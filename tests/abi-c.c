@@ -77,6 +77,10 @@ int main(void) {
         fprintf(stderr, "[Probe] init_params chunk / max_batch defaults do not match\n");
         return 1;
     }
+    if (iparams.stream_max_chunk_frames != 8) {
+        fprintf(stderr, "[Probe] stream_max_chunk_frames default must be 8\n");
+        return 1;
+    }
     if (iparams.abi_version != QT_ABI_VERSION || params.abi_version != QT_ABI_VERSION) {
         fprintf(stderr, "[Probe] abi_version not set by qt_*_default_params\n");
         return 1;
@@ -158,6 +162,41 @@ int main(void) {
         fprintf(stderr, "[Probe] future abi_version rejection did not come from the range check: '%s'\n",
                 qt_last_error());
         return 8;
+    }
+
+    /* The streaming cadence is deliberately a small closed set. Validate the
+     * new ABI field before any model load so a malformed runtime fails fast. */
+    struct qt_init_params invalid_stream = iparams;
+    invalid_stream.talker_path = "irrelevant.gguf";
+    invalid_stream.codec_path = "irrelevant.gguf";
+    invalid_stream.stream_max_chunk_frames = 3;
+    rejected = qt_init(&invalid_stream);
+    if (rejected != NULL) {
+        fprintf(stderr, "[Probe] qt_init accepted stream_max_chunk_frames=3\n");
+        qt_free(rejected);
+        return 12;
+    }
+    if (strstr(qt_last_error(), "stream_max_chunk_frames") == NULL) {
+        fprintf(stderr, "[Probe] invalid stream cadence was not rejected: '%s'\n",
+                qt_last_error());
+        return 12;
+    }
+
+    /* Accepted cadence values must pass validation and reach normal model
+     * loading (the probe intentionally supplies nonexistent paths). */
+    const int supported_stream_values[] = { 1, 2, 4, 8 };
+    for (size_t i = 0; i < sizeof(supported_stream_values) / sizeof(supported_stream_values[0]); ++i) {
+        invalid_stream.stream_max_chunk_frames = supported_stream_values[i];
+        rejected = qt_init(&invalid_stream);
+        if (rejected != NULL) {
+            qt_free(rejected);
+            continue;
+        }
+        if (strstr(qt_last_error(), "stream_max_chunk_frames") != NULL) {
+            fprintf(stderr, "[Probe] supported stream cadence %d was rejected: '%s'\n",
+                    supported_stream_values[i], qt_last_error());
+            return 13;
+        }
     }
 
     /* The floor is the other half of the range check : a struct laid out

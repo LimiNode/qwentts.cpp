@@ -83,6 +83,15 @@ enum qt_status {
     QT_STATUS_CANCELLED       = -5,
 };
 
+// Reason why a successful streaming synthesis stopped. UNKNOWN is used for
+// cancellation and failures; successful requests must report EOS or
+// MAX_TOKENS so callers can enforce a natural-EOS acceptance gate.
+enum qt_finish_reason {
+    QT_FINISH_UNKNOWN    = 0,
+    QT_FINISH_EOS        = 1,
+    QT_FINISH_MAX_TOKENS = 2,
+};
+
 // Returns the last error message produced on the calling thread by any
 // qwen_* entry, as a NUL terminated UTF-8 string. errno-style semantics:
 // the pointer is only meaningful right after a failure (qt_init
@@ -93,6 +102,11 @@ enum qt_status {
 // The pointer stays valid until the next failing qwen_* entry on the
 // same thread.
 QT_API const char * qt_last_error(void);
+
+// Return the finish reason for the most recent qt_synthesize call on the
+// calling thread. The value is thread-local and remains valid until the next
+// synthesis call on that thread.
+QT_API enum qt_finish_reason qt_last_finish_reason(void);
 
 // Output audio buffer. Plain POD: the samples pointer is malloc
 // allocated by qt_synthesize, owned by the struct, released by

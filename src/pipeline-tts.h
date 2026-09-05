@@ -234,6 +234,7 @@ struct TtsJob {
     int64_t                      resolved_seed;
     struct qt_audio *            out;
     qt_status                    status;
+    enum qt_finish_reason        finish_reason;
     std::string                  error;
     bool                         done;
 };

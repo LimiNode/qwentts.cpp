@@ -59,6 +59,10 @@ int main(void) {
     /* Static version string, always reachable. */
     const char * version = qt_version();
     printf("[Probe] %s\n", version);
+    if (qt_last_finish_reason() != QT_FINISH_UNKNOWN) {
+        fprintf(stderr, "[Probe] initial finish reason must be unknown\n");
+        return 1;
+    }
 
     /* Default-initialise the public structs from C. */
     struct qt_init_params iparams;

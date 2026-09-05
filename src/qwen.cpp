@@ -85,6 +85,7 @@ struct qt_context {
 // reclaims it on thread exit. An empty string means "no error recorded
 // on this thread yet", which qt_last_error() exposes as "".
 static thread_local std::string g_last_error;
+static thread_local enum qt_finish_reason g_last_finish_reason = QT_FINISH_UNKNOWN;
 
 void qt_set_error_v(const char * fmt, va_list ap) {
     if (!fmt) {
@@ -202,6 +203,10 @@ const char * qt_last_error(void) {
     // c_str() on an empty std::string is guaranteed to point to a NUL
     // byte by C++11, so callers never have to NULL-check the result.
     return g_last_error.c_str();
+}
+
+enum qt_finish_reason qt_last_finish_reason(void) {
+    return g_last_finish_reason;
 }
 
 void qt_audio_free(struct qt_audio * a) {
@@ -597,6 +602,7 @@ enum qt_status qt_extract_voice_ref(struct qt_context *   q,
 }
 
 enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params * params, struct qt_audio * out) {
+    g_last_finish_reason = QT_FINISH_UNKNOWN;
     if (!q || !params) {
         qt_set_error("qt_synthesize: q or params is NULL");
         if (out) {
@@ -706,6 +712,7 @@ enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params *
         job.resolved_seed = resolved_seed;
         job.out           = out;
         job.status        = QT_STATUS_OK;
+        job.finish_reason = QT_FINISH_UNKNOWN;
         job.done          = false;
         {
             std::lock_guard<std::mutex> lk(q->mu);
@@ -719,6 +726,7 @@ enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params *
         if (job.status != QT_STATUS_OK && !job.error.empty()) {
             qt_set_error("%s", job.error.c_str());
         }
+        g_last_finish_reason = job.finish_reason;
         return job.status;
     } catch (const std::exception & e) {
         qt_set_error("%s", e.what());

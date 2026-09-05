@@ -542,6 +542,7 @@ struct TtsSlot {
 
     bool      finished;
     qt_status fin_status;
+    enum qt_finish_reason finish_reason;
     TtsPerf   perf;
     Timer     t_total;
 };
@@ -841,6 +842,7 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
     s.codec_set        = -1;
     s.finished         = false;
     s.fin_status       = QT_STATUS_OK;
+    s.finish_reason    = QT_FINISH_UNKNOWN;
     s.perf             = {};
     s.t_total.reset();
 
@@ -1077,6 +1079,7 @@ static void tts_slot_complete(TtsEngine * e, TtsSlot & s) {
         job->error = qt_last_error();
     }
     job->status = st;
+    job->finish_reason = st == QT_STATUS_OK ? s.finish_reason : QT_FINISH_UNKNOWN;
 }
 
 void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
@@ -1198,6 +1201,7 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
         if (c0 == codec_eos_id) {
             qt_log(QT_LOG_INFO, "[Pipeline] EOS at step %d, stopping (slot %d)", s.step, i);
             s.finished = true;
+            s.finish_reason = QT_FINISH_EOS;
             continue;
         }
         s.pending_c0 = c0;
@@ -1330,6 +1334,7 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                     }
                     if (s.step >= p->max_new_tokens) {
                         s.finished = true;
+                        s.finish_reason = QT_FINISH_MAX_TOKENS;
                     }
                 }
             }

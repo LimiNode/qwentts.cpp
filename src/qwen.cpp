@@ -225,6 +225,7 @@ void qt_log_set(qt_log_cb cb, void * user_data) {
 // Codec chunk default, shared by qt_init_default_params and the
 // qt_init resolution of an unset value.
 static const float QT_CODEC_CHUNK_SEC_DEFAULT = 24.0f;
+static const int QT_STREAM_MAX_CHUNK_FRAMES_DEFAULT = 8;
 
 void qt_init_default_params(struct qt_init_params * p) {
     p->abi_version = QT_ABI_VERSION;
@@ -235,6 +236,7 @@ void qt_init_default_params(struct qt_init_params * p) {
     p->max_batch   = 1;
 
     p->codec_chunk_sec = QT_CODEC_CHUNK_SEC_DEFAULT;
+    p->stream_max_chunk_frames = QT_STREAM_MAX_CHUNK_FRAMES_DEFAULT;
 }
 
 void qt_tts_default_params(struct qt_tts_params * p) {
@@ -446,6 +448,14 @@ struct qt_context * qt_init(const struct qt_init_params * params) {
     // The chunk width resolves once here: it is a property of the
     // handle, read by every buffered decode it runs.
     const float chunk_sec = params->codec_chunk_sec > 0.0f ? params->codec_chunk_sec : QT_CODEC_CHUNK_SEC_DEFAULT;
+    const int stream_max_chunk_frames = params->stream_max_chunk_frames > 0 ?
+        params->stream_max_chunk_frames : QT_STREAM_MAX_CHUNK_FRAMES_DEFAULT;
+    if (stream_max_chunk_frames != 1 && stream_max_chunk_frames != 2 &&
+        stream_max_chunk_frames != 4 && stream_max_chunk_frames != 8) {
+        qt_set_error("qt_init: stream_max_chunk_frames must be one of 1, 2, 4 or 8");
+        qt_log(QT_LOG_ERROR, "[Qwen] unsupported stream_max_chunk_frames=%d", stream_max_chunk_frames);
+        return nullptr;
+    }
 
     // new qt_context() value-initialises every field: POD aggregates
     // (BackendPair, PipelineTTS) are zero-init, std containers in
@@ -464,7 +474,7 @@ struct qt_context * qt_init(const struct qt_init_params * params) {
         }
 
         if (!pipeline_tts_load(&q->pt, params->talker_path, params->codec_path, q->bp, params->use_fa,
-                               params->clamp_fp16, max_batch, chunk_sec)) {
+                               params->clamp_fp16, max_batch, chunk_sec, stream_max_chunk_frames)) {
             qt_throw("qt_init: pipeline_tts_load failed for '%s' / '%s'", params->talker_path, params->codec_path);
         }
 

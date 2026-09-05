@@ -59,13 +59,13 @@ extern "C" {
 // git short hash + commit date string returned by qt_version(); for
 // binding compat checks, QT_ABI_VERSION is the only number that
 // matters.
-#define QT_ABI_VERSION 4
+#define QT_ABI_VERSION 5
 
 // Oldest struct layout this build addresses. A v3 or older
 // qt_tts_params places its trailing fields at offsets this build does
 // not map, so such a struct is unreadable here and its caller rebuilds
 // against this header.
-#define QT_ABI_MIN_VERSION 4
+#define QT_ABI_MIN_VERSION 5
 
 // Returns a static string of the form "<git-hash> (<date>)" identifying
 // the exact commit this binary was built from. Safe to call from any
@@ -157,11 +157,18 @@ struct qt_init_params {
     // frames at 12.5 Hz). The streaming path frames its own chunks
     // through the persistent codec stream state and reads none of this.
     float codec_chunk_sec;
+
+    // Maximum number of codec frames emitted in one streaming callback.
+    // The streaming ramp starts at one frame and doubles up to this value.
+    // Supported values are 1, 2, 4 and 8; 0 selects the default of 8.
+    // Smaller values reduce steady-state chunk latency at the cost of more
+    // codec graph launches. This setting affects streaming synthesis only.
+    int stream_max_chunk_frames;
 };
 
 // Initialise to the standard defaults: both paths NULL (caller must set
 // them before calling qt_init), use_fa true, clamp_fp16 false,
-// max_batch 1, codec_chunk_sec 24.0.
+// max_batch 1, codec_chunk_sec 24.0, stream_max_chunk_frames 8.
 QT_API void qt_init_default_params(struct qt_init_params * p);
 
 // Allocate every module described by params. Returns NULL on any

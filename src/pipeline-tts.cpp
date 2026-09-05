@@ -152,7 +152,8 @@ bool pipeline_tts_load(PipelineTTS * pt,
                        bool          use_fa,
                        bool          clamp_fp16,
                        int           max_batch,
-                       float         codec_chunk_sec) {
+                       float         codec_chunk_sec,
+                       int           stream_max_chunk_frames) {
     pt->bp                  = bp;
     pt->backend             = bp.backend;
     pt->sched               = NULL;
@@ -165,6 +166,7 @@ bool pipeline_tts_load(PipelineTTS * pt,
     // Chunk width of the buffered decode. The conversion is a fixed
     // 12.5 Hz ratio, so it lands here once instead of per synthesis.
     pt->codec_chunk_frames = pipeline_tts_duration_sec_to_tokens(pt, codec_chunk_sec);
+    pt->stream_max_chunk_frames = stream_max_chunk_frames;
 
     // Fused flash attention needs a GPU kernel; CPU only backends fall
     // back to the F32 manual chain automatically. clamp_fp16 is forwarded
@@ -1382,7 +1384,7 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                 ok = tts_engine_codec_flush(e);
             } else if (e->codec_pending_n >= e->codec_target) {
                 ok = tts_engine_codec_flush(e);
-                if (ok && e->codec_target < (1 << (CODEC_STREAM_CLASSES - 1))) {
+                if (ok && e->codec_target < e->pt->stream_max_chunk_frames) {
                     e->codec_target <<= 1;
                 }
             }

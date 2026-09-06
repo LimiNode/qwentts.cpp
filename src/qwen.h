@@ -61,10 +61,9 @@ extern "C" {
 // matters.
 #define QT_ABI_VERSION 5
 
-// Oldest struct layout this build addresses. A v3 or older
-// qt_tts_params places its trailing fields at offsets this build does
-// not map, so such a struct is unreadable here and its caller rebuilds
-// against this header.
+// Oldest struct layout this build addresses. ABI 5 is required because the
+// current qt_init_params tail includes stream_max_chunk_frames; older layouts
+// are unreadable here and their callers must rebuild against this header.
 #define QT_ABI_MIN_VERSION 5
 
 // Returns a static string of the form "<git-hash> (<date>)" identifying

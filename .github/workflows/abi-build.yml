@@ -1,0 +1,36 @@
+name: ABI and CPU build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  cpu-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Configure
+        run: cmake -S . -B build -DQWEN_SHARED=ON -DGGML_NATIVE=OFF
+      - name: Build shared library and ABI probe
+        run: cmake --build build --target qwen test-abi-c --parallel 2
+      - name: Run ABI probe
+        run: ./build/test-abi-c
+
+  windows-msvc-shared:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B build -DQWEN_SHARED=ON -DGGML_NATIVE=OFF
+      - name: Build shared library and ABI probe
+        shell: pwsh
+        run: cmake --build build --config Release --target qwen test-abi-c --parallel 2
+      - name: Run ABI probe
+        shell: pwsh
+        run: .\build\Release\test-abi-c.exe

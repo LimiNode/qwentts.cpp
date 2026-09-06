@@ -146,6 +146,7 @@ struct PipelineTTS {
     // window at load.
     int codec_chunk_frames;
     int codec_left_ctx_frames;
+    int stream_max_chunk_frames;
 
     CodecSpecials              codec_specials;
     TextSpecials               text_specials;
@@ -210,7 +211,8 @@ bool pipeline_tts_load(PipelineTTS * pt,
                        bool          use_fa,
                        bool          clamp_fp16,
                        int           max_batch,
-                       float         codec_chunk_sec);
+                       float         codec_chunk_sec,
+                       int           stream_max_chunk_frames);
 
 void pipeline_tts_free(PipelineTTS * pt);
 
@@ -232,6 +234,7 @@ struct TtsJob {
     int64_t                      resolved_seed;
     struct qt_audio *            out;
     qt_status                    status;
+    enum qt_finish_reason        finish_reason;
     std::string                  error;
     bool                         done;
 };

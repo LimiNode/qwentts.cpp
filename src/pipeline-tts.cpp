@@ -152,7 +152,8 @@ bool pipeline_tts_load(PipelineTTS * pt,
                        bool          use_fa,
                        bool          clamp_fp16,
                        int           max_batch,
-                       float         codec_chunk_sec) {
+                       float         codec_chunk_sec,
+                       int           stream_max_chunk_frames) {
     pt->bp                  = bp;
     pt->backend             = bp.backend;
     pt->sched               = NULL;
@@ -165,6 +166,7 @@ bool pipeline_tts_load(PipelineTTS * pt,
     // Chunk width of the buffered decode. The conversion is a fixed
     // 12.5 Hz ratio, so it lands here once instead of per synthesis.
     pt->codec_chunk_frames = pipeline_tts_duration_sec_to_tokens(pt, codec_chunk_sec);
+    pt->stream_max_chunk_frames = stream_max_chunk_frames;
 
     // Fused flash attention needs a GPU kernel; CPU only backends fall
     // back to the F32 manual chain automatically. clamp_fp16 is forwarded
@@ -540,6 +542,7 @@ struct TtsSlot {
 
     bool      finished;
     qt_status fin_status;
+    enum qt_finish_reason finish_reason;
     TtsPerf   perf;
     Timer     t_total;
 };
@@ -839,6 +842,7 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
     s.codec_set        = -1;
     s.finished         = false;
     s.fin_status       = QT_STATUS_OK;
+    s.finish_reason    = QT_FINISH_UNKNOWN;
     s.perf             = {};
     s.t_total.reset();
 
@@ -1075,6 +1079,7 @@ static void tts_slot_complete(TtsEngine * e, TtsSlot & s) {
         job->error = qt_last_error();
     }
     job->status = st;
+    job->finish_reason = st == QT_STATUS_OK ? s.finish_reason : QT_FINISH_UNKNOWN;
 }
 
 void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
@@ -1196,6 +1201,7 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
         if (c0 == codec_eos_id) {
             qt_log(QT_LOG_INFO, "[Pipeline] EOS at step %d, stopping (slot %d)", s.step, i);
             s.finished = true;
+            s.finish_reason = QT_FINISH_EOS;
             continue;
         }
         s.pending_c0 = c0;
@@ -1328,6 +1334,7 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                     }
                     if (s.step >= p->max_new_tokens) {
                         s.finished = true;
+                        s.finish_reason = QT_FINISH_MAX_TOKENS;
                     }
                 }
             }
@@ -1382,7 +1389,7 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                 ok = tts_engine_codec_flush(e);
             } else if (e->codec_pending_n >= e->codec_target) {
                 ok = tts_engine_codec_flush(e);
-                if (ok && e->codec_target < (1 << (CODEC_STREAM_CLASSES - 1))) {
+                if (ok && e->codec_target < e->pt->stream_max_chunk_frames) {
                     e->codec_target <<= 1;
                 }
             }

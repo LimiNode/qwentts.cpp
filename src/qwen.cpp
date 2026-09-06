@@ -85,6 +85,7 @@ struct qt_context {
 // reclaims it on thread exit. An empty string means "no error recorded
 // on this thread yet", which qt_last_error() exposes as "".
 static thread_local std::string g_last_error;
+static thread_local enum qt_finish_reason g_last_finish_reason = QT_FINISH_UNKNOWN;
 
 void qt_set_error_v(const char * fmt, va_list ap) {
     if (!fmt) {
@@ -204,6 +205,10 @@ const char * qt_last_error(void) {
     return g_last_error.c_str();
 }
 
+enum qt_finish_reason qt_last_finish_reason(void) {
+    return g_last_finish_reason;
+}
+
 void qt_audio_free(struct qt_audio * a) {
     if (!a) {
         return;
@@ -225,6 +230,7 @@ void qt_log_set(qt_log_cb cb, void * user_data) {
 // Codec chunk default, shared by qt_init_default_params and the
 // qt_init resolution of an unset value.
 static const float QT_CODEC_CHUNK_SEC_DEFAULT = 24.0f;
+static const int QT_STREAM_MAX_CHUNK_FRAMES_DEFAULT = 8;
 
 void qt_init_default_params(struct qt_init_params * p) {
     p->abi_version = QT_ABI_VERSION;
@@ -235,6 +241,7 @@ void qt_init_default_params(struct qt_init_params * p) {
     p->max_batch   = 1;
 
     p->codec_chunk_sec = QT_CODEC_CHUNK_SEC_DEFAULT;
+    p->stream_max_chunk_frames = QT_STREAM_MAX_CHUNK_FRAMES_DEFAULT;
 }
 
 void qt_tts_default_params(struct qt_tts_params * p) {
@@ -446,6 +453,17 @@ struct qt_context * qt_init(const struct qt_init_params * params) {
     // The chunk width resolves once here: it is a property of the
     // handle, read by every buffered decode it runs.
     const float chunk_sec = params->codec_chunk_sec > 0.0f ? params->codec_chunk_sec : QT_CODEC_CHUNK_SEC_DEFAULT;
+    // Zero is the only sentinel for the default.  Preserve every other value
+    // so the whitelist below rejects malformed (including negative) ABI input
+    // instead of silently converting it to the default cadence.
+    const int stream_max_chunk_frames = params->stream_max_chunk_frames == 0 ?
+        QT_STREAM_MAX_CHUNK_FRAMES_DEFAULT : params->stream_max_chunk_frames;
+    if (stream_max_chunk_frames != 1 && stream_max_chunk_frames != 2 &&
+        stream_max_chunk_frames != 4 && stream_max_chunk_frames != 8) {
+        qt_set_error("qt_init: stream_max_chunk_frames must be one of 1, 2, 4 or 8");
+        qt_log(QT_LOG_ERROR, "[Qwen] unsupported stream_max_chunk_frames=%d", stream_max_chunk_frames);
+        return nullptr;
+    }
 
     // new qt_context() value-initialises every field: POD aggregates
     // (BackendPair, PipelineTTS) are zero-init, std containers in
@@ -464,7 +482,7 @@ struct qt_context * qt_init(const struct qt_init_params * params) {
         }
 
         if (!pipeline_tts_load(&q->pt, params->talker_path, params->codec_path, q->bp, params->use_fa,
-                               params->clamp_fp16, max_batch, chunk_sec)) {
+                               params->clamp_fp16, max_batch, chunk_sec, stream_max_chunk_frames)) {
             qt_throw("qt_init: pipeline_tts_load failed for '%s' / '%s'", params->talker_path, params->codec_path);
         }
 
@@ -587,6 +605,7 @@ enum qt_status qt_extract_voice_ref(struct qt_context *   q,
 }
 
 enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params * params, struct qt_audio * out) {
+    g_last_finish_reason = QT_FINISH_UNKNOWN;
     if (!q || !params) {
         qt_set_error("qt_synthesize: q or params is NULL");
         if (out) {
@@ -696,6 +715,7 @@ enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params *
         job.resolved_seed = resolved_seed;
         job.out           = out;
         job.status        = QT_STATUS_OK;
+        job.finish_reason = QT_FINISH_UNKNOWN;
         job.done          = false;
         {
             std::lock_guard<std::mutex> lk(q->mu);
@@ -709,6 +729,7 @@ enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params *
         if (job.status != QT_STATUS_OK && !job.error.empty()) {
             qt_set_error("%s", job.error.c_str());
         }
+        g_last_finish_reason = job.finish_reason;
         return job.status;
     } catch (const std::exception & e) {
         qt_set_error("%s", e.what());

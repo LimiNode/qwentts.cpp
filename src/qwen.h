@@ -59,13 +59,12 @@ extern "C" {
 // git short hash + commit date string returned by qt_version(); for
 // binding compat checks, QT_ABI_VERSION is the only number that
 // matters.
-#define QT_ABI_VERSION 4
+#define QT_ABI_VERSION 5
 
-// Oldest struct layout this build addresses. A v3 or older
-// qt_tts_params places its trailing fields at offsets this build does
-// not map, so such a struct is unreadable here and its caller rebuilds
-// against this header.
-#define QT_ABI_MIN_VERSION 4
+// Oldest struct layout this build addresses. ABI 5 is required because the
+// current qt_init_params tail includes stream_max_chunk_frames; older layouts
+// are unreadable here and their callers must rebuild against this header.
+#define QT_ABI_MIN_VERSION 5
 
 // Returns a static string of the form "<git-hash> (<date>)" identifying
 // the exact commit this binary was built from. Safe to call from any
@@ -83,6 +82,15 @@ enum qt_status {
     QT_STATUS_CANCELLED       = -5,
 };
 
+// Reason why a successful synthesis stopped. UNKNOWN is used for
+// cancellation and failures; successful requests must report EOS or
+// MAX_TOKENS so callers can enforce a natural-EOS acceptance gate.
+enum qt_finish_reason {
+    QT_FINISH_UNKNOWN    = 0,
+    QT_FINISH_EOS        = 1,
+    QT_FINISH_MAX_TOKENS = 2,
+};
+
 // Returns the last error message produced on the calling thread by any
 // qwen_* entry, as a NUL terminated UTF-8 string. errno-style semantics:
 // the pointer is only meaningful right after a failure (qt_init
@@ -93,6 +101,11 @@ enum qt_status {
 // The pointer stays valid until the next failing qwen_* entry on the
 // same thread.
 QT_API const char * qt_last_error(void);
+
+// Return the finish reason for the most recent qt_synthesize call on the
+// calling thread. The value is thread-local and remains valid until the next
+// synthesis call on that thread.
+QT_API enum qt_finish_reason qt_last_finish_reason(void);
 
 // Output audio buffer. Plain POD: the samples pointer is malloc
 // allocated by qt_synthesize, owned by the struct, released by
@@ -157,11 +170,19 @@ struct qt_init_params {
     // frames at 12.5 Hz). The streaming path frames its own chunks
     // through the persistent codec stream state and reads none of this.
     float codec_chunk_sec;
+
+    // Maximum number of codec frames emitted in one streaming callback.
+    // The streaming ramp starts at one frame and doubles up to this value.
+    // ABI contract: 0 selects the default of 8; only 1, 2, 4 and 8 are valid
+    // explicit values. Every other value, including negatives, is invalid.
+    // Smaller values reduce steady-state chunk latency at the cost of more
+    // codec graph launches. This setting affects streaming synthesis only.
+    int stream_max_chunk_frames;
 };
 
 // Initialise to the standard defaults: both paths NULL (caller must set
 // them before calling qt_init), use_fa true, clamp_fp16 false,
-// max_batch 1, codec_chunk_sec 24.0.
+// max_batch 1, codec_chunk_sec 24.0, stream_max_chunk_frames 8.
 QT_API void qt_init_default_params(struct qt_init_params * p);
 
 // Allocate every module described by params. Returns NULL on any
@@ -229,7 +250,8 @@ typedef bool (*qt_cancel_cb)(void * user_data);
 //
 // The chunk granularity is a ramp over the persistent codec stream
 // state: the first flush covers a single 12.5 Hz frame for the lowest
-// time to first audio, then the target width doubles up to 8 frames as
+// time to first audio, then the target width doubles up to
+// stream_max_chunk_frames (default 8) as
 // the stream settles. The last chunk on EOS / max_new flushes whatever
 // frames remain.
 typedef bool (*qt_audio_chunk_cb)(const float * samples, int n_samples, void * user_data);

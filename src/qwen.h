@@ -82,7 +82,7 @@ enum qt_status {
     QT_STATUS_CANCELLED       = -5,
 };
 
-// Reason why a successful streaming synthesis stopped. UNKNOWN is used for
+// Reason why a successful synthesis stopped. UNKNOWN is used for
 // cancellation and failures; successful requests must report EOS or
 // MAX_TOKENS so callers can enforce a natural-EOS acceptance gate.
 enum qt_finish_reason {
@@ -250,7 +250,8 @@ typedef bool (*qt_cancel_cb)(void * user_data);
 //
 // The chunk granularity is a ramp over the persistent codec stream
 // state: the first flush covers a single 12.5 Hz frame for the lowest
-// time to first audio, then the target width doubles up to 8 frames as
+// time to first audio, then the target width doubles up to
+// stream_max_chunk_frames (default 8) as
 // the stream settles. The last chunk on EOS / max_new flushes whatever
 // frames remain.
 typedef bool (*qt_audio_chunk_cb)(const float * samples, int n_samples, void * user_data);

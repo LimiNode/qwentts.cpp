@@ -174,7 +174,8 @@ struct qt_init_params {
 
     // Maximum number of codec frames emitted in one streaming callback.
     // The streaming ramp starts at one frame and doubles up to this value.
-    // Supported values are 1, 2, 4 and 8; 0 selects the default of 8.
+    // ABI contract: 0 selects the default of 8; only 1, 2, 4 and 8 are valid
+    // explicit values. Every other value, including negatives, is invalid.
     // Smaller values reduce steady-state chunk latency at the cost of more
     // codec graph launches. This setting affects streaming synthesis only.
     int stream_max_chunk_frames;

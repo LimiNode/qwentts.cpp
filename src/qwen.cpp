@@ -453,8 +453,11 @@ struct qt_context * qt_init(const struct qt_init_params * params) {
     // The chunk width resolves once here: it is a property of the
     // handle, read by every buffered decode it runs.
     const float chunk_sec = params->codec_chunk_sec > 0.0f ? params->codec_chunk_sec : QT_CODEC_CHUNK_SEC_DEFAULT;
-    const int stream_max_chunk_frames = params->stream_max_chunk_frames > 0 ?
-        params->stream_max_chunk_frames : QT_STREAM_MAX_CHUNK_FRAMES_DEFAULT;
+    // Zero is the only sentinel for the default.  Preserve every other value
+    // so the whitelist below rejects malformed (including negative) ABI input
+    // instead of silently converting it to the default cadence.
+    const int stream_max_chunk_frames = params->stream_max_chunk_frames == 0 ?
+        QT_STREAM_MAX_CHUNK_FRAMES_DEFAULT : params->stream_max_chunk_frames;
     if (stream_max_chunk_frames != 1 && stream_max_chunk_frames != 2 &&
         stream_max_chunk_frames != 4 && stream_max_chunk_frames != 8) {
         qt_set_error("qt_init: stream_max_chunk_frames must be one of 1, 2, 4 or 8");

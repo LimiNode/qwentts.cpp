@@ -186,6 +186,19 @@ int main(void) {
         return 12;
     }
 
+    invalid_stream.stream_max_chunk_frames = -1;
+    rejected = qt_init(&invalid_stream);
+    if (rejected != NULL) {
+        fprintf(stderr, "[Probe] qt_init accepted stream_max_chunk_frames=-1\n");
+        qt_free(rejected);
+        return 14;
+    }
+    if (strstr(qt_last_error(), "stream_max_chunk_frames") == NULL) {
+        fprintf(stderr, "[Probe] negative stream cadence was not rejected: '%s'\n",
+                qt_last_error());
+        return 14;
+    }
+
     /* Accepted cadence values must pass validation and reach normal model
      * loading (the probe intentionally supplies nonexistent paths). */
     const int supported_stream_values[] = { 1, 2, 4, 8 };

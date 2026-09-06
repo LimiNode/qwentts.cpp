@@ -27,7 +27,7 @@ jobs:
           submodules: recursive
       - name: Configure
         shell: pwsh
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DQWEN_SHARED=ON -DGGML_NATIVE=OFF
+        run: cmake -S . -B build -DQWEN_SHARED=ON -DGGML_NATIVE=OFF
       - name: Build shared library and ABI probe
         shell: pwsh
         run: cmake --build build --config Release --target qwen test-abi-c --parallel 2

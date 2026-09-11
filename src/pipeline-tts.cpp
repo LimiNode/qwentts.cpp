@@ -21,7 +21,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
 
 static void parse_codec_specials(const GGUFModel & gf, CodecSpecials & cs) {
     cs.pad_id       = (int) gf_get_u32(gf, "qwen3-tts.codec.pad_id");
@@ -1181,9 +1180,7 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
         // codec EOS token is valid after generation has started, but allowing
         // it on the first step produces a misleading successful empty audio
         // result (and makes the worker fail only after the model call).
-        if (s.step == 0 && codec_eos_id >= 0 && codec_eos_id < vocab) {
-            s.logits[(size_t) codec_eos_id] = -std::numeric_limits<float>::infinity();
-        }
+        suppress_initial_eos(s.logits.data(), vocab, codec_eos_id, s.step);
         float u_c0 = 0.0f;
         int   c0   = sample_top_k_p(s.logits.data(), vocab, s.talker_T, p->top_k, p->top_p, p->repetition_penalty,
                                     s.talker_history.data(), (int) s.talker_history.size(), s.job->resolved_seed,

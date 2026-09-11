@@ -211,3 +211,17 @@ target_include_directories(test-abi-c PRIVATE
 )
 target_link_libraries(test-abi-c PRIVATE qwen-core)
 link_ggml_backends(test-abi-c)
+
+# Model-free sampling contract regression: EOS is masked only for the first
+# codec frame and remains eligible on subsequent generation steps.
+enable_testing()
+add_executable(test-sampling-contract tests/sampling-contract.cpp)
+target_include_directories(test-sampling-contract PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+if(MSVC)
+    target_compile_options(test-sampling-contract PRIVATE /W4 /WX /wd4505)
+else()
+    target_compile_options(test-sampling-contract PRIVATE -Wall -Wextra -Werror -Wno-unused-function -pedantic)
+endif()
+add_test(NAME sampling_contract COMMAND test-sampling-contract)

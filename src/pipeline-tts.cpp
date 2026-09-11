@@ -1349,11 +1349,10 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
         }
     }
 
-    // Fresh slots that got no frame this step (their very first frame
-    // ended in EOS or cancel) still advanced past prefill conceptually;
-    // slots that emitted advanced in the loop above. Slots neither
-    // finished nor advanced cannot exist: every live slot either emits
-    // or finishes.
+    // Fresh slots that were cancelled before emitting a frame still advance
+    // past prefill conceptually; step-0 EOS is masked above. Slots that
+    // emitted advanced in the loop above. Slots neither finished nor
+    // advanced cannot exist: every live slot either emits or finishes.
 
     // 5) Shared codec streaming: one lockstep flush cadence over the
     // lanes [0, codec_M). A membership change this frame (a streaming

@@ -40,6 +40,15 @@ static inline void apply_suppress(float * logits, int V, int lo, int hi, int kee
     }
 }
 
+// A successful synthesis must emit at least one codec frame. Keep EOS
+// available for later steps, but make the first-frame contract explicit so
+// callers never receive a successful empty stream.
+static inline void suppress_initial_eos(float * logits, int V, int eos_id, int step) {
+    if (step == 0 && eos_id >= 0 && eos_id < V) {
+        logits[(size_t) eos_id] = -INFINITY;
+    }
+}
+
 // Repetition penalty over unique tokens in history (HF rule):
 //   if score >= 0 -> score / penalty
 //   if score <  0 -> score * penalty

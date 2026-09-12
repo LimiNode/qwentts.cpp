@@ -107,6 +107,28 @@ QT_API const char * qt_last_error(void);
 // synthesis call on that thread.
 QT_API enum qt_finish_reason qt_last_finish_reason(void);
 
+// Wall-clock phase metrics for the most recent synthesis on the calling
+// thread. The fields are zero when synthesis did not reach the pipeline.
+// `ttfa_ms` ends when the first codec frame is ready and `total_ms` ends when
+// qt_synthesize returns.
+struct qt_synthesis_metrics {
+    int    abi_version;
+    double prompt_build_ms;
+    double prefill_ms;
+    double ttfa_ms;
+    double talker_ms;
+    double predictor_ms;
+    double host_ms;
+    double codec_ms;
+    double total_ms;
+    int    n_frames;
+};
+
+// Copy metrics for the most recent qt_synthesize call into `out`. Safe with a
+// NULL pointer. The result remains valid until the next synthesis call on the
+// same thread.
+QT_API void qt_last_synthesis_metrics(struct qt_synthesis_metrics * out);
+
 // Output audio buffer. Plain POD: the samples pointer is malloc
 // allocated by qt_synthesize, owned by the struct, released by
 // qt_audio_free. Do not free samples directly nor reassign without

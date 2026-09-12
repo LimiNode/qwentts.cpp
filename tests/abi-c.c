@@ -63,6 +63,13 @@ int main(void) {
         fprintf(stderr, "[Probe] initial finish reason must be unknown\n");
         return 1;
     }
+    struct qt_synthesis_metrics metrics = { 0 };
+    qt_last_synthesis_metrics(&metrics);
+    if (metrics.abi_version != QT_ABI_VERSION || metrics.n_frames != 0) {
+        fprintf(stderr, "[Probe] initial synthesis metrics are not empty\n");
+        return 1;
+    }
+    qt_last_synthesis_metrics(NULL);
 
     /* Default-initialise the public structs from C. */
     struct qt_init_params iparams;

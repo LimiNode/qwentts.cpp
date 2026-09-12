@@ -86,6 +86,8 @@ struct qt_context {
 // on this thread yet", which qt_last_error() exposes as "".
 static thread_local std::string g_last_error;
 static thread_local enum qt_finish_reason g_last_finish_reason = QT_FINISH_UNKNOWN;
+static thread_local struct qt_synthesis_metrics g_last_synthesis_metrics = {
+    QT_ABI_VERSION, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0};
 
 void qt_set_error_v(const char * fmt, va_list ap) {
     if (!fmt) {
@@ -207,6 +209,12 @@ const char * qt_last_error(void) {
 
 enum qt_finish_reason qt_last_finish_reason(void) {
     return g_last_finish_reason;
+}
+
+void qt_last_synthesis_metrics(struct qt_synthesis_metrics * out) {
+    if (out != nullptr) {
+        *out = g_last_synthesis_metrics;
+    }
 }
 
 void qt_audio_free(struct qt_audio * a) {
@@ -606,6 +614,7 @@ enum qt_status qt_extract_voice_ref(struct qt_context *   q,
 
 enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params * params, struct qt_audio * out) {
     g_last_finish_reason = QT_FINISH_UNKNOWN;
+    g_last_synthesis_metrics = {QT_ABI_VERSION, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0};
     if (!q || !params) {
         qt_set_error("qt_synthesize: q or params is NULL");
         if (out) {
@@ -716,6 +725,15 @@ enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params *
         job.out           = out;
         job.status        = QT_STATUS_OK;
         job.finish_reason = QT_FINISH_UNKNOWN;
+        job.prompt_build_ms = 0.0;
+        job.prefill_ms      = 0.0;
+        job.ttfa_ms         = 0.0;
+        job.talker_ms       = 0.0;
+        job.predictor_ms    = 0.0;
+        job.host_ms         = 0.0;
+        job.codec_ms        = 0.0;
+        job.total_ms        = 0.0;
+        job.n_frames        = 0;
         job.done          = false;
         {
             std::lock_guard<std::mutex> lk(q->mu);
@@ -730,6 +748,17 @@ enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params *
             qt_set_error("%s", job.error.c_str());
         }
         g_last_finish_reason = job.finish_reason;
+        g_last_synthesis_metrics = {
+            QT_ABI_VERSION,
+            job.prompt_build_ms,
+            job.prefill_ms,
+            job.ttfa_ms,
+            job.talker_ms,
+            job.predictor_ms,
+            job.host_ms,
+            job.codec_ms,
+            job.total_ms,
+            job.n_frames};
         return job.status;
     } catch (const std::exception & e) {
         qt_set_error("%s", e.what());

@@ -235,6 +235,15 @@ struct TtsJob {
     struct qt_audio *            out;
     qt_status                    status;
     enum qt_finish_reason        finish_reason;
+    double                       prompt_build_ms;
+    double                       prefill_ms;
+    double                       ttfa_ms;
+    double                       talker_ms;
+    double                       predictor_ms;
+    double                       host_ms;
+    double                       codec_ms;
+    double                       total_ms;
+    int                          n_frames;
     std::string                  error;
     bool                         done;
 };

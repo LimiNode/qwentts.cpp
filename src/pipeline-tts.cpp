@@ -1078,6 +1078,15 @@ static void tts_slot_complete(TtsEngine * e, TtsSlot & s) {
     if (st != QT_STATUS_OK) {
         job->error = qt_last_error();
     }
+    job->prompt_build_ms = s.perf.build_ms;
+    job->prefill_ms      = s.perf.prefill_ms;
+    job->ttfa_ms         = s.perf.ttfa_ms;
+    job->talker_ms       = s.perf.talker_ms;
+    job->predictor_ms    = s.perf.predictor_ms;
+    job->host_ms         = s.perf.host_ms;
+    job->codec_ms        = s.perf.codec_ms;
+    job->total_ms        = s.perf.total_ms;
+    job->n_frames        = s.perf.n_frames;
     job->status = st;
     job->finish_reason = st == QT_STATUS_OK ? s.finish_reason : QT_FINISH_UNKNOWN;
 }

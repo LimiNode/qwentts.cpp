@@ -63,6 +63,25 @@ int main(void) {
         fprintf(stderr, "[Probe] initial finish reason must be unknown\n");
         return 1;
     }
+    struct qt_synthesis_metrics metrics = { 0 };
+    qt_last_synthesis_metrics(&metrics, sizeof(metrics));
+    if (metrics.abi_version != QT_ABI_VERSION || metrics.n_frames != 0) {
+        fprintf(stderr, "[Probe] initial synthesis metrics are not empty\n");
+        return 1;
+    }
+    qt_last_synthesis_metrics(NULL, 0);
+
+    /* A bounded copy must not overwrite bytes beyond the requested prefix. */
+    struct {
+        struct qt_synthesis_metrics metrics;
+        unsigned char guard[4];
+    } bounded;
+    memset(&bounded, 0xA5, sizeof(bounded));
+    qt_last_synthesis_metrics(&bounded.metrics, 1);
+    if (bounded.guard[0] != 0xA5 || bounded.guard[3] != 0xA5) {
+        fprintf(stderr, "[Probe] bounded metrics copy overwrote its output buffer\n");
+        return 1;
+    }
 
     /* Default-initialise the public structs from C. */
     struct qt_init_params iparams;

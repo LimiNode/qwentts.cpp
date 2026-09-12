@@ -17,6 +17,7 @@
 // part of this public ABI.
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -109,8 +110,9 @@ QT_API enum qt_finish_reason qt_last_finish_reason(void);
 
 // Wall-clock phase metrics for the most recent synthesis on the calling
 // thread. The fields are zero when synthesis did not reach the pipeline.
-// `ttfa_ms` ends when the first codec frame is ready and `total_ms` ends when
-// qt_synthesize returns.
+// `ttfa_ms` ends when the first codec frame is ready and `pipeline_total_ms`
+// ends when the internal synthesis pipeline retires. It is not necessarily
+// the exact wall-clock instant at which qt_synthesize returns to its caller.
 struct qt_synthesis_metrics {
     int    abi_version;
     double prompt_build_ms;
@@ -120,14 +122,18 @@ struct qt_synthesis_metrics {
     double predictor_ms;
     double host_ms;
     double codec_ms;
-    double total_ms;
+    double pipeline_total_ms;
     int    n_frames;
 };
 
-// Copy metrics for the most recent qt_synthesize call into `out`. Safe with a
-// NULL pointer. The result remains valid until the next synthesis call on the
-// same thread.
-QT_API void qt_last_synthesis_metrics(struct qt_synthesis_metrics * out);
+// Copy at most `out_size` bytes of metrics for the most recent qt_synthesize
+// call into `out`. Safe with NULL or zero-sized output. Callers compiled
+// against an older, shorter struct remain safe when a newer runtime adds
+// fields; bytes not copied by the runtime retain their caller-initialised
+// values. The result remains valid until the next synthesis call on the same
+// thread.
+QT_API void qt_last_synthesis_metrics(struct qt_synthesis_metrics * out,
+                                      size_t out_size);
 
 // Output audio buffer. Plain POD: the samples pointer is malloc
 // allocated by qt_synthesize, owned by the struct, released by

@@ -211,9 +211,12 @@ enum qt_finish_reason qt_last_finish_reason(void) {
     return g_last_finish_reason;
 }
 
-void qt_last_synthesis_metrics(struct qt_synthesis_metrics * out) {
-    if (out != nullptr) {
-        *out = g_last_synthesis_metrics;
+void qt_last_synthesis_metrics(struct qt_synthesis_metrics * out, size_t out_size) {
+    if (out != nullptr && out_size != 0) {
+        const size_t bytes_to_copy = out_size < sizeof(g_last_synthesis_metrics)
+            ? out_size
+            : sizeof(g_last_synthesis_metrics);
+        std::memcpy(out, &g_last_synthesis_metrics, bytes_to_copy);
     }
 }
 

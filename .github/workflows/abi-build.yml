@@ -14,10 +14,12 @@ jobs:
           submodules: recursive
       - name: Configure
         run: cmake -S . -B build -DQWEN_SHARED=ON -DGGML_NATIVE=OFF
-      - name: Build shared library and ABI probe
-        run: cmake --build build --target qwen test-abi-c --parallel 2
-      - name: Run ABI probe
-        run: ./build/test-abi-c
+      - name: Build shared library and regression tests
+        run: cmake --build build --target qwen test-abi-c test-sampling-contract --parallel 2
+      - name: Run ABI probe and sampling contract
+        run: |
+          ./build/test-abi-c
+          ctest --test-dir build --output-on-failure -R '^sampling_contract$'
 
   windows-msvc-shared:
     runs-on: windows-latest
@@ -28,9 +30,11 @@ jobs:
       - name: Configure
         shell: pwsh
         run: cmake -S . -B build -DQWEN_SHARED=ON -DGGML_NATIVE=OFF
-      - name: Build shared library and ABI probe
+      - name: Build shared library and regression tests
         shell: pwsh
-        run: cmake --build build --config Release --target qwen test-abi-c --parallel 2
-      - name: Run ABI probe
+        run: cmake --build build --config Release --target qwen test-abi-c test-sampling-contract --parallel 2
+      - name: Run ABI probe and sampling contract
         shell: pwsh
-        run: .\build\Release\test-abi-c.exe
+        run: |
+          .\build\Release\test-abi-c.exe
+          ctest --test-dir build -C Release --output-on-failure -R '^sampling_contract$'

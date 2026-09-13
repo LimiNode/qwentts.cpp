@@ -1303,6 +1303,23 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                 if (N == 1 && s.step == 0 && p->dump_dir) {
                     cp_dump = p->dump_dir;
                 }
+                if (N == 1 && p->dump_dir && s.step < 2) {
+                    std::string predictor_draws;
+                    for (int g = 1; g < num_codebooks; g++) {
+                        float u = 0.0f;
+                        philox_uniform_fill(seeds[(size_t) i], subseqs[(size_t) i] + g, 0u, &u, 1);
+                        if (!predictor_draws.empty()) {
+                            predictor_draws += ',';
+                        }
+                        predictor_draws += std::to_string(subseqs[(size_t) i] + g);
+                        predictor_draws += ':';
+                        char draw_text[32];
+                        std::snprintf(draw_text, sizeof(draw_text), "%.10f", (double) u);
+                        predictor_draws += draw_text;
+                    }
+                    qt_log(QT_LOG_DEBUG, "[ARTrace] predictor_philox step=%d base=%lld draws=%s", s.step,
+                           (long long) subseqs[(size_t) i], predictor_draws.c_str());
+                }
             }
             Timer t_pred;
             bool  pred_ok =

@@ -55,5 +55,54 @@ int main() {
                "diagnostics retain deterministic top tokens")) {
         return 1;
     }
+
+    // Model-free deterministic policy checks. The explicit uniform draw keeps
+    // these assertions independent of Philox/RNG scheduling.
+    const int32_t history[] = { 0 };
+    float policy_logits[]    = { 4.0F, 3.0F, 3.5F };
+    const int selected = sample_top_k_p_with_uniform(policy_logits, 3, 1.0F, 2, 1.0F, 2.0F, history, 1, 0.1F);
+    if (!check(selected == 1, "repetition penalty is applied before top-k selection")) {
+        return 1;
+    }
+
+    // The production wrapper must remain equivalent to the explicit-u seam:
+    // it owns only the Philox draw, not sampling policy.
+    const int64_t test_seed = 1006;
+    const int64_t test_subseq = 17;
+    float expected_logits[] = { 4.0F, 3.0F, 3.5F };
+    float actual_logits[]   = { 4.0F, 3.0F, 3.5F };
+    float expected_u = 0.0F;
+    philox_uniform_fill(test_seed, test_subseq, 0u, &expected_u, 1);
+    const int expected = sample_top_k_p_with_uniform(
+        expected_logits, 3, 1.0F, 2, 1.0F, 2.0F, history, 1, expected_u);
+    float actual_u = -2.0F;
+    const int actual = sample_top_k_p(
+        actual_logits, 3, 1.0F, 2, 1.0F, 2.0F, history, 1,
+        test_seed, test_subseq, &actual_u);
+    if (!check(actual == expected, "production wrapper matches explicit-u policy") ||
+        !check(actual_u == expected_u, "production wrapper exposes its Philox draw")) {
+        return 1;
+    }
+
+    float greedy_logits[] = { 2.0F, 7.0F, 3.0F };
+    if (!check(sample_top_k_p_with_uniform(greedy_logits, 3, 0.0F, 50, 1.0F, 2.0F, history, 1, -1.0F) == 1,
+               "greedy policy bypasses repetition penalty and RNG")) {
+        return 1;
+    }
+    float greedy_wrapper_u = 123.0F;
+    float greedy_wrapper_logits[] = { 2.0F, 7.0F, 3.0F };
+    if (!check(sample_top_k_p(greedy_wrapper_logits, 3, 0.0F, 50, 1.0F, 2.0F, history, 1,
+                              test_seed, test_subseq, &greedy_wrapper_u) == 1,
+               "greedy wrapper bypasses Philox") ||
+        !check(greedy_wrapper_u == -1.0F, "greedy wrapper reports no RNG draw")) {
+        return 1;
+    }
+
+    float top_p_logits[] = { 4.0F, 3.0F, 2.0F, 1.0F };
+    const int top_p_selected =
+        sample_top_k_p_with_uniform(top_p_logits, 4, 1.0F, 0, 0.70F, 1.0F, nullptr, 0, 0.95F);
+    if (!check(top_p_selected == 1, "top-p retains the boundary-crossing candidate")) {
+        return 1;
+    }
     return 0;
 }

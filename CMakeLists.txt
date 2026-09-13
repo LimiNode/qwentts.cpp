@@ -225,3 +225,14 @@ else()
     target_compile_options(test-sampling-contract PRIVATE -Wall -Wextra -Werror -Wno-unused-function -pedantic)
 endif()
 add_test(NAME sampling_contract COMMAND test-sampling-contract)
+
+# Cross-language model-free policy parity. The Python script is intentionally
+# dependency-free and compares the explicit-u native seam against a small
+# reference implementation over fixed edge-case vectors.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME sampling_contract_python_parity
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/verify-sampling-parity.py
+                     $<TARGET_FILE:test-sampling-contract>)
+endif()

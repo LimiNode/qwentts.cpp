@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 static void parse_codec_specials(const GGUFModel & gf, CodecSpecials & cs) {
     cs.pad_id       = (int) gf_get_u32(gf, "qwen3-tts.codec.pad_id");
@@ -918,6 +919,26 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
             const int shape[2] = { pt->num_code_groups, s.ref_codes_T };
             debug_dump_i32_as_f32(&d, "ref-codes", s.ref_codes_ptr, shape, 2);
         }
+
+        const uint64_t prompt_ids_hash = debug_hash64(
+            s.prompt.prompt_ids.data(), s.prompt.prompt_ids.size() * sizeof(s.prompt.prompt_ids[0]));
+        const uint64_t input_hash = debug_hash64(
+            s.prompt.input_embed.data(), s.prompt.input_embed.size() * sizeof(s.prompt.input_embed[0]));
+        const uint64_t trailing_hash = debug_hash64(
+            s.prompt.trailing_text_hidden.data(),
+            s.prompt.trailing_text_hidden.size() * sizeof(s.prompt.trailing_text_hidden[0]));
+        const uint64_t speaker_hash = ref_spk_emb_ptr != NULL ?
+            debug_hash64(ref_spk_emb_ptr, (size_t) pt->talker.hidden_size * sizeof(float)) : 0;
+        const uint64_t ref_codes_hash = s.ref_codes_T > 0 ?
+            debug_hash64(s.ref_codes_ptr,
+                         (size_t) pt->num_code_groups * (size_t) s.ref_codes_T * sizeof(int32_t)) : 0;
+        qt_log(QT_LOG_DEBUG,
+               "[ARTrace] prompt seed=%lld T_ctx=%d T_trailing=%d ref_T=%d prompt_ids_hash=%016llx "
+               "input_hash=%016llx trailing_hash=%016llx speaker_hash=%016llx ref_codes_hash=%016llx",
+               (long long) job->resolved_seed, s.prompt.T_ctx, s.prompt.T_trailing, s.ref_codes_T,
+               (unsigned long long) prompt_ids_hash, (unsigned long long) input_hash,
+               (unsigned long long) trailing_hash, (unsigned long long) speaker_hash,
+               (unsigned long long) ref_codes_hash);
     }
 
     s.talker_T = params->do_sample ? params->temperature : 0.0f;
@@ -1212,6 +1233,28 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                    (long long) (s.subseq_counter - 1));
         }
 
+        // The bounded trace observes the final multinomial weights without
+        // changing them or consuming RNG state. It is enabled only by the
+        // existing diagnostic dump option and deliberately stops at 128
+        // Talker steps so a runaway request cannot create unbounded logs.
+        if (p->dump_dir && s.step < 128) {
+            const SamplingDiagnostics diagnostics =
+                sampling_diagnostics_from_weights(s.logits.data(), vocab, c0, codec_eos_id, 5);
+            std::string top;
+            for (const TokenProb & token : diagnostics.top_tokens) {
+                if (!top.empty()) {
+                    top += ',';
+                }
+                top += std::to_string(token.id) + ':' + std::to_string(token.prob);
+            }
+            qt_log(QT_LOG_DEBUG,
+                   "[ARTrace] sample step=%d c0=%d u=%.10f selected_p=%.9g eos_id=%d eos_p=%.9g "
+                   "eos_rank=%d candidates=%d history=%d top=%s",
+                   s.step, c0, (double) u_c0, (double) diagnostics.selected_probability, codec_eos_id,
+                   (double) diagnostics.eos_probability, diagnostics.eos_rank, diagnostics.candidate_count,
+                   (int) s.talker_history.size(), top.c_str());
+        }
+
         if (c0 == codec_eos_id) {
             qt_log(QT_LOG_INFO, "[Pipeline] EOS at step %d, stopping (slot %d)", s.step, i);
             s.finished = true;
@@ -1292,6 +1335,16 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
 
                     std::vector<int32_t> codes(cp.codes.begin() + (size_t) i * (size_t) num_codebooks,
                                                cp.codes.begin() + (size_t) (i + 1) * (size_t) num_codebooks);
+                    if (p->dump_dir && s.step < 2) {
+                        std::string code_text;
+                        for (int code : codes) {
+                            if (!code_text.empty()) {
+                                code_text += ',';
+                            }
+                            code_text += std::to_string(code);
+                        }
+                        qt_log(QT_LOG_DEBUG, "[ARTrace] predictor step=%d codes=%s", s.step, code_text.c_str());
+                    }
                     s.all_codes.push_back(codes);
                     s.talker_history.push_back(s.pending_c0);
 

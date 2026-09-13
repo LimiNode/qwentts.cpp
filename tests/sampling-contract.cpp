@@ -38,5 +38,22 @@ int main() {
                "an invalid EOS id leaves scores unchanged")) {
         return 1;
     }
+
+    const float weights[] = {1.0F, 4.0F, 2.0F, 0.0F};
+    const SamplingDiagnostics diagnostics =
+        sampling_diagnostics_from_weights(weights, 4, 2, 0, 3);
+    if (!check(diagnostics.candidate_count == 3, "diagnostics count eligible candidates") ||
+        !check(diagnostics.eos_rank == 3, "diagnostics rank EOS") ||
+        !check(std::fabs(diagnostics.eos_probability - 1.0F / 7.0F) < 1e-6F,
+               "diagnostics report EOS probability") ||
+        !check(std::fabs(diagnostics.selected_probability - 2.0F / 7.0F) < 1e-6F,
+               "diagnostics report selected probability") ||
+        !check(diagnostics.top_tokens.size() == 3 &&
+                   diagnostics.top_tokens[0].id == 1 &&
+                   diagnostics.top_tokens[1].id == 2 &&
+                   diagnostics.top_tokens[2].id == 0,
+               "diagnostics retain deterministic top tokens")) {
+        return 1;
+    }
     return 0;
 }

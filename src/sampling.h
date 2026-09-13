@@ -24,6 +24,71 @@ struct TokenProb {
     float prob;
 };
 
+// Bounded diagnostics derived from the final multinomial weights after
+// suppression, repetition penalty, temperature, top-k and top-p. The helper
+// observes the sampler output without changing it or consuming RNG state.
+struct SamplingDiagnostics {
+    float                  selected_probability = 0.0f;
+    float                  eos_probability      = 0.0f;
+    int                    eos_rank             = 0; // 0 means filtered/ineligible
+    int                    candidate_count      = 0;
+    std::vector<TokenProb> top_tokens;
+};
+
+static SamplingDiagnostics sampling_diagnostics_from_weights(const float * weights,
+                                                              int           V,
+                                                              int           selected_id,
+                                                              int           eos_id,
+                                                              int           top_n) {
+    SamplingDiagnostics result;
+    if (!weights || V <= 0) {
+        return result;
+    }
+
+    double sum = 0.0;
+    for (int i = 0; i < V; i++) {
+        const float weight = weights[i];
+        if (std::isfinite(weight) && weight > 0.0f) {
+            sum += weight;
+            result.candidate_count++;
+        }
+    }
+    if (!(sum > 0.0)) {
+        return result;
+    }
+
+    if (selected_id >= 0 && selected_id < V) {
+        result.selected_probability = static_cast<float>(weights[selected_id] / sum);
+    }
+    if (eos_id >= 0 && eos_id < V && std::isfinite(weights[eos_id]) && weights[eos_id] > 0.0f) {
+        result.eos_probability = static_cast<float>(weights[eos_id] / sum);
+        result.eos_rank        = 1;
+        for (int i = 0; i < V; i++) {
+            if (weights[i] > weights[eos_id]) {
+                result.eos_rank++;
+            }
+        }
+    }
+
+    if (top_n > 0) {
+        std::vector<TokenProb> candidates;
+        candidates.reserve(static_cast<size_t>(result.candidate_count));
+        for (int i = 0; i < V; i++) {
+            if (std::isfinite(weights[i]) && weights[i] > 0.0f) {
+                candidates.push_back({ i, static_cast<float>(weights[i] / sum) });
+            }
+        }
+        const size_t keep = std::min(static_cast<size_t>(top_n), candidates.size());
+        std::partial_sort(candidates.begin(), candidates.begin() + keep, candidates.end(),
+                          [](const TokenProb & a, const TokenProb & b) {
+                              return a.prob > b.prob || (a.prob == b.prob && a.id < b.id);
+                          });
+        candidates.resize(keep);
+        result.top_tokens = std::move(candidates);
+    }
+    return result;
+}
+
 // Mask logits in [lo, hi) to -inf, except keep is left untouched.
 static inline void apply_suppress(float * logits, int V, int lo, int hi, int keep) {
     if (lo < 0) {

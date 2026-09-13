@@ -154,21 +154,19 @@ static inline void apply_repetition_penalty(float *         logits,
 // logits, no rep_pen, no philox draw.
 //
 // Buffers are thread_local to avoid alloc per token.
-static int sample_top_k_p(float *         logits,
-                          int             V,
-                          float           temperature,
-                          int             top_k,
-                          float           top_p,
-                          float           rep_pen,
-                          const int32_t * history,
-                          int             n_history,
-                          int64_t         seed,
-                          int64_t         philox_subseq,
-                          float *         dump_u_out) {
+// Deterministic sampler seam used by model-free parity tests. A uniform value
+// in [0, 1) is supplied explicitly, so tests can compare native and Python
+// categorical selection without coupling the policy test to an RNG.
+static int sample_top_k_p_with_uniform(float *         logits,
+                                       int             V,
+                                       float           temperature,
+                                       int             top_k,
+                                       float           top_p,
+                                       float           rep_pen,
+                                       const int32_t * history,
+                                       int             n_history,
+                                       float           uniform_u) {
     if (temperature <= 0.0f) {
-        if (dump_u_out) {
-            *dump_u_out = -1.0f;
-        }
         return (int) (std::max_element(logits, logits + V) - logits);
     }
 
@@ -257,13 +255,7 @@ static int sample_top_k_p(float *         logits,
         sum += logits[i];
     }
 
-    float u = 0.0f;
-    philox_uniform_fill(seed, philox_subseq, 0u, &u, 1);
-    if (dump_u_out) {
-        *dump_u_out = u;
-    }
-
-    float r   = u * sum;
+    float r   = uniform_u * sum;
     float acc = 0.0f;
     for (int i = 0; i < V; i++) {
         acc += logits[i];
@@ -272,4 +264,28 @@ static int sample_top_k_p(float *         logits,
         }
     }
     return V - 1;
+}
+
+// Stochastic production entry point. It owns the Philox draw and delegates
+// the policy itself to the deterministic seam above.
+static int sample_top_k_p(float *         logits,
+                          int             V,
+                          float           temperature,
+                          int             top_k,
+                          float           top_p,
+                          float           rep_pen,
+                          const int32_t * history,
+                          int             n_history,
+                          int64_t         seed,
+                          int64_t         philox_subseq,
+                          float *         dump_u_out) {
+    float uniform_u = -1.0f;
+    if (temperature > 0.0f) {
+        philox_uniform_fill(seed, philox_subseq, 0u, &uniform_u, 1);
+    }
+    if (dump_u_out) {
+        *dump_u_out = uniform_u;
+    }
+    return sample_top_k_p_with_uniform(logits, V, temperature, top_k, top_p, rep_pen, history, n_history,
+                                       uniform_u);
 }

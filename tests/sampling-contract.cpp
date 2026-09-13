@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cmath>
+#include <cstring>
 #include <limits>
 
 namespace {
@@ -15,7 +16,53 @@ bool check(bool condition, const char *description) {
 
 } // namespace
 
-int main() {
+struct ParityVector {
+    const char *name;
+    float logits[4];
+    int vocab;
+    float temperature;
+    int top_k;
+    float top_p;
+    float repetition_penalty;
+    const int32_t *history;
+    int history_size;
+    float uniform_u;
+};
+
+int dump_parity_vectors() {
+    const int32_t positive_history[] = { 0 };
+    const int32_t negative_history[] = { 0 };
+    const int32_t *no_history = nullptr;
+    const ParityVector vectors[] = {
+        { "positive_repetition", { 4.0F, 3.0F, 3.5F, 0.0F }, 3, 1.0F, 2, 1.0F, 2.0F, positive_history, 1, 0.1F },
+        { "negative_repetition", { -4.0F, -3.0F, -3.5F, 0.0F }, 3, 1.0F, 2, 1.0F, 2.0F, negative_history, 1, 0.1F },
+        { "top_k_one", { 1.0F, 9.0F, 8.0F, 0.0F }, 3, 1.0F, 1, 1.0F, 1.0F, no_history, 0, 0.99F },
+        { "top_k_zero", { 1.0F, 2.0F, 3.0F, 0.0F }, 3, 1.0F, 0, 1.0F, 1.0F, no_history, 0, 0.01F },
+        { "top_p_one", { 4.0F, 3.0F, 2.0F, 0.0F }, 3, 1.0F, 0, 1.0F, 1.0F, no_history, 0, 0.90F },
+        { "top_p_crossing", { 4.0F, 3.0F, 2.0F, 1.0F }, 4, 1.0F, 0, 0.70F, 1.0F, no_history, 0, 0.95F },
+        { "uniform_low", { 1.0F, 0.0F, -1.0F, 0.0F }, 3, 1.0F, 0, 1.0F, 1.0F, no_history, 0, 0.0000001F },
+        { "uniform_high", { 1.0F, 0.0F, -1.0F, 0.0F }, 3, 1.0F, 0, 1.0F, 1.0F, no_history, 0, 0.9999999F },
+        { "ties", { 1.0F, 1.0F, 1.0F, 0.0F }, 3, 1.0F, 0, 1.0F, 1.0F, no_history, 0, 0.50F },
+        { "temperature", { 4.0F, 3.0F, 2.0F, 0.0F }, 3, 2.0F, 0, 1.0F, 1.0F, no_history, 0, 0.75F },
+    };
+
+    std::printf("name\tselected\tu\n");
+    for (const ParityVector &vector : vectors) {
+        float logits[4];
+        std::memcpy(logits, vector.logits, sizeof(logits));
+        const int selected = sample_top_k_p_with_uniform(
+            logits, vector.vocab, vector.temperature, vector.top_k, vector.top_p,
+            vector.repetition_penalty, vector.history, vector.history_size, vector.uniform_u);
+        std::printf("%s\t%d\t%.9g\n", vector.name, selected, vector.uniform_u);
+    }
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--dump-parity-vectors") == 0) {
+        return dump_parity_vectors();
+    }
+
     float first_step[] = {1.0F, 100.0F, 2.0F};
     suppress_initial_eos(first_step, 3, 1, 0);
     if (!check(std::isinf(first_step[1]) && first_step[1] < 0.0F,

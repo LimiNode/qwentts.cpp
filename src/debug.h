@@ -7,6 +7,7 @@
 #include "utf8.h"
 
 #include <cstdint>
+#include <cstddef>
 #include <cstdio>
 #include <vector>
 
@@ -14,6 +15,18 @@ struct DebugDumper {
     char dir[512];
     bool enabled;
 };
+
+// Stable byte fingerprint for diagnostic provenance. FNV-1a is sufficient:
+// the hash detects prompt/reference divergence and is not a security boundary.
+static uint64_t debug_hash64(const void * data, size_t size) {
+    const auto * bytes = static_cast<const uint8_t *>(data);
+    uint64_t     hash  = 1469598103934665603ULL;
+    for (size_t i = 0; i < size; i++) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
 
 static void debug_init(DebugDumper * d, const char * dir) {
     d->enabled = (dir != nullptr);

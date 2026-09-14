@@ -295,6 +295,10 @@ def main():
     ap.add_argument("--lang",           default="english")
     ap.add_argument("--quant",          default="F32",
                     help="GGUF quantization suffix (F32, BF16, Q8_0, Q4_K_M)")
+    ap.add_argument("--model-talker",   default=None,
+                    help="override the Talker GGUF path")
+    ap.add_argument("--model-codec",    default=None,
+                    help="override the codec GGUF path")
     ap.add_argument("--out-pt",         default=os.path.join(DUMP_PT,  "clone-python.wav"))
     ap.add_argument("--out-cpp",        default=os.path.join(DUMP_CPP, "clone-cpp.wav"))
     ap.add_argument("--max-new-tokens", type=int, default=64)
@@ -459,8 +463,8 @@ def main():
     if not os.path.isfile(cc.BIN):
         print(f"[Cossim] FATAL: {cc.BIN} not found, build qwen-tts first")
         sys.exit(1)
-    model_lm  = MODEL_T.format(q=args.quant)
-    model_cdc = MODEL_CDC_T.format(q=args.quant)
+    model_lm  = args.model_talker or MODEL_T.format(q=args.quant)
+    model_cdc = args.model_codec or MODEL_CDC_T.format(q=args.quant)
     for p in (model_lm, model_cdc):
         if not os.path.isfile(p):
             print(f"[Cossim] FATAL: GGUF not found: {p}")

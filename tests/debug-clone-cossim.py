@@ -65,7 +65,31 @@ STAGES_CLONE = cc.STAGES_STANDARD + [
     ("SpeakerEmb",      "spk-emb.bin"),
 ]
 
-def install_clone_hooks(model, dump_dir):
+def write_reference_latents(directory, speaker_embedding, reference_codes):
+    """Export Python reference tensors in qwentts CLI latent-file formats."""
+    os.makedirs(directory, exist_ok=True)
+    np.asarray(speaker_embedding.detach().cpu(), dtype=np.float32).tofile(
+        os.path.join(directory, "reference.spk")
+    )
+    codes = np.asarray(reference_codes.detach().cpu(), dtype=np.int32).reshape(-1)
+    packed = bytearray((codes.size * 11 + 7) // 8)
+    accumulator = 0
+    bits = 0
+    out_pos = 0
+    for code in codes:
+        accumulator |= (int(code) & 0x7FF) << bits
+        bits += 11
+        while bits >= 8:
+            packed[out_pos] = accumulator & 0xFF
+            out_pos += 1
+            accumulator >>= 8
+            bits -= 8
+    if bits:
+        packed[out_pos] = accumulator & 0xFF
+    with open(os.path.join(directory, "reference.rvq"), "wb") as handle:
+        handle.write(packed)
+
+def install_clone_hooks(model, dump_dir, dump_predictor_logits=False):
     """Capture the codec encoder bisection points (SEANet, encoder_transformer,
     downsample = pre-FSQ latents), the ECAPA mel front end input, and four
     ECAPA forward bisection points (frontend conv0 output, third SE-Res2Net
@@ -227,6 +251,27 @@ def install_clone_hooks(model, dump_dir):
         seen_asp["done"] = True
     spk.asp.register_forward_hook(hook_asp)
 
+    if dump_predictor_logits:
+        # The native graph exposes slot-0 predictor logits only in its
+        # diagnostic dump mode. Capture the first invocation of each Python
+        # codebook head, which corresponds to the first generated frame.
+        predictor = model.talker.code_predictor
+        seen_predictor = set()
+        for step, head in enumerate(predictor.lm_head):
+            def hook_predictor(module, args, output, step=step):
+                if step in seen_predictor:
+                    return
+                logits = output[0] if isinstance(output, tuple) else output
+                if getattr(logits, "dim", lambda: 0)() == 3:
+                    logits = logits[:, -1, :]
+                if getattr(logits, "dim", lambda: 0)() == 2:
+                    cc.save_dump(
+                        os.path.join(dump_dir, f"predictor-logits-step{step}.bin"),
+                        logits[0],
+                    )
+                    seen_predictor.add(step)
+            head.register_forward_hook(hook_predictor)
+
 def dump_mel_constants(dump_dir):
     """Reproduce the speaker encoder mel front end CPU constants the same
     way the upstream mel_spectrogram() builds them (torch.hann_window for
@@ -276,11 +321,19 @@ def main():
     ap.add_argument("--lang",           default="english")
     ap.add_argument("--quant",          default="F32",
                     help="GGUF quantization suffix (F32, BF16, Q8_0, Q4_K_M)")
+    ap.add_argument("--model-talker",   default=None,
+                    help="override the Talker GGUF path")
+    ap.add_argument("--model-codec",    default=None,
+                    help="override the codec GGUF path")
     ap.add_argument("--out-pt",         default=os.path.join(DUMP_PT,  "clone-python.wav"))
     ap.add_argument("--out-cpp",        default=os.path.join(DUMP_CPP, "clone-cpp.wav"))
     ap.add_argument("--max-new-tokens", type=int, default=64)
     ap.add_argument("--trace",          action="store_true",
                     help="print per sample u and idx for the first 32 samples")
+    ap.add_argument("--dump-predictor-logits", action="store_true",
+                    help="dump first-frame Python code-predictor logits")
+    ap.add_argument("--export-reference-latents", default=None,
+                    help="export Python speaker/code tensors and reuse them natively")
     args = ap.parse_args()
 
     cc.ensure_dir(DUMP_PT)
@@ -321,7 +374,7 @@ def main():
     # Install codec encoder + ECAPA front end hooks before any encode call,
     # so the freshly captured intermediates land in DUMP_PT/*.bin alongside
     # the talker stages installed further down by cc.install_hooks.
-    install_clone_hooks(model, DUMP_PT)
+    install_clone_hooks(model, DUMP_PT, dump_predictor_logits=args.dump_predictor_logits)
 
     # Load reference WAV. Resample to 24 kHz if needed since both the speaker
     # encoder and the codec tokenizer expect 24 kHz mono input.
@@ -371,6 +424,8 @@ def main():
     ref_code_kt = ref_code_pt.transpose(0, 1).contiguous()
     print(f"[Python] RefCodes shape: {tuple(ref_code_kt.shape)} (K, T_codec)")
     cc.save_dump_i32(os.path.join(DUMP_PT, "ref-codes.bin"), ref_code_kt)
+    if args.export_reference_latents:
+        write_reference_latents(args.export_reference_latents, spk_emb, ref_code_kt)
 
     # Tokenize the utterance and the reference text.
     assistant_text = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
@@ -438,8 +493,8 @@ def main():
     if not os.path.isfile(cc.BIN):
         print(f"[Cossim] FATAL: {cc.BIN} not found, build qwen-tts first")
         sys.exit(1)
-    model_lm  = MODEL_T.format(q=args.quant)
-    model_cdc = MODEL_CDC_T.format(q=args.quant)
+    model_lm  = args.model_talker or MODEL_T.format(q=args.quant)
+    model_cdc = args.model_codec or MODEL_CDC_T.format(q=args.quant)
     for p in (model_lm, model_cdc):
         if not os.path.isfile(p):
             print(f"[Cossim] FATAL: GGUF not found: {p}")
@@ -455,7 +510,6 @@ def main():
         "--model",     model_lm,
         "--codec",     model_cdc,
         "--seed",      str(args.seed),
-        "--ref-wav",   args.ref_wav,
         "--ref-text",  args.ref_text,
         "--lang",      args.lang,
         "--max-new",   str(args.max_new_tokens),
@@ -463,6 +517,13 @@ def main():
         "-o",          args.out_cpp,
         "--greedy",
     ]
+    if args.export_reference_latents:
+        cmd.extend([
+            "--ref-spk", os.path.join(args.export_reference_latents, "reference.spk"),
+            "--ref-rvq", os.path.join(args.export_reference_latents, "reference.rvq"),
+        ])
+    else:
+        cmd.extend(["--ref-wav", args.ref_wav])
     print(f"[GGML] Cmd: {' '.join(cmd)}")
     r = subprocess.run(cmd, input=text, text=True)
     if r.returncode != 0:
@@ -477,6 +538,18 @@ def main():
     cc.compare_exact_i32("prompt-ids.bin", DUMP_CPP, DUMP_PT, "PromptIDs")
     cc.compare_exact_i32("ref-codes.bin",  DUMP_CPP, DUMP_PT, "RefCodes")
     cc.compare_stages(STAGES_CLONE, DUMP_CPP, DUMP_PT)
+    if args.dump_predictor_logits:
+        for step in range(32):
+            name = f"predictor-logits-step{step}.bin"
+            try:
+                aa, ab = cc.pair(name, DUMP_CPP, DUMP_PT)
+            except FileNotFoundError:
+                break
+            c, mx, mean = cc.metric(aa, ab)
+            print(
+                f"[Cossim] PredictorLogits{step} cos: {c:.6f} "
+                f"max: {mx:.4e} mean: {mean:.4e}"
+            )
     cc.compare_exact_i32("codes-full.bin", DUMP_CPP, DUMP_PT, "CodesFull")
 
     aa, ab = cc.pair("output-audio.bin", DUMP_CPP, DUMP_PT)

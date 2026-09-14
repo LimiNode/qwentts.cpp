@@ -395,13 +395,17 @@ static bool code_predictor_frame_graph_build(const CodePredictorWeights * cw,
 
     std::vector<CodePredPassBake> bake;
     bake.reserve((size_t) n_acoustic);
+    std::vector<struct ggml_tensor *> logits_steps;
+    logits_steps.reserve((size_t) n_acoustic);
     struct ggml_tensor * logits = NULL;
 
     code_predictor_pass_append(cp->ctx, gf, cw, kv, talker_embd_table, hidden_bridge, sp, 0, N, use_flash_attn,
                                clamp_fp16, &logits, bake);
+    logits_steps.push_back(logits);
     for (int g = 1; g < n_acoustic; g++) {
         code_predictor_pass_append(cp->ctx, gf, cw, kv, cw->codec_embedding[(size_t) (g - 1)], NULL, sp, g, N,
                                    use_flash_attn, clamp_fp16, &logits, bake);
+        logits_steps.push_back(logits);
     }
 
     cp->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -414,6 +418,7 @@ static bool code_predictor_frame_graph_build(const CodePredictorWeights * cw,
 
     cp->gf     = gf;
     cp->logits = logits;
+    cp->logits_steps = std::move(logits_steps);
     cp->N      = N;
     return true;
 }
@@ -466,6 +471,21 @@ static bool code_predictor_frame_step(const CodePredictorWeights * cw,
         std::vector<int32_t> codes32(out->codes.begin(), out->codes.begin() + n_codes);
         int                  n = (int) codes32.size();
         debug_dump_i32_as_f32(&d, "codes-step0", codes32.data(), &n, 1);
+
+        // Diagnostic-only readback: the normal predictor path keeps logits on
+        // device and samples directly in the graph. When a dump directory is
+        // requested, expose slot-0 logits for every codebook so Python and
+        // native model parity can be localized before sampling. The tensor is
+        // laid out [vocab, N], therefore the first vocab values are slot 0.
+        for (size_t g = 0; g < frame_graph->logits_steps.size(); g++) {
+            struct ggml_tensor * logits = frame_graph->logits_steps[g];
+            const int            vocab  = (int) logits->ne[0];
+            std::vector<float>   values((size_t) vocab * (size_t) N);
+            ggml_backend_tensor_get(logits, values.data(), 0, values.size() * sizeof(float));
+            char name[64];
+            snprintf(name, sizeof(name), "predictor-logits-step%zu", g);
+            debug_dump_1d(&d, name, values.data(), vocab);
+        }
     }
 
     return true;

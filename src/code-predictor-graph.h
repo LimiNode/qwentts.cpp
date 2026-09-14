@@ -9,11 +9,16 @@
 #include "ggml-alloc.h"
 #include "ggml.h"
 
+#include <vector>
+
 struct CodePredGraph {
     struct ggml_context * ctx    = nullptr;
     struct ggml_cgraph *  gf     = nullptr;
     ggml_gallocr_t        galloc = nullptr;
     struct ggml_tensor *  logits = nullptr;  // [Vg, N] f32
+    // All per-codebook logits, retained only as graph metadata so the
+    // opt-in diagnostic path can read them back after one frame replay.
+    std::vector<struct ggml_tensor *> logits_steps;
     int                   N      = 0;        // batch width this build covers
 };
 
@@ -28,5 +33,6 @@ static void code_predictor_graph_free(CodePredGraph * cp) {
     }
     cp->gf     = nullptr;
     cp->logits = nullptr;
+    cp->logits_steps.clear();
     cp->N      = 0;
 }

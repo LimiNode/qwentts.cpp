@@ -65,7 +65,7 @@ STAGES_CLONE = cc.STAGES_STANDARD + [
     ("SpeakerEmb",      "spk-emb.bin"),
 ]
 
-def install_clone_hooks(model, dump_dir):
+def install_clone_hooks(model, dump_dir, dump_predictor_logits=False):
     """Capture the codec encoder bisection points (SEANet, encoder_transformer,
     downsample = pre-FSQ latents), the ECAPA mel front end input, and four
     ECAPA forward bisection points (frontend conv0 output, third SE-Res2Net
@@ -227,6 +227,25 @@ def install_clone_hooks(model, dump_dir):
         seen_asp["done"] = True
     spk.asp.register_forward_hook(hook_asp)
 
+    if dump_predictor_logits:
+        # The native graph exposes slot-0 predictor logits only in its
+        # diagnostic dump mode. Capture the first invocation of each Python
+        # codebook head, which corresponds to the first generated frame.
+        predictor = model.talker.code_predictor
+        seen_predictor = set()
+        for step, head in enumerate(predictor.lm_head):
+            def hook_predictor(module, args, output, step=step):
+                if step in seen_predictor:
+                    return
+                logits = output[0] if isinstance(output, tuple) else output
+                if getattr(logits, "dim", lambda: 0)() == 2:
+                    cc.save_dump(
+                        os.path.join(dump_dir, f"predictor-logits-step{step}.bin"),
+                        logits[0],
+                    )
+                    seen_predictor.add(step)
+            head.register_forward_hook(hook_predictor)
+
 def dump_mel_constants(dump_dir):
     """Reproduce the speaker encoder mel front end CPU constants the same
     way the upstream mel_spectrogram() builds them (torch.hann_window for
@@ -281,6 +300,8 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=64)
     ap.add_argument("--trace",          action="store_true",
                     help="print per sample u and idx for the first 32 samples")
+    ap.add_argument("--dump-predictor-logits", action="store_true",
+                    help="dump first-frame Python code-predictor logits")
     args = ap.parse_args()
 
     cc.ensure_dir(DUMP_PT)
@@ -321,7 +342,7 @@ def main():
     # Install codec encoder + ECAPA front end hooks before any encode call,
     # so the freshly captured intermediates land in DUMP_PT/*.bin alongside
     # the talker stages installed further down by cc.install_hooks.
-    install_clone_hooks(model, DUMP_PT)
+    install_clone_hooks(model, DUMP_PT, dump_predictor_logits=args.dump_predictor_logits)
 
     # Load reference WAV. Resample to 24 kHz if needed since both the speaker
     # encoder and the codec tokenizer expect 24 kHz mono input.
@@ -477,6 +498,18 @@ def main():
     cc.compare_exact_i32("prompt-ids.bin", DUMP_CPP, DUMP_PT, "PromptIDs")
     cc.compare_exact_i32("ref-codes.bin",  DUMP_CPP, DUMP_PT, "RefCodes")
     cc.compare_stages(STAGES_CLONE, DUMP_CPP, DUMP_PT)
+    if args.dump_predictor_logits:
+        for step in range(32):
+            name = f"predictor-logits-step{step}.bin"
+            try:
+                aa, ab = cc.pair(name, DUMP_CPP, DUMP_PT)
+            except FileNotFoundError:
+                break
+            c, mx, mean = cc.metric(aa, ab)
+            print(
+                f"[Cossim] PredictorLogits{step} cos: {c:.6f} "
+                f"max: {mx:.4e} mean: {mean:.4e}"
+            )
     cc.compare_exact_i32("codes-full.bin", DUMP_CPP, DUMP_PT, "CodesFull")
 
     aa, ab = cc.pair("output-audio.bin", DUMP_CPP, DUMP_PT)

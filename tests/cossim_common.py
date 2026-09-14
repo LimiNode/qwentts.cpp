@@ -143,13 +143,31 @@ def philox_uniform(seed, subseq, ctr_lo=0):
 _subseq_counter = [0]
 _seed           = [42]
 _trace_samples  = [False]
+_sample_trace   = []
+_original_multinomial = torch.multinomial
 
 def reset_philox(seed):
     _subseq_counter[0] = 0
     _seed[0]           = int(seed)
+    _sample_trace.clear()
 
 def set_trace(flag):
     _trace_samples[0] = bool(flag)
+
+def enable_philox_sampling(seed, trace=False):
+    """Use the qwentts Philox stream for Python multinomial draws.
+
+    This is intentionally opt-in: the ordinary cossim scripts retain their
+    historical greedy behavior, while stochastic parity runs can share the
+    exact seed/subsequence contract with the native sampler.
+    """
+    reset_philox(seed)
+    set_trace(trace)
+    torch.multinomial = patched_multinomial
+
+def sample_trace():
+    """Return a copy of the recorded multinomial draws for parity checks."""
+    return list(_sample_trace)
 
 def patched_multinomial(input, num_samples, replacement=False, generator=None, out=None):
     """Drop in replacement for torch.multinomial(num_samples=1) that pulls
@@ -180,6 +198,7 @@ def patched_multinomial(input, num_samples, replacement=False, generator=None, o
         out_ids[b, 0] = idx
         if _trace_samples[0] and seq < 32:
             print(f"[Sample-PY] subseq={seq} u={float(u):.10f} idx={idx} top_prob={float(row.max()):.6f}")
+        _sample_trace.append({"subseq": seq, "u": float(u), "idx": idx})
     if input.dim() == 1:
         return out_ids.squeeze(0)
     return out_ids
@@ -394,4 +413,16 @@ GEN_KWARGS_GREEDY = dict(
     do_sample             = False,
     subtalker_dosample    = False,
     repetition_penalty    = 1.0,
+)
+
+GEN_KWARGS_STOCHASTIC = dict(
+    do_sample             = True,
+    temperature           = 0.9,
+    top_k                 = 50,
+    top_p                 = 1.0,
+    repetition_penalty    = 1.05,
+    subtalker_dosample    = True,
+    subtalker_temperature = 0.9,
+    subtalker_top_k       = 50,
+    subtalker_top_p       = 1.0,
 )

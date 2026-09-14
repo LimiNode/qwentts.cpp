@@ -510,8 +510,9 @@ def main():
     cc.save_dump(os.path.join(DUMP_PT, "output-audio.bin"), audio_pt)
     print(f"[Python] Audio: {audio_pt.shape[0]} samples {fs} Hz {audio_pt.shape[0]/fs:.2f}s -> {args.out_pt}")
 
-    if not os.path.isfile(cc.BIN):
-        print(f"[Cossim] FATAL: {cc.BIN} not found, build qwen-tts first")
+    binary = cc.find_binary()
+    if binary is None:
+        print(f"[Cossim] FATAL: {cc.BIN}[.exe] not found, build qwen-tts first")
         sys.exit(1)
     model_lm  = args.model_talker or MODEL_T.format(q=args.quant)
     model_cdc = args.model_codec or MODEL_CDC_T.format(q=args.quant)
@@ -526,7 +527,7 @@ def main():
         torch.cuda.empty_cache()
 
     cmd = [
-        cc.BIN,
+        binary,
         "--model",     model_lm,
         "--codec",     model_cdc,
         "--seed",      str(args.seed),

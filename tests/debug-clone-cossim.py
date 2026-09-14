@@ -334,6 +334,12 @@ def main():
                     help="dump first-frame Python code-predictor logits")
     ap.add_argument("--export-reference-latents", default=None,
                     help="export Python speaker/code tensors and reuse them natively")
+    ap.add_argument("--stochastic",     action="store_true",
+                    help="run both stacks with the shared Philox stochastic sampler")
+    ap.add_argument("--temperature",    type=float, default=0.9)
+    ap.add_argument("--top-k",           type=int, default=50)
+    ap.add_argument("--top-p",           type=float, default=1.0)
+    ap.add_argument("--repetition-penalty", type=float, default=1.05)
     args = ap.parse_args()
 
     cc.ensure_dir(DUMP_PT)
@@ -353,11 +359,25 @@ def main():
     print(f"[Input] RefAudio: {args.ref_wav}")
     print(f"[Input] RefText: {len(ref_text)} chars: {ref_text[:60]}{'...' if len(ref_text) > 60 else ''}")
     print(f"[Input] Lang: {args.lang} Seed: {args.seed} MaxNewTokens: {args.max_new_tokens}")
-    print(f"[Input] Mode: greedy ICL")
+    print(f"[Input] Mode: {'stochastic' if args.stochastic else 'greedy'} ICL")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    cc.set_trace(args.trace)
+    if args.stochastic:
+        cc.enable_philox_sampling(args.seed, trace=args.trace)
+        generation_kwargs = dict(cc.GEN_KWARGS_STOCHASTIC)
+        generation_kwargs.update(
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            repetition_penalty=args.repetition_penalty,
+            subtalker_temperature=args.temperature,
+            subtalker_top_k=args.top_k,
+            subtalker_top_p=args.top_p,
+        )
+    else:
+        cc.set_trace(args.trace)
+        generation_kwargs = cc.GEN_KWARGS_GREEDY
 
     cc.register_qwen3_tts()
 
@@ -469,7 +489,7 @@ def main():
         languages=[args.lang],
         non_streaming_mode=False,
         max_new_tokens=args.max_new_tokens,
-        **cc.GEN_KWARGS_GREEDY,
+        **generation_kwargs,
     )
     codes = talker_codes_list[0]
     print(f"[Python] Codes shape: {tuple(codes.shape)} (T_frames, num_code_groups)")
@@ -515,7 +535,6 @@ def main():
         "--max-new",   str(args.max_new_tokens),
         "--dump",      DUMP_CPP,
         "-o",          args.out_cpp,
-        "--greedy",
     ]
     if args.export_reference_latents:
         cmd.extend([
@@ -524,10 +543,47 @@ def main():
         ])
     else:
         cmd.extend(["--ref-wav", args.ref_wav])
+    if args.stochastic:
+        cmd += [
+            "--temp", str(args.temperature),
+            "--top-k", str(args.top_k),
+            "--top-p", str(args.top_p),
+            "--rep-pen", str(args.repetition_penalty),
+            "--sub-temp", str(args.temperature),
+            "--sub-top-k", str(args.top_k),
+            "--sub-top-p", str(args.top_p),
+        ]
+    else:
+        cmd.append("--greedy")
     print(f"[GGML] Cmd: {' '.join(cmd)}")
-    r = subprocess.run(cmd, input=text, text=True)
+    r = subprocess.run(cmd, input=text, text=True, capture_output=True)
+    if r.stdout:
+        print(r.stdout, end="")
+    if r.stderr:
+        print(r.stderr, file=sys.stderr, end="")
     if r.returncode != 0:
         sys.exit(r.returncode)
+
+    if args.stochastic:
+        native_trace = []
+        for line in r.stderr.splitlines():
+            if "[Sample] " not in line:
+                continue
+            fields = dict(item.split("=", 1) for item in line.split("[Sample] ", 1)[1].split() if "=" in item)
+            native_trace.append({"subseq": int(fields["subseq"]), "u": float(fields["u"]), "idx": int(fields["c0"])})
+        # Native emits a compact [Sample] line for Talker codebook-0 only;
+        # the 15 predictor selections are covered by the exact codes-full
+        # comparison below. Filter the Python Philox stream to the same
+        # frame-start subsequences before comparing c0 selections.
+        python_trace = [item for item in cc.sample_trace() if item["subseq"] % 16 == 0]
+        if len(native_trace) != len(python_trace):
+            raise RuntimeError(f"stochastic Talker sample count mismatch: native={len(native_trace)} python={len(python_trace)}")
+        for native, python in zip(native_trace, python_trace):
+            if native["subseq"] != python["subseq"] or native["idx"] != python["idx"]:
+                raise RuntimeError(f"stochastic token mismatch: native={native} python={python}")
+            if abs(native["u"] - python["u"]) > 1e-9:
+                raise RuntimeError(f"stochastic Philox mismatch: native={native} python={python}")
+        print(f"[Parity] stochastic sample trace exact: {len(native_trace)} draws")
 
     audio_cpp, sr = sf.read(args.out_cpp)
     if audio_cpp.ndim > 1:

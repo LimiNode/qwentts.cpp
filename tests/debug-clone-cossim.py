@@ -65,6 +65,30 @@ STAGES_CLONE = cc.STAGES_STANDARD + [
     ("SpeakerEmb",      "spk-emb.bin"),
 ]
 
+def write_reference_latents(directory, speaker_embedding, reference_codes):
+    """Export Python reference tensors in qwentts CLI latent-file formats."""
+    os.makedirs(directory, exist_ok=True)
+    np.asarray(speaker_embedding.detach().cpu(), dtype=np.float32).tofile(
+        os.path.join(directory, "reference.spk")
+    )
+    codes = np.asarray(reference_codes.detach().cpu(), dtype=np.int32).reshape(-1)
+    packed = bytearray((codes.size * 11 + 7) // 8)
+    accumulator = 0
+    bits = 0
+    out_pos = 0
+    for code in codes:
+        accumulator |= (int(code) & 0x7FF) << bits
+        bits += 11
+        while bits >= 8:
+            packed[out_pos] = accumulator & 0xFF
+            out_pos += 1
+            accumulator >>= 8
+            bits -= 8
+    if bits:
+        packed[out_pos] = accumulator & 0xFF
+    with open(os.path.join(directory, "reference.rvq"), "wb") as handle:
+        handle.write(packed)
+
 def install_clone_hooks(model, dump_dir, dump_predictor_logits=False):
     """Capture the codec encoder bisection points (SEANet, encoder_transformer,
     downsample = pre-FSQ latents), the ECAPA mel front end input, and four
@@ -308,6 +332,8 @@ def main():
                     help="print per sample u and idx for the first 32 samples")
     ap.add_argument("--dump-predictor-logits", action="store_true",
                     help="dump first-frame Python code-predictor logits")
+    ap.add_argument("--export-reference-latents", default=None,
+                    help="export Python speaker/code tensors and reuse them natively")
     args = ap.parse_args()
 
     cc.ensure_dir(DUMP_PT)
@@ -398,6 +424,8 @@ def main():
     ref_code_kt = ref_code_pt.transpose(0, 1).contiguous()
     print(f"[Python] RefCodes shape: {tuple(ref_code_kt.shape)} (K, T_codec)")
     cc.save_dump_i32(os.path.join(DUMP_PT, "ref-codes.bin"), ref_code_kt)
+    if args.export_reference_latents:
+        write_reference_latents(args.export_reference_latents, spk_emb, ref_code_kt)
 
     # Tokenize the utterance and the reference text.
     assistant_text = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
@@ -482,7 +510,6 @@ def main():
         "--model",     model_lm,
         "--codec",     model_cdc,
         "--seed",      str(args.seed),
-        "--ref-wav",   args.ref_wav,
         "--ref-text",  args.ref_text,
         "--lang",      args.lang,
         "--max-new",   str(args.max_new_tokens),
@@ -490,6 +517,13 @@ def main():
         "-o",          args.out_cpp,
         "--greedy",
     ]
+    if args.export_reference_latents:
+        cmd.extend([
+            "--ref-spk", os.path.join(args.export_reference_latents, "reference.spk"),
+            "--ref-rvq", os.path.join(args.export_reference_latents, "reference.rvq"),
+        ])
+    else:
+        cmd.extend(["--ref-wav", args.ref_wav])
     print(f"[GGML] Cmd: {' '.join(cmd)}")
     r = subprocess.run(cmd, input=text, text=True)
     if r.returncode != 0:

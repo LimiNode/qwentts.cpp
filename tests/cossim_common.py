@@ -80,6 +80,11 @@ def register_qwen3_tts():
 # Path to the C++ qwen-tts binary, relative to tests/.
 BIN = "../build/qwen-tts"
 
+def find_binary():
+    """Return the built qwen-tts executable on POSIX or Windows."""
+    candidates = (BIN, BIN + ".exe")
+    return next((path for path in candidates if os.path.isfile(path)), None)
+
 # Standard stage list shared by every cossim script. Mode-specific scripts
 # may extend this list before iterating (eg. clone adds SpeakerEmb / RefCodes).
 STAGES_STANDARD = [

@@ -238,6 +238,8 @@ def install_clone_hooks(model, dump_dir, dump_predictor_logits=False):
                 if step in seen_predictor:
                     return
                 logits = output[0] if isinstance(output, tuple) else output
+                if getattr(logits, "dim", lambda: 0)() == 3:
+                    logits = logits[:, -1, :]
                 if getattr(logits, "dim", lambda: 0)() == 2:
                     cc.save_dump(
                         os.path.join(dump_dir, f"predictor-logits-step{step}.bin"),

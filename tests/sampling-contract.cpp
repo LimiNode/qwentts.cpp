@@ -37,6 +37,10 @@ int dump_parity_vectors() {
         { "positive_repetition", { 4.0F, 3.0F, 3.5F, 0.0F }, 3, 1.0F, 2, 1.0F, 2.0F, positive_history, 1, 0.1F },
         { "negative_repetition", { -4.0F, -3.0F, -3.5F, 0.0F }, 3, 1.0F, 2, 1.0F, 2.0F, negative_history, 1, 0.1F },
         { "top_k_one", { 1.0F, 9.0F, 8.0F, 0.0F }, 3, 1.0F, 1, 1.0F, 1.0F, no_history, 0, 0.99F },
+        // The lower-id candidate is intentionally less probable.  This locks
+        // the torch.multinomial vocabulary-order contract used by stochastic
+        // native-vs-Python replay; probability-sorted CDFs select token 3.
+        { "top_k_vocab_order", { 0.0F, 3.0F, 0.0F, 4.0F }, 4, 1.0F, 2, 1.0F, 1.0F, no_history, 0, 0.20F },
         { "top_k_zero", { 1.0F, 2.0F, 3.0F, 0.0F }, 3, 1.0F, 0, 1.0F, 1.0F, no_history, 0, 0.01F },
         { "top_p_one", { 4.0F, 3.0F, 2.0F, 0.0F }, 3, 1.0F, 0, 1.0F, 1.0F, no_history, 0, 0.90F },
         { "top_p_crossing", { 4.0F, 3.0F, 2.0F, 1.0F }, 4, 1.0F, 0, 0.70F, 1.0F, no_history, 0, 0.95F },
@@ -109,6 +113,13 @@ int main(int argc, char **argv) {
     float policy_logits[]    = { 4.0F, 3.0F, 3.5F };
     const int selected = sample_top_k_p_with_uniform(policy_logits, 3, 1.0F, 2, 1.0F, 2.0F, history, 1, 0.1F);
     if (!check(selected == 1, "repetition penalty is applied before top-k selection")) {
+        return 1;
+    }
+
+    float vocab_order_logits[] = { 0.0F, 3.0F, 0.0F, 4.0F };
+    if (!check(sample_top_k_p_with_uniform(vocab_order_logits, 4, 1.0F, 2, 1.0F, 1.0F,
+                                           nullptr, 0, 0.20F) == 1,
+               "top-k stochastic CDF follows vocabulary order")) {
         return 1;
     }
 

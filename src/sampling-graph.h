@@ -82,18 +82,24 @@ static inline struct ggml_tensor * sampler_tail_build(struct ggml_context * gctx
 
     struct ggml_tensor * cur = ggml_div(gctx, logits, temp);
 
-    // keep each slot's top_k candidates, logits and ids in descending
-    // order. argsort guarantees the order on every backend (top_k does
-    // not), and the descending layout is what makes the u = 0 draw an
-    // argmax.
-    struct ggml_tensor * candidates = NULL;
+    // Keep the top-k set, but restore the original vocabulary order before
+    // the CDF walk. torch.multinomial (the FasterQwen reference) consumes
+    // probabilities in vocabulary order; walking a probability-sorted list
+    // changes deterministic Philox replay for the same uniform u.
     if (sp->top_k > 0 && sp->top_k < n_vocab) {
         struct ggml_tensor * order = ggml_argsort(gctx, cur, GGML_SORT_ORDER_DESC);
         struct ggml_tensor * idx =
             ggml_cont(gctx, ggml_view_2d(gctx, order, sp->top_k, N, order->nb[1], 0));  // [top_k, N] i32
         struct ggml_tensor * a3d = ggml_reshape_3d(gctx, cur, 1, n_vocab, N);
-        cur                      = ggml_reshape_2d(gctx, ggml_get_rows(gctx, a3d, idx), sp->top_k, N);
-        candidates               = idx;
+        struct ggml_tensor * top_values = ggml_get_rows(gctx, a3d, idx); // [1, top_k, N]
+
+        // Scatter the selected logits into a full-vocabulary tensor filled
+        // with -inf. Softmax/cumsum now follow token-id order while keeping
+        // exactly the same top-k mask.
+        struct ggml_tensor * full = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, 1, n_vocab, N);
+        full = ggml_fill(gctx, full, -INFINITY);
+        full = ggml_set_rows(gctx, full, top_values, idx);
+        cur  = ggml_reshape_2d(gctx, full, n_vocab, N);
     }
 
     // draw one token per slot: find where the cdf crosses u
@@ -105,11 +111,6 @@ static inline struct ggml_tensor * sampler_tail_build(struct ggml_context * gctx
     struct ggml_tensor * idxf       = ggml_sum_rows(gctx, cross_mask);  // [1, N]
     struct ggml_tensor * idx =
         ggml_cast(gctx, ggml_scale_bias(gctx, idxf, -1.0f, (float) cross_mask->ne[0]), GGML_TYPE_I32);
-
-    if (candidates) {
-        struct ggml_tensor * cand_3d = ggml_reshape_3d(gctx, candidates, 1, candidates->ne[0], N);
-        idx                          = ggml_get_rows(gctx, cand_3d, idx);  // [1, 1, N]
-    }
 
     struct ggml_tensor * ids = ggml_reshape_1d(gctx, idx, N);
     struct ggml_tensor * dst = ggml_view_1d(gctx, sp->codes, N, (size_t) (step_idx + 1) * sp->codes->nb[1]);

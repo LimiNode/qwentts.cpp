@@ -1225,10 +1225,10 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
             continue;
         }
 
-        // Trace the first 32 samples unconditionally so [Sample] lines
-        // up with [Sample-PY] / [Sample-CP] across the 16 codes of step
-        // 0 and step 1 the Python harness emits.
-        if ((s.subseq_counter - 1) < 32) {
+        // Keep the compact first-32 trace for ordinary diagnostics.  A dump
+        // run opts into the bounded full-frame trace so long-horizon parity
+        // can compare every generated Talker step without unbounded logs.
+        if ((s.subseq_counter - 1) < 32 || (p->dump_dir && s.step < 128)) {
             qt_log(QT_LOG_DEBUG, "[Sample] step=%d c0=%d u=%.10f subseq=%lld", s.step, c0, (double) u_c0,
                    (long long) (s.subseq_counter - 1));
         }
@@ -1303,7 +1303,7 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                 if (N == 1 && s.step == 0 && p->dump_dir) {
                     cp_dump = p->dump_dir;
                 }
-                if (N == 1 && p->dump_dir && s.step < 2) {
+                if (N == 1 && p->dump_dir && s.step < 128) {
                     std::string predictor_draws;
                     for (int g = 1; g < num_codebooks; g++) {
                         float u = 0.0f;
@@ -1352,7 +1352,7 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
 
                     std::vector<int32_t> codes(cp.codes.begin() + (size_t) i * (size_t) num_codebooks,
                                                cp.codes.begin() + (size_t) (i + 1) * (size_t) num_codebooks);
-                    if (p->dump_dir && s.step < 2) {
+                    if (p->dump_dir && s.step < 128) {
                         std::string code_text;
                         for (int code : codes) {
                             if (!code_text.empty()) {

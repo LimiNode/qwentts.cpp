@@ -30,6 +30,9 @@ VECTORS = (
     Vector("positive_repetition", (4.0, 3.0, 3.5), 1.0, 2, 1.0, 2.0, (0,), 0.1),
     Vector("negative_repetition", (-4.0, -3.0, -3.5), 1.0, 2, 1.0, 2.0, (0,), 0.1),
     Vector("top_k_one", (1.0, 9.0, 8.0), 1.0, 1, 1.0, 1.0, (), 0.99),
+    # The native sampler keeps the filtered candidates in vocabulary order,
+    # matching torch.multinomial.  A probability-sorted CDF would select 3.
+    Vector("top_k_vocab_order", (0.0, 3.0, 0.0, 4.0), 1.0, 2, 1.0, 1.0, (), 0.20),
     Vector("top_k_zero", (1.0, 2.0, 3.0), 1.0, 0, 1.0, 1.0, (), 0.01),
     Vector("top_p_one", (4.0, 3.0, 2.0), 1.0, 0, 1.0, 1.0, (), 0.90),
     Vector("top_p_crossing", (4.0, 3.0, 2.0, 1.0), 1.0, 0, 0.70, 1.0, (), 0.95),

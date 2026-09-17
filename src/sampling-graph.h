@@ -4,8 +4,8 @@
 // readbacks. Each tail applies the per step temperature, keeps the
 // top_k candidates, then draws one token where the cdf crosses the
 // per step uniform u. top_k bakes from the generation defaults at
-// build; nucleus filtering is not applied. Greedy slots upload u = 0,
-// which lands the draw on each slot's first (highest) candidate.
+// build; nucleus filtering is not applied. Greedy slots upload u = -1,
+// a private sentinel that is blended with a direct argmax after the CDF walk.
 //
 // Sampler inputs and the codes accumulator live in a caller owned
 // persistent context, never in gallocr input buffers. The uniform
@@ -16,6 +16,7 @@
 #include "ggml.h"
 #include "philox.h"
 
+#include <cmath>
 #include <vector>
 
 struct SamplerInputs {
@@ -39,8 +40,9 @@ static inline void sampler_inputs_build(struct ggml_context * pctx, SamplerInput
 }
 
 // Upload the per frame sampler state. Greedy slots (temperature <= 0)
-// carry temperature 1 and u 0, which selects the argmax through the
-// descending candidate order. subseq_base[i] indexes slot i's philox
+// carry temperature 1 and u -1. The negative sentinel is reserved for greedy
+// because philox_uniform_fill always returns a value in (0, 1).
+// subseq_base[i] indexes slot i's philox
 // stream: draw g uses subsequence subseq_base[i] + 1 + g.
 static inline void sampler_inputs_upload(SamplerInputs * sp,
                                          const float *   temperature,
@@ -52,7 +54,7 @@ static inline void sampler_inputs_upload(SamplerInputs * sp,
     for (int g = 0; g < sp->n_steps; g++) {
         for (int i = 0; i < N; i++) {
             const bool greedy = temperature[i] <= 0.0f;
-            float      u      = 0.0f;
+            float      u      = -1.0f; // greedy sentinel: direct argmax
             if (!greedy) {
                 philox_uniform_fill(seed[i], subseq_base[i] + 1 + g, 0u, &u, 1);
             }
@@ -112,7 +114,16 @@ static inline struct ggml_tensor * sampler_tail_build(struct ggml_context * gctx
     struct ggml_tensor * idx =
         ggml_cast(gctx, ggml_scale_bias(gctx, idxf, -1.0f, (float) cross_mask->ne[0]), GGML_TYPE_I32);
 
-    struct ggml_tensor * ids = ggml_reshape_1d(gctx, idx, N);
+    // Vocabulary-order CDF is required for stochastic parity. Preserve the
+    // separate greedy contract explicitly instead of relying on candidate
+    // ordering: u < 0 is the private greedy sentinel.
+    struct ggml_tensor * greedy_mask = ggml_step(gctx, ggml_scale(gctx, u, -1.0f));
+    struct ggml_tensor * idx_1d      = ggml_reshape_1d(gctx, idx, N);
+    struct ggml_tensor * idx_f       = ggml_cast(gctx, idx_1d, GGML_TYPE_F32);
+    struct ggml_tensor * argmax_f    = ggml_cast(gctx, ggml_argmax(gctx, logits), GGML_TYPE_F32);
+    struct ggml_tensor * selected_f  = ggml_add(
+        gctx, idx_f, ggml_mul(gctx, greedy_mask, ggml_sub(gctx, argmax_f, idx_f)));
+    struct ggml_tensor * ids = ggml_cast(gctx, selected_f, GGML_TYPE_I32);
     struct ggml_tensor * dst = ggml_view_1d(gctx, sp->codes, N, (size_t) (step_idx + 1) * sp->codes->nb[1]);
     return ggml_cpy(gctx, ids, dst);
 }

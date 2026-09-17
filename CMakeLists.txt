@@ -226,6 +226,18 @@ else()
 endif()
 add_test(NAME sampling_contract COMMAND test-sampling-contract)
 
+# Backend-level sampler graph regression. This intentionally exercises the
+# GGML graph path rather than the host explicit-u sampler seam above.
+add_executable(test-sampling-graph-contract tests/sampling-graph-contract.cpp)
+if(MSVC)
+    target_compile_options(test-sampling-graph-contract PRIVATE /W4 /WX /wd4505)
+else()
+    target_compile_options(test-sampling-graph-contract PRIVATE -Wall -Wextra -Werror -Wno-unused-function -pedantic)
+endif()
+target_link_libraries(test-sampling-graph-contract PRIVATE ggml)
+link_ggml_backends(test-sampling-graph-contract)
+add_test(NAME sampling_graph_contract COMMAND test-sampling-graph-contract)
+
 # Cross-language model-free policy parity. The Python script is intentionally
 # dependency-free and compares the explicit-u native seam against a small
 # reference implementation over fixed edge-case vectors.

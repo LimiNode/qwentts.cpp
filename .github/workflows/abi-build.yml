@@ -15,11 +15,11 @@ jobs:
       - name: Configure
         run: cmake -S . -B build -DQWEN_SHARED=ON -DGGML_NATIVE=OFF
       - name: Build shared library and regression tests
-        run: cmake --build build --target qwen test-abi-c test-sampling-contract --parallel 2
+        run: cmake --build build --target qwen test-abi-c test-sampling-contract test-sampling-graph-contract --parallel 2
       - name: Run ABI probe and sampling contract
         run: |
           ./build/test-abi-c
-          ctest --test-dir build --output-on-failure -R '^sampling_contract(_python_parity)?$'
+          ctest --test-dir build --output-on-failure -R '^sampling(_graph)?_contract(_python_parity)?$'
 
   windows-msvc-shared:
     runs-on: windows-latest
@@ -32,9 +32,9 @@ jobs:
         run: cmake -S . -B build -DQWEN_SHARED=ON -DGGML_NATIVE=OFF
       - name: Build shared library and regression tests
         shell: pwsh
-        run: cmake --build build --config Release --target qwen test-abi-c test-sampling-contract --parallel 2
+        run: cmake --build build --config Release --target qwen test-abi-c test-sampling-contract test-sampling-graph-contract --parallel 2
       - name: Run ABI probe and sampling contract
         shell: pwsh
         run: |
           .\build\Release\test-abi-c.exe
-          ctest --test-dir build -C Release --output-on-failure -R '^sampling_contract(_python_parity)?$'
+          ctest --test-dir build -C Release --output-on-failure -R '^sampling(_graph)?_contract(_python_parity)?$'

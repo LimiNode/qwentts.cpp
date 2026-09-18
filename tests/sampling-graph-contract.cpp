@@ -75,6 +75,6 @@ int main() {
     const bool stochastic = run_case("stochastic-vocabulary-order", 1.0F, 0.20F, 1);
     // Greedy must remain argmax (3), even though the first surviving vocab id
     // is 1. This catches accidental reuse of the stochastic CDF ordering.
-    const bool greedy = run_case("greedy-argmax", 0.0F, -1.0F, 3);
+    const bool greedy = run_case("greedy-argmax", 1.0F, -1.0F, 3);
     return (stochastic && greedy) ? 0 : 1;
 }

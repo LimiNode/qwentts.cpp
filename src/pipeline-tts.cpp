@@ -1290,6 +1290,7 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
             std::vector<int64_t> seeds((size_t) N, 0);
             std::vector<int64_t> subseqs((size_t) N, 0);
             const char *         cp_dump = NULL;
+            int                  cp_frame = 0;
             for (int i = 0; i < N; i++) {
                 TtsSlot & s = e->slots[(size_t) i];
                 if (!s.has_frame) {
@@ -1300,8 +1301,9 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                 temps[(size_t) i]              = s.subtk_T;
                 seeds[(size_t) i]              = s.job->resolved_seed;
                 subseqs[(size_t) i]            = s.subseq_counter - 1;
-                if (N == 1 && s.step == 0 && p->dump_dir) {
+                if (N == 1 && p->dump_dir && s.step < 128) {
                     cp_dump = p->dump_dir;
+                    cp_frame = s.step;
                 }
                 if (N == 1 && p->dump_dir && s.step < 128) {
                     std::string predictor_draws;
@@ -1324,7 +1326,8 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
             Timer t_pred;
             bool  pred_ok =
                 code_predictor_frame_step(&pt->code_predictor, pt->backend, &gs.frame, &gs.sampler, c0s.data(), N,
-                                          temps.data(), seeds.data(), subseqs.data(), cp_dump, &cp);
+                                          temps.data(), seeds.data(), subseqs.data(), cp_dump,
+                                          cp_frame, &cp);
             if (!pred_ok) {
                 for (TtsSlot & s : e->slots) {
                     s.finished   = true;

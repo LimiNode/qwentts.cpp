@@ -35,6 +35,45 @@ struct SamplingDiagnostics {
     std::vector<TokenProb> top_tokens;
 };
 
+// Exact replay of the host sampler's final F32 accumulator. The input must be
+// the post-softmax unnormalized weights left in-place by
+// sample_top_k_p_with_uniform(). This helper is diagnostic-only and does not
+// consume RNG state or mutate the weights.
+struct SamplingAccumulatorDiagnostics {
+    float              sum      = 0.0f;
+    float              target   = 0.0f;
+    int                selected = -1;
+    std::vector<float> cdf;
+};
+
+static SamplingAccumulatorDiagnostics sampling_accumulator_diagnostics_from_weights(const float * weights,
+                                                                                      int           V,
+                                                                                      float         uniform_u) {
+    SamplingAccumulatorDiagnostics result;
+    if (!weights || V <= 0) {
+        return result;
+    }
+
+    result.cdf.resize((size_t) V);
+    for (int i = 0; i < V; i++) {
+        result.sum += weights[i];
+    }
+    result.target = uniform_u * result.sum;
+
+    float acc = 0.0f;
+    for (int i = 0; i < V; i++) {
+        acc += weights[i];
+        result.cdf[(size_t) i] = acc;
+        if (result.selected < 0 && acc >= result.target) {
+            result.selected = i;
+        }
+    }
+    if (result.selected < 0) {
+        result.selected = V - 1;
+    }
+    return result;
+}
+
 static SamplingDiagnostics sampling_diagnostics_from_weights(const float * weights,
                                                               int           V,
                                                               int           selected_id,

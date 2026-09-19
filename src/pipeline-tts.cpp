@@ -21,7 +21,39 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <limits>
 #include <string>
+
+// A diagnostic-only sidecar lets a replay pin the Talker c0 history without
+// changing the public ABI. One integer token is read per line from
+// <dump_dir>/forced-talker-history.txt; the normal path never consults it.
+static std::vector<int32_t> load_forced_talker_history(const char * dump_dir) {
+    if (dump_dir == NULL || *dump_dir == '\0') {
+        return {};
+    }
+    std::string path(dump_dir);
+    if (!path.empty() && path.back() != '/' && path.back() != '\\') {
+        path.push_back('/');
+    }
+    path += "forced-talker-history.txt";
+    std::ifstream input(path);
+    if (!input) {
+        return {};
+    }
+    std::vector<int32_t> out;
+    int64_t value = 0;
+    while (input >> value) {
+        if (value < 0 || value > std::numeric_limits<int32_t>::max()) {
+            return {};
+        }
+        out.push_back((int32_t) value);
+    }
+    if (!input.eof()) {
+        return {};
+    }
+    return out;
+}
 
 static void parse_codec_specials(const GGUFModel & gf, CodecSpecials & cs) {
     cs.pad_id       = (int) gf_get_u32(gf, "qwen3-tts.codec.pad_id");
@@ -543,6 +575,7 @@ struct TtsSlot {
     int                  step;            // frames emitted so far
     int64_t              subseq_counter;  // Philox subsequence cursor
     std::vector<int32_t> talker_history;  // emitted c0, feeds repetition penalty
+    std::vector<int32_t> forced_talker_history; // diagnostic replay override
     std::vector<int32_t> prev_ids;        // previous frame codes [num_code_groups]
     const float *        prev_overlay;    // trailing text row or tts_pad row
     std::vector<float>   logits;          // pending c0 logits [vocab]
@@ -861,6 +894,20 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
     s.finish_reason    = QT_FINISH_UNKNOWN;
     s.perf             = {};
     s.t_total.reset();
+    s.forced_talker_history = load_forced_talker_history(params->dump_dir);
+    if (!s.forced_talker_history.empty()) {
+        bool valid = true;
+        for (int32_t token : s.forced_talker_history) {
+            valid = valid && token >= 0 && token < pt->talker.vocab_size;
+        }
+        if (!valid) {
+            qt_log(QT_LOG_WARN, "[Pipeline] ignoring invalid forced Talker history sidecar");
+            s.forced_talker_history.clear();
+        } else {
+            qt_log(QT_LOG_INFO, "[Pipeline] forced Talker history: %d c0 tokens",
+                   (int) s.forced_talker_history.size());
+        }
+    }
 
     // Voice clone mode B: pre-encoded latent codes feed the ICL prompt
     // directly; otherwise, if ref_text is given, encode the reference
@@ -1252,9 +1299,11 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
             suppressed_logits = s.logits;
         }
         float u_c0 = 0.0f;
-        int   c0   = sample_top_k_p(s.logits.data(), vocab, s.talker_T, p->top_k, p->top_p, p->repetition_penalty,
-                                    s.talker_history.data(), (int) s.talker_history.size(), s.job->resolved_seed,
-                                    s.subseq_counter, &u_c0);
+        const int sampled_c0 = sample_top_k_p(s.logits.data(), vocab, s.talker_T, p->top_k, p->top_p,
+                                              p->repetition_penalty, s.talker_history.data(),
+                                              (int) s.talker_history.size(), s.job->resolved_seed,
+                                              s.subseq_counter, &u_c0);
+        int c0 = sampled_c0;
         s.perf.host_ms += t_host.ms();
         s.subseq_counter++;
         if (c0 < 0) {
@@ -1263,6 +1312,13 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
             s.finished   = true;
             s.fin_status = QT_STATUS_GENERATE_FAILED;
             continue;
+        }
+
+        const bool forced_c0 = (s.step >= 0 && (size_t) s.step < s.forced_talker_history.size());
+        if (forced_c0) {
+            c0 = s.forced_talker_history[(size_t) s.step];
+            qt_log(QT_LOG_DEBUG, "[ARTrace] forced Talker c0 step=%d sampled=%d forced=%d", s.step, sampled_c0,
+                   c0);
         }
 
         // Keep the compact first-32 trace for ordinary diagnostics.  A dump
@@ -1320,9 +1376,10 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                 top += std::to_string(token.id) + ':' + std::to_string(token.prob);
             }
             qt_log(QT_LOG_DEBUG,
-                   "[ARTrace] sample step=%d c0=%d u=%.10f selected_p=%.9g eos_id=%d eos_p=%.9g "
+                   "[ARTrace] sample step=%d c0=%d sampled_c0=%d forced=%d u=%.10f selected_p=%.9g eos_id=%d eos_p=%.9g "
                    "eos_rank=%d candidates=%d history=%d top=%s",
-                   s.step, c0, (double) u_c0, (double) diagnostics.selected_probability, codec_eos_id,
+                   s.step, c0, sampled_c0, forced_c0 ? 1 : 0, (double) u_c0,
+                   (double) diagnostics.selected_probability, codec_eos_id,
                    (double) diagnostics.eos_probability, diagnostics.eos_rank, diagnostics.candidate_count,
                    (int) s.talker_history.size(), top.c_str());
         }

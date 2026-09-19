@@ -334,6 +334,8 @@ def main():
                     help="capture actual Python multinomial probabilities and both CDF views at --sampler-subseq")
     ap.add_argument("--sampler-subseq", type=int, default=42,
                     help="Philox subsequence to capture with --dump-sampler-intermediates")
+    ap.add_argument("--forced-talker-history", default=None,
+                    help="comma-separated Talker c0 tokens to force in a diagnostic replay")
     ap.add_argument("--dump-predictor-logits", action="store_true",
                     help="dump first-frame Python code-predictor logits")
     ap.add_argument("--export-reference-latents", default=None,
@@ -367,8 +369,12 @@ def main():
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    forced_history = []
     if args.stochastic:
         cc.enable_philox_sampling(args.seed, trace=args.trace)
+        if args.forced_talker_history:
+            forced_history = [int(token) for token in args.forced_talker_history.split(",") if token.strip()]
+            cc.set_forced_talker_history(forced_history)
         if args.dump_sampler_intermediates:
             cc.enable_sampler_diagnostic(
                 args.dump_sampler_intermediates,
@@ -546,6 +552,15 @@ def main():
         "--dump",      DUMP_CPP,
         "-o",          args.out_cpp,
     ]
+    if forced_history:
+        os.makedirs(DUMP_CPP, exist_ok=True)
+        with open(os.path.join(DUMP_CPP, "forced-talker-history.txt"), "w", encoding="ascii") as f:
+            f.write("\n".join(str(token) for token in forced_history) + "\n")
+    else:
+        try:
+            os.remove(os.path.join(DUMP_CPP, "forced-talker-history.txt"))
+        except FileNotFoundError:
+            pass
     if args.export_reference_latents:
         cmd.extend([
             "--ref-spk", os.path.join(args.export_reference_latents, "reference.spk"),

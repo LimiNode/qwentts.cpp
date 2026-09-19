@@ -330,6 +330,10 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=64)
     ap.add_argument("--trace",          action="store_true",
                     help="print per sample u and idx for the first 32 samples")
+    ap.add_argument("--dump-sampler-intermediates", default=None,
+                    help="capture actual Python multinomial probabilities/CDF at --sampler-subseq")
+    ap.add_argument("--sampler-subseq", type=int, default=42,
+                    help="Philox subsequence to capture with --dump-sampler-intermediates")
     ap.add_argument("--dump-predictor-logits", action="store_true",
                     help="dump first-frame Python code-predictor logits")
     ap.add_argument("--export-reference-latents", default=None,
@@ -365,6 +369,11 @@ def main():
     np.random.seed(args.seed)
     if args.stochastic:
         cc.enable_philox_sampling(args.seed, trace=args.trace)
+        if args.dump_sampler_intermediates:
+            cc.enable_sampler_diagnostic(
+                args.dump_sampler_intermediates,
+                subseq=args.sampler_subseq,
+            )
         generation_kwargs = dict(cc.GEN_KWARGS_STOCHASTIC)
         generation_kwargs.update(
             temperature=args.temperature,

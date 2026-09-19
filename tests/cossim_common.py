@@ -149,6 +149,11 @@ _subseq_counter = [0]
 _seed           = [42]
 _trace_samples  = [False]
 _sample_trace   = []
+_sampler_diagnostic = {
+    "dump_dir": None,
+    "subseq": None,
+    "captured": False,
+}
 _original_multinomial = torch.multinomial
 
 def reset_philox(seed):
@@ -169,6 +174,22 @@ def enable_philox_sampling(seed, trace=False):
     reset_philox(seed)
     set_trace(trace)
     torch.multinomial = patched_multinomial
+
+def enable_sampler_diagnostic(dump_dir, subseq=42):
+    """Capture one actual Python sampler input and its CDF.
+
+    ``torch.multinomial`` receives probabilities after the Transformers
+    logits processors/warpers have applied top-k/top-p.  Capturing this tensor
+    at the target Philox subsequence therefore records the surviving
+    candidate set and the exact vocab-order probabilities used by Python,
+    rather than reconstructing them later from logits.
+    """
+    ensure_dir(dump_dir)
+    _sampler_diagnostic.update(
+        dump_dir=os.fspath(dump_dir),
+        subseq=int(subseq),
+        captured=False,
+    )
 
 def sample_trace():
     """Return a copy of the recorded multinomial draws for parity checks."""
@@ -201,6 +222,30 @@ def patched_multinomial(input, num_samples, replacement=False, generator=None, o
                 idx = i
                 break
         out_ids[b, 0] = idx
+        diagnostic = _sampler_diagnostic
+        if (diagnostic["dump_dir"] is not None
+                and not diagnostic["captured"]
+                and seq == diagnostic["subseq"]):
+            dump_dir = diagnostic["dump_dir"]
+            candidate_ids = np.flatnonzero(row > 0.0).astype(np.int64)
+            order = np.argsort(-row[candidate_ids], kind="stable")
+            candidate_ids = candidate_ids[order]
+            candidate_probs = row[candidate_ids].astype(np.float32)
+            cdf = np.cumsum(row, dtype=np.float32)
+            save_dump(os.path.join(dump_dir, "sampler-input-probs.bin"), row)
+            save_dump_i32(os.path.join(dump_dir, "sampler-candidate-ids.bin"), candidate_ids)
+            save_dump(os.path.join(dump_dir, "sampler-candidate-probs.bin"), candidate_probs)
+            save_dump(os.path.join(dump_dir, "sampler-cdf.bin"), cdf)
+            save_dump(os.path.join(dump_dir, "sampler-u.bin"), np.asarray([u], dtype=np.float32))
+            save_dump_i32(os.path.join(dump_dir, "sampler-selected.bin"), np.asarray([idx], dtype=np.int64))
+            with open(os.path.join(dump_dir, "sampler-diagnostic.txt"), "w", encoding="utf-8") as f:
+                f.write(f"subseq={seq}\n")
+                f.write(f"vocab={vocab}\n")
+                f.write(f"candidate_count={candidate_ids.size}\n")
+                f.write(f"u={float(u):.10f}\n")
+                f.write(f"selected={idx}\n")
+                f.write("candidate_ids=" + ",".join(str(int(x)) for x in candidate_ids) + "\n")
+            diagnostic["captured"] = True
         if _trace_samples[0] and seq < 32:
             print(f"[Sample-PY] subseq={seq} u={float(u):.10f} idx={idx} top_prob={float(row.max()):.6f}")
         _sample_trace.append({"subseq": seq, "u": float(u), "idx": idx})

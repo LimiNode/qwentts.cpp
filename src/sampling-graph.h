@@ -133,6 +133,10 @@ static inline struct ggml_tensor * sampler_tail_build(struct ggml_context * gctx
     }
 
     if (capture_diagnostics) {
+        // Materialize an owning graph tensor before softmax. Retaining only
+        // the reshape/set_rows view is insufficient on CUDA because the
+        // allocator may recycle the view source after its last consumer.
+        cur = ggml_dup(gctx, cur);
         sp->diagnostics.masked_logits = cur;
         ggml_set_output(cur);
     }

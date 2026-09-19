@@ -95,6 +95,23 @@ class SamplerDiagnosticTest(unittest.TestCase):
             self.assertEqual(selection_sum[0], 1.0)
             self.assertLess(abs(selection_target[0] - float(cc.philox_uniform(1006, 0))), 1e-12)
 
+    def test_forced_frame_replay_overrides_all_codebooks(self) -> None:
+        """A diagnostic full-frame sidecar must pin c0 and predictor draws."""
+        frame = list(range(100, 116))
+        cc.set_forced_talker_frames([frame])
+        cc.enable_philox_sampling(1008)
+        try:
+            probabilities = torch.ones((1, 2048), dtype=torch.float32)
+            selected = [
+                int(cc.patched_multinomial(probabilities, 1).item())
+                for _ in range(16)
+            ]
+        finally:
+            cc.set_forced_talker_frames([])
+            torch.multinomial = cc._original_multinomial
+
+        self.assertEqual(selected, frame)
+
 
 if __name__ == "__main__":
     unittest.main()

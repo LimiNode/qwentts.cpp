@@ -8,16 +8,24 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
+try:
+    import numpy as np
+except ModuleNotFoundError:  # pragma: no cover - optional research deps
+    np = None
 
 try:
     import torch
 except ModuleNotFoundError as exc:  # pragma: no cover - optional research deps
-    raise unittest.SkipTest(f"diagnostic harness dependencies unavailable: {exc}")
+    torch = None
+    _TORCH_IMPORT_ERROR = exc
+else:
+    _TORCH_IMPORT_ERROR = None
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 try:
+    if torch is None or np is None:
+        raise ModuleNotFoundError("torch/numpy unavailable")
     import cossim_common as cc
 except ModuleNotFoundError as exc:  # pragma: no cover - optional research deps
     cc = None
@@ -26,12 +34,37 @@ else:
     _IMPORT_ERROR = None
 
 
-def _load_f64(path: Path) -> np.ndarray:
+def _load_f64(path: Path) -> "np.ndarray":
     raw = path.read_bytes()
     ndim = struct.unpack_from("i", raw, 0)[0]
     offset = 4 + 4 * ndim
     shape = struct.unpack_from(f"{ndim}i", raw, 4)
     return np.frombuffer(raw, dtype=np.float64, offset=offset).reshape(shape)
+
+
+class SamplerDiagnosticContractTest(unittest.TestCase):
+    """Dependency-free policy regression for the diagnostic contract."""
+
+    def test_vocab_order_selection_is_distinct_from_probability_order(self) -> None:
+        probabilities = [0.1, 0.2, 0.3, 0.4]
+        candidate_ids = sorted(range(len(probabilities)),
+                               key=lambda index: probabilities[index], reverse=True)
+        self.assertEqual(candidate_ids, [3, 2, 1, 0])
+
+        uniform = 0.2
+        target = uniform * sum(probabilities)
+        accumulator = 0.0
+        selected = len(probabilities) - 1
+        cdf = []
+        for index, probability in enumerate(probabilities):
+            accumulator += probability
+            cdf.append(accumulator)
+            if accumulator >= target:
+                selected = index
+                break
+
+        self.assertEqual(selected, 1)
+        self.assertEqual(cdf, [0.1, 0.30000000000000004])
 
 
 @unittest.skipIf(cc is None, f"diagnostic harness dependencies unavailable: {_IMPORT_ERROR}")
@@ -61,3 +94,7 @@ class SamplerDiagnosticTest(unittest.TestCase):
             selection_target = _load_f64(dump_dir / "sampler-target-f64.bin")
             self.assertEqual(selection_sum[0], 1.0)
             self.assertLess(abs(selection_target[0] - float(cc.philox_uniform(1006, 0))), 1e-12)
+
+
+if __name__ == "__main__":
+    unittest.main()

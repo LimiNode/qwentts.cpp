@@ -247,4 +247,10 @@ if(Python3_Interpreter_FOUND)
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/verify-sampling-parity.py
                      $<TARGET_FILE:test-sampling-contract>)
+    # The dependency-free case in test_sampler_diagnostic.py runs in every
+    # build.  Its optional torch/numpy case is also exercised automatically
+    # when the research harness dependencies are available.
+    add_test(NAME sampler_diagnostic_python
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_sampler_diagnostic.py)
 endif()

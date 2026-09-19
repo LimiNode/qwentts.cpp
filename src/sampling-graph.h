@@ -20,6 +20,20 @@
 #include <vector>
 
 struct SamplerInputs {
+    struct Diagnostics {
+        bool                 enabled      = false;
+        int                  target_step  = 9;
+        struct ggml_tensor * scaled_logits = nullptr;
+        struct ggml_tensor * top_order    = nullptr;
+        struct ggml_tensor * top_ids      = nullptr;
+        struct ggml_tensor * top_values   = nullptr;
+        struct ggml_tensor * masked_logits = nullptr;
+        struct ggml_tensor * probabilities = nullptr;
+        struct ggml_tensor * cumsum       = nullptr;
+        struct ggml_tensor * uniform      = nullptr;
+        struct ggml_tensor * selected     = nullptr;
+    } diagnostics;
+
     struct ggml_tensor * state   = nullptr;  // [2, N, n_steps] f32, per slot (temperature, u)
     struct ggml_tensor * codes   = nullptr;  // [N, n_codes] i32, row g holds code g of every slot
     int                  n_steps = 0;        // sampled codes per frame (semantic + acoustic)
@@ -83,6 +97,11 @@ static inline struct ggml_tensor * sampler_tail_build(struct ggml_context * gctx
         ggml_view_2d(gctx, sp->state, 1, N, sp->state->nb[1], sp->state->nb[0] + (size_t) step_idx * sp->state->nb[2]);
 
     struct ggml_tensor * cur = ggml_div(gctx, logits, temp);
+    const bool capture_diagnostics = sp->diagnostics.enabled && step_idx == sp->diagnostics.target_step && N == 1;
+    if (capture_diagnostics) {
+        sp->diagnostics.scaled_logits = cur;
+        ggml_set_output(cur);
+    }
 
     // Keep the top-k set, but restore the original vocabulary order before
     // the CDF walk. torch.multinomial (the FasterQwen reference) consumes
@@ -95,6 +114,15 @@ static inline struct ggml_tensor * sampler_tail_build(struct ggml_context * gctx
         struct ggml_tensor * a3d = ggml_reshape_3d(gctx, cur, 1, n_vocab, N);
         struct ggml_tensor * top_values = ggml_get_rows(gctx, a3d, idx); // [1, top_k, N]
 
+        if (capture_diagnostics) {
+            sp->diagnostics.top_order  = order;
+            sp->diagnostics.top_ids    = idx;
+            sp->diagnostics.top_values = top_values;
+            ggml_set_output(order);
+            ggml_set_output(idx);
+            ggml_set_output(top_values);
+        }
+
         // Scatter the selected logits into a full-vocabulary tensor filled
         // with -inf. Softmax/cumsum now follow token-id order while keeping
         // exactly the same top-k mask.
@@ -104,9 +132,23 @@ static inline struct ggml_tensor * sampler_tail_build(struct ggml_context * gctx
         cur  = ggml_reshape_2d(gctx, full, n_vocab, N);
     }
 
+    if (capture_diagnostics) {
+        sp->diagnostics.masked_logits = cur;
+        ggml_set_output(cur);
+    }
+
     // draw one token per slot: find where the cdf crosses u
     struct ggml_tensor * probs  = ggml_soft_max(gctx, cur);
     struct ggml_tensor * cumsum = ggml_cumsum(gctx, probs);
+
+    if (capture_diagnostics) {
+        sp->diagnostics.probabilities = probs;
+        sp->diagnostics.cumsum        = cumsum;
+        sp->diagnostics.uniform       = u;
+        ggml_set_output(probs);
+        ggml_set_output(cumsum);
+        ggml_set_output(u);
+    }
 
     struct ggml_tensor * diff       = ggml_sub(gctx, cumsum, u);
     struct ggml_tensor * cross_mask = ggml_step(gctx, diff);
@@ -124,6 +166,10 @@ static inline struct ggml_tensor * sampler_tail_build(struct ggml_context * gctx
     struct ggml_tensor * selected_f  = ggml_add(
         gctx, idx_f, ggml_mul(gctx, greedy_mask, ggml_sub(gctx, argmax_f, idx_f)));
     struct ggml_tensor * ids = ggml_cast(gctx, selected_f, GGML_TYPE_I32);
+    if (capture_diagnostics) {
+        sp->diagnostics.selected = ids;
+        ggml_set_output(ids);
+    }
     struct ggml_tensor * dst = ggml_view_1d(gctx, sp->codes, N, (size_t) (step_idx + 1) * sp->codes->nb[1]);
     return ggml_cpy(gctx, ids, dst);
 }

@@ -110,13 +110,22 @@ static void parse_generation_defaults(const GGUFModel & gf, GenerationDefaults &
 // frame graph over one persistent sampler state. Built lazily on the
 // first frame at a given width, then replayed for the process
 // lifetime.
-static bool pipeline_tts_cp_graphs_ensure(PipelineTTS * pt, int N) {
+static bool pipeline_tts_cp_graphs_ensure(PipelineTTS * pt, int N, bool diagnostics = false) {
     if ((int) pt->cp_graphs.size() < N) {
         pt->cp_graphs.resize((size_t) N);
     }
     CodePredGraphSet & s = pt->cp_graphs[(size_t) (N - 1)];
-    if (s.frame.ctx != NULL) {
+    if (s.frame.ctx != NULL && (!diagnostics || s.sampler_diagnostics)) {
         return true;
+    }
+
+    if (s.frame.ctx != NULL) {
+        // A diagnostic request may arrive after the normal graph was built.
+        // Rebuild only the frame graph so the sampler can retain its actual
+        // intermediate tensors without changing the normal graph path. Once
+        // installed, this diagnostic graph remains cached for this graph set;
+        // later non-diagnostic requests still skip all diagnostic readbacks.
+        code_predictor_graph_free(&s.frame);
     }
 
     // Sampler inputs and the codes accumulator, resident on the
@@ -141,9 +150,15 @@ static bool pipeline_tts_cp_graphs_ensure(PipelineTTS * pt, int N) {
         ggml_backend_buffer_clear(s.sampler_buf, 0);
     }
 
-    return code_predictor_frame_graph_build(&pt->code_predictor, &pt->code_predictor_kv, pt->backend,
-                                            pt->talker.codec_embedding, pt->hidden_bridge, &s.sampler, N,
-                                            pt->use_flash_attn, pt->clamp_fp16, &s.frame);
+    s.sampler.diagnostics.enabled = diagnostics;
+
+    const bool ok = code_predictor_frame_graph_build(&pt->code_predictor, &pt->code_predictor_kv, pt->backend,
+                                                     pt->talker.codec_embedding, pt->hidden_bridge, &s.sampler, N,
+                                                     pt->use_flash_attn, pt->clamp_fp16, &s.frame);
+    if (ok) {
+        s.sampler_diagnostics = diagnostics;
+    }
+    return ok;
 }
 
 bool pipeline_tts_load(PipelineTTS * pt,
@@ -1276,7 +1291,13 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
     if (any_live) {
         CodePredictorOutput cp;
 
-        if (!pipeline_tts_cp_graphs_ensure(pt, N)) {
+        bool diagnostics = false;
+        if (N == 1) {
+            for (const TtsSlot & slot : e->slots) {
+                diagnostics = diagnostics || (slot.has_frame && slot.job->params->dump_dir != NULL);
+            }
+        }
+        if (!pipeline_tts_cp_graphs_ensure(pt, N, diagnostics)) {
             qt_set_error("tts_engine_step: code predictor graph build failed (N=%d)", N);
             for (TtsSlot & s : e->slots) {
                 s.finished   = true;

@@ -45,6 +45,7 @@
 #include "qt-error.h"
 #include "sampling-graph.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -492,6 +493,83 @@ static bool code_predictor_frame_step(const CodePredictorWeights * cw,
                 snprintf(name, sizeof(name), "predictor-logits-frame%d-step%zu", frame_index, g);
             }
             debug_dump_1d(&d, name, values.data(), vocab);
+        }
+
+        // The sampler graph normally keeps all of these tensors device-local.
+        // For the bounded frame-2 investigation, retain and read back the
+        // actual graph intermediates rather than reconstructing them offline.
+        if (frame_index == 2 && N == 1 && sp->diagnostics.enabled && sp->diagnostics.masked_logits) {
+            const SamplerInputs::Diagnostics & sd = sp->diagnostics;
+            const int n_vocab = (int) sd.masked_logits->ne[0];
+            const int top_k   = (int) sd.top_ids->ne[0];
+            int       vocab_shape = n_vocab;
+            int       top_k_shape = top_k;
+            int       scalar_shape = 1;
+            std::vector<float> scaled((size_t) n_vocab);
+            std::vector<int32_t> order((size_t) n_vocab);
+            std::vector<int32_t> top_ids((size_t) top_k);
+            std::vector<int32_t> candidate_ids;
+            std::vector<float> top_values((size_t) top_k);
+            std::vector<float> masked((size_t) n_vocab);
+            std::vector<float> probs((size_t) n_vocab);
+            std::vector<float> cdf((size_t) n_vocab);
+            float uniform = 0.0f;
+            int32_t selected = -1;
+
+            ggml_backend_tensor_get(sd.scaled_logits, scaled.data(), 0, scaled.size() * sizeof(float));
+            ggml_backend_tensor_get(sd.top_order, order.data(), 0, order.size() * sizeof(int32_t));
+            ggml_backend_tensor_get(sd.top_ids, top_ids.data(), 0, top_ids.size() * sizeof(int32_t));
+            ggml_backend_tensor_get(sd.top_values, top_values.data(), 0, top_values.size() * sizeof(float));
+            ggml_backend_tensor_get(sd.masked_logits, masked.data(), 0, masked.size() * sizeof(float));
+            ggml_backend_tensor_get(sd.probabilities, probs.data(), 0, probs.size() * sizeof(float));
+            ggml_backend_tensor_get(sd.cumsum, cdf.data(), 0, cdf.size() * sizeof(float));
+            ggml_backend_tensor_get(sd.uniform, &uniform, 0, sizeof(uniform));
+            ggml_backend_tensor_get(sd.selected, &selected, 0, sizeof(selected));
+            candidate_ids = top_ids;
+            std::sort(candidate_ids.begin(), candidate_ids.end());
+
+            debug_dump_1d(&d, "sampler-frame2-step9-scaled-logits", scaled.data(), n_vocab);
+            debug_dump_i32_as_f32(&d, "sampler-frame2-step9-top-order", order.data(), &vocab_shape, 1);
+            debug_dump_i32_as_f32(&d, "sampler-frame2-step9-top-k-ids", top_ids.data(), &top_k_shape, 1);
+            debug_dump_1d(&d, "sampler-frame2-step9-top-k-logits", top_values.data(), top_k);
+            debug_dump_1d(&d, "sampler-frame2-step9-masked-logits", masked.data(), n_vocab);
+            debug_dump_1d(&d, "sampler-frame2-step9-probabilities", probs.data(), n_vocab);
+            debug_dump_1d(&d, "sampler-frame2-step9-cdf", cdf.data(), n_vocab);
+            debug_dump_1d(&d, "sampler-frame2-step9-u", &uniform, 1);
+            debug_dump_i32_as_f32(&d, "sampler-frame2-step9-selected", &selected, &scalar_shape, 1);
+
+            char summary_path[1024];
+            snprintf(summary_path, sizeof(summary_path), "%s/sampler-frame2-step9.txt", d.dir);
+            if (FILE * f = utf8_fopen(summary_path, "wb")) {
+                const int kth_id = (top_k > 0) ? order[(size_t) top_k - 1] : -1;
+                const int next_id = (top_k < n_vocab) ? order[(size_t) top_k] : -1;
+                const float kth = (kth_id >= 0) ? scaled[(size_t) kth_id] : 0.0f;
+                const float next = (next_id >= 0) ? scaled[(size_t) next_id] : 0.0f;
+                fprintf(f, "frame=2\nstep=9\nlogical_codebook=10\n");
+                fprintf(f, "vocab=%d\ntop_k=%d\n", n_vocab, top_k);
+                fprintf(f, "u=%.10g\nselected=%d\n", (double) uniform, (int) selected);
+                fprintf(f, "kth_id=%d\nkth_logit=%.10g\n", kth_id, (double) kth);
+                fprintf(f, "k_plus_one_id=%d\nk_plus_one_logit=%.10g\n", next_id, (double) next);
+                fprintf(f, "top_order_hash=0x%016llx\n", (unsigned long long) debug_hash64(order.data(), order.size() * sizeof(int32_t)));
+                fprintf(f, "candidate_set_hash=0x%016llx\n",
+                        (unsigned long long) debug_hash64(candidate_ids.data(), candidate_ids.size() * sizeof(int32_t)));
+                fprintf(f, "masked_logits_hash=0x%016llx\n",
+                        (unsigned long long) debug_hash64(masked.data(), masked.size() * sizeof(float)));
+                fprintf(f, "probabilities_hash=0x%016llx\n",
+                        (unsigned long long) debug_hash64(probs.data(), probs.size() * sizeof(float)));
+                fprintf(f, "cdf_hash=0x%016llx\n",
+                        (unsigned long long) debug_hash64(cdf.data(), cdf.size() * sizeof(float)));
+                for (int token : {1168, 1180}) {
+                    if (token >= 0 && token < n_vocab) {
+                        fprintf(f, "token_%d_logit=%.10g\n", token, (double) masked[(size_t) token]);
+                        fprintf(f, "token_%d_probability=%.10g\n", token, (double) probs[(size_t) token]);
+                        fprintf(f, "token_%d_cdf_before=%.10g\n", token,
+                                token > 0 ? (double) cdf[(size_t) token - 1] : 0.0);
+                        fprintf(f, "token_%d_cdf=%.10g\n", token, (double) cdf[(size_t) token]);
+                    }
+                }
+                fclose(f);
+            }
         }
     }
 

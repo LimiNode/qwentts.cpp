@@ -23,7 +23,9 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <sstream>
 #include <string>
+#include <utility>
 
 // A diagnostic-only sidecar lets a replay pin the Talker c0 history without
 // changing the public ABI. One integer token is read per line from
@@ -48,6 +50,47 @@ static std::vector<int32_t> load_forced_talker_history(const char * dump_dir) {
             return {};
         }
         out.push_back((int32_t) value);
+    }
+    if (!input.eof()) {
+        return {};
+    }
+    return out;
+}
+
+// A diagnostic-only full-frame replay sidecar. Each non-empty line in
+// <dump_dir>/forced-talker-frames.txt contains one complete frame of
+// num_code_groups integer codebook ids. The normal path never consults it.
+static std::vector<std::vector<int32_t>> load_forced_talker_frames(const char * dump_dir) {
+    if (dump_dir == NULL || *dump_dir == '\0') {
+        return {};
+    }
+    std::string path(dump_dir);
+    if (!path.empty() && path.back() != '/' && path.back() != '\\') {
+        path.push_back('/');
+    }
+    path += "forced-talker-frames.txt";
+    std::ifstream input(path);
+    if (!input) {
+        return {};
+    }
+    std::vector<std::vector<int32_t>> out;
+    std::string line;
+    while (std::getline(input, line)) {
+        std::istringstream row(line);
+        std::vector<int32_t> frame;
+        int64_t value = 0;
+        while (row >> value) {
+            if (value < 0 || value > std::numeric_limits<int32_t>::max()) {
+                return {};
+            }
+            frame.push_back((int32_t) value);
+        }
+        if (!row.eof()) {
+            return {};
+        }
+        if (!frame.empty()) {
+            out.push_back(std::move(frame));
+        }
     }
     if (!input.eof()) {
         return {};
@@ -576,6 +619,7 @@ struct TtsSlot {
     int64_t              subseq_counter;  // Philox subsequence cursor
     std::vector<int32_t> talker_history;  // emitted c0, feeds repetition penalty
     std::vector<int32_t> forced_talker_history; // diagnostic replay override
+    std::vector<std::vector<int32_t>> forced_talker_frames; // complete frame replay
     std::vector<int32_t> prev_ids;        // previous frame codes [num_code_groups]
     const float *        prev_overlay;    // trailing text row or tts_pad row
     std::vector<float>   logits;          // pending c0 logits [vocab]
@@ -906,6 +950,27 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
         } else {
             qt_log(QT_LOG_INFO, "[Pipeline] forced Talker history: %d c0 tokens",
                    (int) s.forced_talker_history.size());
+        }
+    }
+    s.forced_talker_frames = load_forced_talker_frames(params->dump_dir);
+    if (!s.forced_talker_frames.empty()) {
+        bool valid = true;
+        for (const std::vector<int32_t> & frame : s.forced_talker_frames) {
+            if ((int) frame.size() != pt->num_code_groups) {
+                valid = false;
+                break;
+            }
+            valid = valid && frame[0] >= 0 && frame[0] < pt->talker.vocab_size;
+            for (int g = 1; valid && g < pt->num_code_groups; g++) {
+                valid = frame[(size_t) g] >= 0 && frame[(size_t) g] < pt->code_predictor.vocab_size;
+            }
+        }
+        if (!valid) {
+            qt_log(QT_LOG_WARN, "[Pipeline] ignoring invalid forced Talker frames sidecar");
+            s.forced_talker_frames.clear();
+        } else {
+            qt_log(QT_LOG_INFO, "[Pipeline] forced Talker frames: %d complete frames",
+                   (int) s.forced_talker_frames.size());
         }
     }
 
@@ -1314,8 +1379,14 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
             continue;
         }
 
-        const bool forced_c0 = (s.step >= 0 && (size_t) s.step < s.forced_talker_history.size());
-        if (forced_c0) {
+        const bool forced_frame = (s.step >= 0 && (size_t) s.step < s.forced_talker_frames.size());
+        const bool forced_c0 = forced_frame ||
+                               (s.step >= 0 && (size_t) s.step < s.forced_talker_history.size());
+        if (forced_frame) {
+            c0 = s.forced_talker_frames[(size_t) s.step][0];
+            qt_log(QT_LOG_DEBUG, "[ARTrace] forced Talker frame c0 step=%d sampled=%d forced=%d", s.step,
+                   sampled_c0, c0);
+        } else if (forced_c0) {
             c0 = s.forced_talker_history[(size_t) s.step];
             qt_log(QT_LOG_DEBUG, "[ARTrace] forced Talker c0 step=%d sampled=%d forced=%d", s.step, sampled_c0,
                    c0);
@@ -1490,6 +1561,16 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
 
                     std::vector<int32_t> codes(cp.codes.begin() + (size_t) i * (size_t) num_codebooks,
                                                cp.codes.begin() + (size_t) (i + 1) * (size_t) num_codebooks);
+                    const bool forced_frame =
+                        s.step >= 0 && (size_t) s.step < s.forced_talker_frames.size();
+                    if (forced_frame) {
+                        const std::vector<int32_t> sampled_codes = codes;
+                        codes = s.forced_talker_frames[(size_t) s.step];
+                        qt_log(QT_LOG_DEBUG,
+                               "[ARTrace] forced Talker frame step=%d sampled=%d,%d,%d,%d forced=%d,%d,%d,%d",
+                               s.step, sampled_codes[0], sampled_codes[1], sampled_codes[2], sampled_codes[3],
+                               codes[0], codes[1], codes[2], codes[3]);
+                    }
                     if (p->dump_dir && s.step < 128) {
                         std::string code_text;
                         for (int code : codes) {

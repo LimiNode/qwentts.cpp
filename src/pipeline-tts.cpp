@@ -1226,6 +1226,11 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
         // it on the first step produces a misleading successful empty audio
         // result (and makes the worker fail only after the model call).
         suppress_initial_eos(s.logits.data(), vocab, codec_eos_id, s.step);
+        const bool diagnostic_frame = p->dump_dir && s.step < 128;
+        std::vector<float> suppressed_logits;
+        if (diagnostic_frame) {
+            suppressed_logits = s.logits;
+        }
         float u_c0 = 0.0f;
         int   c0   = sample_top_k_p(s.logits.data(), vocab, s.talker_T, p->top_k, p->top_p, p->repetition_penalty,
                                     s.talker_history.data(), (int) s.talker_history.size(), s.job->resolved_seed,
@@ -1253,6 +1258,38 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
         // existing diagnostic dump option and deliberately stops at 128
         // Talker steps so a runaway request cannot create unbounded logs.
         if (p->dump_dir && s.step < 128) {
+            const SamplingAccumulatorDiagnostics accumulator =
+                sampling_accumulator_diagnostics_from_weights(s.logits.data(), vocab, u_c0);
+            DebugDumper d;
+            debug_init(&d, p->dump_dir);
+            char name[96];
+            snprintf(name, sizeof(name), "talker-sampler-frame%d-suppressed-logits", s.step);
+            debug_dump_1d(&d, name, suppressed_logits.data(), vocab);
+            snprintf(name, sizeof(name), "talker-sampler-frame%d-weights", s.step);
+            debug_dump_1d(&d, name, s.logits.data(), vocab);
+            snprintf(name, sizeof(name), "talker-sampler-frame%d-selection-cdf-f32", s.step);
+            debug_dump_1d(&d, name, accumulator.cdf.data(), vocab);
+            snprintf(name, sizeof(name), "talker-sampler-frame%d-u", s.step);
+            debug_dump_1d(&d, name, &u_c0, 1);
+            snprintf(name, sizeof(name), "talker-sampler-frame%d-sum-f32", s.step);
+            debug_dump_1d(&d, name, &accumulator.sum, 1);
+            snprintf(name, sizeof(name), "talker-sampler-frame%d-target-f32", s.step);
+            debug_dump_1d(&d, name, &accumulator.target, 1);
+            int scalar_shape = 1;
+            snprintf(name, sizeof(name), "talker-sampler-frame%d-selected", s.step);
+            debug_dump_i32_as_f32(&d, name, &c0, &scalar_shape, 1);
+
+            char summary_path[1024];
+            snprintf(summary_path, sizeof(summary_path), "%s/talker-sampler-frame%d.txt", d.dir, s.step);
+            if (FILE * f = utf8_fopen(summary_path, "wb")) {
+                fprintf(f, "frame=%d\nsubseq=%lld\n", s.step, (long long) (s.subseq_counter - 1));
+                fprintf(f, "vocab=%d\nu=%.10g\n", vocab, (double) u_c0);
+                fprintf(f, "sum_f32=%.10g\ntarget_f32=%.10g\n", (double) accumulator.sum,
+                        (double) accumulator.target);
+                fprintf(f, "selected=%d\nreplayed_selected=%d\n", c0, accumulator.selected);
+                fclose(f);
+            }
+
             const SamplingDiagnostics diagnostics =
                 sampling_diagnostics_from_weights(s.logits.data(), vocab, c0, codec_eos_id, 5);
             std::string top;

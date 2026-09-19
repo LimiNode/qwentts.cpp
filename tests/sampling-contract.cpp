@@ -107,6 +107,20 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    const float accumulator_weights[] = { 0.1F, 0.2F, 0.3F, 0.4F };
+    const SamplingAccumulatorDiagnostics accumulator =
+        sampling_accumulator_diagnostics_from_weights(accumulator_weights, 4, 0.55F);
+    if (!check(accumulator.cdf.size() == 4, "accumulator diagnostics retain every vocabulary entry") ||
+        !check(std::fabs(accumulator.sum - 1.0F) < 1e-6F, "accumulator diagnostics preserve the F32 sum") ||
+        !check(std::fabs(accumulator.target - 0.55F) < 1e-6F,
+               "accumulator diagnostics preserve the F32 target") ||
+        !check(std::fabs(accumulator.cdf[1] - 0.3F) < 1e-6F &&
+                   std::fabs(accumulator.cdf[2] - 0.6F) < 1e-6F,
+               "accumulator diagnostics follow vocabulary-order CDF") ||
+        !check(accumulator.selected == 2, "accumulator diagnostics replay the selected token")) {
+        return 1;
+    }
+
     // Model-free deterministic policy checks. The explicit uniform draw keeps
     // these assertions independent of Philox/RNG scheduling.
     const int32_t history[] = { 0 };

@@ -149,6 +149,7 @@ _subseq_counter = [0]
 _seed           = [42]
 _trace_samples  = [False]
 _sample_trace   = []
+_forced_talker_history = []
 _sampler_diagnostic = {
     "dump_dir": None,
     "subseq": None,
@@ -160,6 +161,11 @@ def reset_philox(seed):
     _subseq_counter[0] = 0
     _seed[0]           = int(seed)
     _sample_trace.clear()
+
+def set_forced_talker_history(tokens):
+    """Pin Talker c0 outputs for a diagnostic replay without changing sampling math."""
+    global _forced_talker_history
+    _forced_talker_history = [int(token) for token in tokens]
 
 def set_trace(flag):
     _trace_samples[0] = bool(flag)
@@ -234,6 +240,12 @@ def patched_multinomial(input, num_samples, replacement=False, generator=None, o
                 selected = True
             if selected and not capture_selection:
                 break
+        # Talker c0 samples are Philox subsequences 0, 16, 32, ...; predictor
+        # draws remain untouched. This mirrors the native dump-dir sidecar and
+        # makes the replay contract explicit without changing production code.
+        forced_frame = seq // 16 if seq % 16 == 0 else -1
+        if b == 0 and 0 <= forced_frame < len(_forced_talker_history):
+            idx = _forced_talker_history[forced_frame]
         out_ids[b, 0] = idx
         diagnostic = _sampler_diagnostic
         if capture_selection:

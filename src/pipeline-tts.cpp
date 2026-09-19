@@ -1181,6 +1181,26 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                 s.logits.assign(fw.logits_last.begin() + (size_t) i * (size_t) vocab,
                                 fw.logits_last.begin() + (size_t) (i + 1) * (size_t) vocab);
 
+                // Bounded same-history bisection: when diagnostics are
+                // enabled, retain the raw Talker output before suppression,
+                // repetition penalty, temperature, or top-k processing.  The
+                // frame index is the semantic AR frame (step 1 is the first
+                // decode after the prefill).  This is diagnostic-only and is
+                // never read on the normal hot path.
+                if (s.job->params->dump_dir && s.step < 128) {
+                    DebugDumper d;
+                    debug_init(&d, s.job->params->dump_dir);
+                    char name[64];
+                    snprintf(name, sizeof(name), "talker-logits-frame%d-raw", s.step);
+                    debug_dump_1d(&d, name, s.logits.data(), vocab);
+                    if (!fw.hidden_last.empty()) {
+                        snprintf(name, sizeof(name), "talker-hidden-frame%d", s.step);
+                        debug_dump_1d(&d, name,
+                                      fw.hidden_last.data() + (size_t) i * (size_t) hidden,
+                                      hidden);
+                    }
+                }
+
                 // Bisection dump: the talker hidden_last at step 1 is
                 // the input the code predictor consumes after consuming
                 // the next-emb of step 0. Pairing it byte for byte with

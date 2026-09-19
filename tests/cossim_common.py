@@ -176,13 +176,15 @@ def enable_philox_sampling(seed, trace=False):
     torch.multinomial = patched_multinomial
 
 def enable_sampler_diagnostic(dump_dir, subseq=42):
-    """Capture one actual Python sampler input and its CDF.
+    """Capture one actual Python sampler input and both cumulative views.
 
     ``torch.multinomial`` receives probabilities after the Transformers
     logits processors/warpers have applied top-k/top-p.  Capturing this tensor
     at the target Philox subsequence therefore records the surviving
     candidate set and the exact vocab-order probabilities used by Python,
-    rather than reconstructing them later from logits.
+    rather than reconstructing them later from logits.  The F32 ``cumsum``
+    is a diagnostic reconstruction; ``selection-cdf-f64`` is the accumulator
+    used by this harness to choose the token.
     """
     ensure_dir(dump_dir)
     _sampler_diagnostic.update(
@@ -216,16 +218,25 @@ def patched_multinomial(input, num_samples, replacement=False, generator=None, o
         target = float(u) * s
         acc    = 0.0
         idx    = vocab - 1
+        capture_selection = (
+            _sampler_diagnostic["dump_dir"] is not None
+            and not _sampler_diagnostic["captured"]
+            and seq == _sampler_diagnostic["subseq"]
+        )
+        selection_cdf = np.empty(vocab, dtype=np.float64) if capture_selection else None
+        selected = False
         for i in range(vocab):
             acc += float(row[i])
-            if acc >= target:
+            if selection_cdf is not None:
+                selection_cdf[i] = acc
+            if not selected and acc >= target:
                 idx = i
+                selected = True
+            if selected and not capture_selection:
                 break
         out_ids[b, 0] = idx
         diagnostic = _sampler_diagnostic
-        if (diagnostic["dump_dir"] is not None
-                and not diagnostic["captured"]
-                and seq == diagnostic["subseq"]):
+        if capture_selection:
             dump_dir = diagnostic["dump_dir"]
             candidate_ids = np.flatnonzero(row > 0.0).astype(np.int64)
             order = np.argsort(-row[candidate_ids], kind="stable")
@@ -235,7 +246,10 @@ def patched_multinomial(input, num_samples, replacement=False, generator=None, o
             save_dump(os.path.join(dump_dir, "sampler-input-probs.bin"), row)
             save_dump_i32(os.path.join(dump_dir, "sampler-candidate-ids.bin"), candidate_ids)
             save_dump(os.path.join(dump_dir, "sampler-candidate-probs.bin"), candidate_probs)
-            save_dump(os.path.join(dump_dir, "sampler-cdf.bin"), cdf)
+            save_dump(os.path.join(dump_dir, "sampler-cdf-f32.bin"), cdf)
+            save_dump_f64(os.path.join(dump_dir, "sampler-selection-cdf-f64.bin"), selection_cdf)
+            save_dump_f64(os.path.join(dump_dir, "sampler-sum-f64.bin"), np.asarray([s], dtype=np.float64))
+            save_dump_f64(os.path.join(dump_dir, "sampler-target-f64.bin"), np.asarray([target], dtype=np.float64))
             save_dump(os.path.join(dump_dir, "sampler-u.bin"), np.asarray([u], dtype=np.float32))
             save_dump_i32(os.path.join(dump_dir, "sampler-selected.bin"), np.asarray([idx], dtype=np.int64))
             with open(os.path.join(dump_dir, "sampler-diagnostic.txt"), "w", encoding="utf-8") as f:
@@ -243,6 +257,10 @@ def patched_multinomial(input, num_samples, replacement=False, generator=None, o
                 f.write(f"vocab={vocab}\n")
                 f.write(f"candidate_count={candidate_ids.size}\n")
                 f.write(f"u={float(u):.10f}\n")
+                f.write(f"cdf_f32_file=sampler-cdf-f32.bin\n")
+                f.write(f"selection_cdf_f64_file=sampler-selection-cdf-f64.bin\n")
+                f.write(f"sum_f64={s:.17g}\n")
+                f.write(f"target_f64={target:.17g}\n")
                 f.write(f"selected={idx}\n")
                 f.write("candidate_ids=" + ",".join(str(int(x)) for x in candidate_ids) + "\n")
             diagnostic["captured"] = True
@@ -260,6 +278,16 @@ def save_dump(path, data):
     if isinstance(data, torch.Tensor):
         data = data.detach().to(torch.float32).cpu().numpy()
     data  = np.ascontiguousarray(data.astype(np.float32))
+    shape = data.shape
+    with open(path, "wb") as f:
+        f.write(struct.pack("i", len(shape)))
+        for s in shape:
+            f.write(struct.pack("i", s))
+        f.write(data.tobytes())
+
+def save_dump_f64(path, data):
+    """Write diagnostic values without rounding the selection accumulator."""
+    data = np.ascontiguousarray(np.asarray(data, dtype=np.float64))
     shape = data.shape
     with open(path, "wb") as f:
         f.write(struct.pack("i", len(shape)))

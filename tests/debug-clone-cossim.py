@@ -331,7 +331,7 @@ def main():
     ap.add_argument("--trace",          action="store_true",
                     help="print per sample u and idx for the first 32 samples")
     ap.add_argument("--dump-sampler-intermediates", default=None,
-                    help="capture actual Python multinomial probabilities/CDF at --sampler-subseq")
+                    help="capture actual Python multinomial probabilities and both CDF views at --sampler-subseq")
     ap.add_argument("--sampler-subseq", type=int, default=42,
                     help="Philox subsequence to capture with --dump-sampler-intermediates")
     ap.add_argument("--dump-predictor-logits", action="store_true",

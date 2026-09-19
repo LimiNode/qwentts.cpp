@@ -407,6 +407,7 @@ def install_hooks(model, dump_dir, bisect_layers=(0, 7, 14, 21, 27)):
             return
         if talker_post_step["n"] == 0:
             save_dump(os.path.join(dump_dir, "talker-hidden-step1.bin"), last[0, -1])
+        save_dump(os.path.join(dump_dir, f"talker-hidden-frame{talker_post_step['n'] + 1}.bin"), last[0, -1])
         talker_post_step["n"] += 1
     talker_model.register_forward_hook(talker_model_post_hook)
 
@@ -416,6 +417,7 @@ def install_hooks(model, dump_dir, bisect_layers=(0, 7, 14, 21, 27)):
     # trailing_text_hidden / tts_pad_embed overlay tensors carried by the
     # output dataclass at every step (we only dump them once).
     seen_overlay = {"done": False}
+    talker_logits_step = {"n": 0}
     orig_talker_forward = talker_lm.forward
     def hooked_talker_forward(*args, **kwargs):
         inputs_embeds = kwargs.get("inputs_embeds", None)
@@ -430,6 +432,14 @@ def install_hooks(model, dump_dir, bisect_layers=(0, 7, 14, 21, 27)):
             if logits.dim() == 3 and logits.shape[1] > 1:
                 save_dump(os.path.join(dump_dir, "talker-logits-prefill.bin"), logits[0, -1])
                 seen_codes["done"] = True
+        if (out is not None and getattr(out, "logits", None) is not None):
+            logits = out.logits
+            if logits.dim() == 3 and logits.shape[1] == 1:
+                talker_logits_step["n"] += 1
+                save_dump(
+                    os.path.join(dump_dir, f"talker-logits-frame{talker_logits_step['n']}.bin"),
+                    logits[0, -1],
+                )
         if (out is not None and not seen_overlay["done"]
                 and getattr(out, "trailing_text_hidden", None) is not None
                 and getattr(out, "tts_pad_embed", None) is not None):

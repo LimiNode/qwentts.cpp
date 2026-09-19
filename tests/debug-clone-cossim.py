@@ -253,23 +253,29 @@ def install_clone_hooks(model, dump_dir, dump_predictor_logits=False):
 
     if dump_predictor_logits:
         # The native graph exposes slot-0 predictor logits only in its
-        # diagnostic dump mode. Capture the first invocation of each Python
-        # codebook head, which corresponds to the first generated frame.
+        # diagnostic dump mode. Capture the bounded per-frame invocation of
+        # each Python codebook head with the same frame-indexed naming.
         predictor = model.talker.code_predictor
-        seen_predictor = set()
+        predictor_frames = [0] * len(predictor.lm_head)
         for step, head in enumerate(predictor.lm_head):
             def hook_predictor(module, args, output, step=step):
-                if step in seen_predictor:
+                frame = predictor_frames[step]
+                predictor_frames[step] += 1
+                if frame >= 128:
                     return
                 logits = output[0] if isinstance(output, tuple) else output
                 if getattr(logits, "dim", lambda: 0)() == 3:
                     logits = logits[:, -1, :]
                 if getattr(logits, "dim", lambda: 0)() == 2:
+                    name = (
+                        f"predictor-logits-step{step}.bin"
+                        if frame == 0
+                        else f"predictor-logits-frame{frame}-step{step}.bin"
+                    )
                     cc.save_dump(
-                        os.path.join(dump_dir, f"predictor-logits-step{step}.bin"),
+                        os.path.join(dump_dir, name),
                         logits[0],
                     )
-                    seen_predictor.add(step)
             head.register_forward_hook(hook_predictor)
 
 def dump_mel_constants(dump_dir):
@@ -339,7 +345,7 @@ def main():
     ap.add_argument("--forced-talker-frames", default=None,
                     help="text file with one complete 16-codebook Talker frame per line")
     ap.add_argument("--dump-predictor-logits", action="store_true",
-                    help="dump first-frame Python code-predictor logits")
+                    help="dump bounded frame-indexed Python code-predictor logits")
     ap.add_argument("--export-reference-latents", default=None,
                     help="export Python speaker/code tensors and reuse them natively")
     ap.add_argument("--stochastic",     action="store_true",
@@ -646,17 +652,26 @@ def main():
     cc.compare_exact_i32("ref-codes.bin",  DUMP_CPP, DUMP_PT, "RefCodes")
     cc.compare_stages(STAGES_CLONE, DUMP_CPP, DUMP_PT)
     if args.dump_predictor_logits:
-        for step in range(32):
-            name = f"predictor-logits-step{step}.bin"
-            try:
-                aa, ab = cc.pair(name, DUMP_CPP, DUMP_PT)
-            except FileNotFoundError:
+        for frame in range(min(args.max_new_tokens, 128)):
+            compared = 0
+            for step in range(32):
+                name = (
+                    f"predictor-logits-step{step}.bin"
+                    if frame == 0
+                    else f"predictor-logits-frame{frame}-step{step}.bin"
+                )
+                try:
+                    aa, ab = cc.pair(name, DUMP_CPP, DUMP_PT)
+                except FileNotFoundError:
+                    break
+                c, mx, mean = cc.metric(aa, ab)
+                print(
+                    f"[Cossim] PredictorLogitsFrame{frame}Step{step} cos: {c:.6f} "
+                    f"max: {mx:.4e} mean: {mean:.4e}"
+                )
+                compared += 1
+            if compared == 0:
                 break
-            c, mx, mean = cc.metric(aa, ab)
-            print(
-                f"[Cossim] PredictorLogits{step} cos: {c:.6f} "
-                f"max: {mx:.4e} mean: {mean:.4e}"
-            )
     cc.compare_exact_i32("codes-full.bin", DUMP_CPP, DUMP_PT, "CodesFull")
 
     aa, ab = cc.pair("output-audio.bin", DUMP_CPP, DUMP_PT)

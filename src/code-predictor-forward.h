@@ -500,7 +500,7 @@ static bool code_predictor_frame_step(const CodePredictorWeights * cw,
         // actual graph intermediates rather than reconstructing them offline.
         if (frame_index == 2 && N == 1 && sp->diagnostics.enabled && sp->diagnostics.masked_logits) {
             const SamplerInputs::Diagnostics & sd = sp->diagnostics;
-            const int n_vocab = (int) sd.masked_logits->ne[0];
+            const int n_vocab = (int) sd.scaled_logits->ne[0];
             const int top_k   = (int) sd.top_ids->ne[0];
             int       vocab_shape = n_vocab;
             int       top_k_shape = top_k;

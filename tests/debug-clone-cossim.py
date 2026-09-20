@@ -358,8 +358,16 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=64)
     ap.add_argument("--trace",          action="store_true",
                     help="print per sample u and idx for the first 32 samples")
-    ap.add_argument("--dump-sampler-intermediates", default=None,
-                    help="capture actual Python multinomial probabilities and both CDF views at the target")
+    ap.add_argument(
+        "--dump-sampler-intermediates",
+        nargs="?",
+        const=DUMP_PT,
+        default=None,
+        help=(
+            "capture actual Python multinomial probabilities and both CDF views "
+            "at the target (default: python/clone)"
+        ),
+    )
     ap.add_argument("--sampler-frame", type=int, default=2,
                     help="predictor frame for bounded sampler diagnostics (default: 2)")
     ap.add_argument("--sampler-step", type=int, default=9,

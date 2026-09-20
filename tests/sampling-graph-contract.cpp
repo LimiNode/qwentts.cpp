@@ -37,6 +37,7 @@ bool run_case(const char * name,
     sampler_inputs_build(ctx, &sampler, 1, 1, 2);
     sampler.diagnostics.enabled     = diagnostics;
     sampler.diagnostics.target_step = 0;
+    sampler.forced_enabled           = forced_token >= 0;
     ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 1);
     ggml_tensor * output = sampler_tail_build(ctx, logits, &sampler, 0);
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 256, false);

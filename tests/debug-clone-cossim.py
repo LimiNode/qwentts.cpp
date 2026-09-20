@@ -258,7 +258,9 @@ def install_clone_hooks(model, dump_dir, dump_predictor_logits=False):
         predictor = model.talker.code_predictor
         predictor_frames = [0] * len(predictor.lm_head)
         predictor_hidden_calls = [0]
-        predictor_norm = getattr(predictor, "norm", None)
+        # The RMSNorm belongs to the decoder submodule, not the conditional
+        # generation wrapper that owns the lm_head list.
+        predictor_norm = getattr(getattr(predictor, "model", None), "norm", None)
         if predictor_norm is not None:
             def hook_predictor_hidden(module, args, output):
                 call = predictor_hidden_calls[0]

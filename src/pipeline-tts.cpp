@@ -268,6 +268,7 @@ static bool pipeline_tts_cp_graphs_ensure(PipelineTTS * pt, int N, bool diagnost
     }
 
     s.sampler.diagnostics.enabled = diagnostics;
+    s.sampler.forced_enabled = diagnostics;
 
     const bool ok = code_predictor_frame_graph_build(&pt->code_predictor, &pt->code_predictor_kv, pt->backend,
                                                      pt->talker.codec_embedding, pt->hidden_bridge, &s.sampler, N,

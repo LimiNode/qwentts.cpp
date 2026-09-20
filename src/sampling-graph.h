@@ -40,6 +40,7 @@ struct SamplerInputs {
     int                  n_steps = 0;        // sampled codes per frame (semantic + acoustic)
     int                  N       = 0;
     int                  top_k   = 0;        // candidate count baked into every tail
+    bool                 forced_enabled = false; // diagnostic graph only
 };
 
 // Create the sampler tensors inside pctx. The caller allocates pctx
@@ -62,6 +63,9 @@ static inline void sampler_inputs_build(struct ggml_context * pctx, SamplerInput
 // predictor steps consume the forced history rather than a host-side result
 // that arrives after the frame graph has already run.
 static inline void sampler_forced_codes_upload(SamplerInputs * sp, const int32_t * forced_codes, int N) {
+    if (!sp->forced_enabled) {
+        return;
+    }
     std::vector<float> values((size_t) sp->n_steps * (size_t) N, -1.0f);
     if (forced_codes) {
         for (int g = 0; g < sp->n_steps; g++) {
@@ -190,10 +194,12 @@ static inline struct ggml_tensor * sampler_tail_build(struct ggml_context * gctx
     struct ggml_tensor * argmax_f    = ggml_cast(gctx, ggml_argmax(gctx, logits), GGML_TYPE_F32);
     struct ggml_tensor * selected_f  = ggml_add(
         gctx, idx_f, ggml_mul(gctx, greedy_mask, ggml_sub(gctx, argmax_f, idx_f)));
-    struct ggml_tensor * forced =
-        ggml_view_2d(gctx, sp->forced, 1, N, sp->forced->nb[1], (size_t) step_idx * sp->forced->nb[1]);
-    struct ggml_tensor * forced_mask = ggml_step(gctx, forced);
-    selected_f = ggml_add(gctx, selected_f, ggml_mul(gctx, forced_mask, ggml_sub(gctx, forced, selected_f)));
+    if (sp->forced_enabled) {
+        struct ggml_tensor * forced =
+            ggml_view_2d(gctx, sp->forced, 1, N, sp->forced->nb[1], (size_t) step_idx * sp->forced->nb[1]);
+        struct ggml_tensor * forced_mask = ggml_step(gctx, forced);
+        selected_f = ggml_add(gctx, selected_f, ggml_mul(gctx, forced_mask, ggml_sub(gctx, forced, selected_f)));
+    }
     struct ggml_tensor * ids = ggml_cast(gctx, selected_f, GGML_TYPE_I32);
     if (capture_diagnostics) {
         sp->diagnostics.selected = ids;

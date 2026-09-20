@@ -65,6 +65,18 @@ class FirstMismatchTest(unittest.TestCase):
 
             self.assertFalse(report["sampler_target"]["python_summary_matches_target"])
 
+    def test_shape_mismatch_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            native_dir = Path(temp_dir) / "native"
+            python_dir = Path(temp_dir) / "python"
+            native_dir.mkdir()
+            python_dir.mkdir()
+            _write_dump(native_dir / "codes-full.bin", [[10, 20], [30, 40]])
+            _write_dump(python_dir / "codes-full.bin", [[10, 20], [30, 40], [50, 60]])
+
+            with self.assertRaisesRegex(ValueError, "identical shapes"):
+                afm.analyze(native_dir, python_dir)
+
 
 if __name__ == "__main__":
     unittest.main()

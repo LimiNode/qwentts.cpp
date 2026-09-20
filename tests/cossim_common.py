@@ -151,6 +151,7 @@ _trace_samples  = [False]
 _sample_trace   = []
 _forced_talker_history = []
 _forced_talker_frames = []
+_forced_predictor_frames = []
 _sampler_diagnostic = {
     "dump_dir": None,
     "subseq": None,
@@ -172,6 +173,11 @@ def set_forced_talker_frames(frames):
     """Pin complete Talker codebook frames for a diagnostic replay."""
     global _forced_talker_frames
     _forced_talker_frames = [[int(token) for token in frame] for frame in frames]
+
+def set_forced_predictor_frames(frames):
+    """Pin predictor codebooks 1..15 while preserving the graph history."""
+    global _forced_predictor_frames
+    _forced_predictor_frames = [[int(token) for token in frame] for frame in frames]
 
 def set_trace(flag):
     _trace_samples[0] = bool(flag)
@@ -255,6 +261,10 @@ def patched_multinomial(input, num_samples, replacement=False, generator=None, o
             frame = _forced_talker_frames[forced_frame]
             if codebook < len(frame):
                 idx = frame[codebook]
+        elif b == 0 and codebook > 0 and 0 <= forced_frame < len(_forced_predictor_frames):
+            frame = _forced_predictor_frames[forced_frame]
+            if codebook - 1 < len(frame):
+                idx = frame[codebook - 1]
         elif b == 0 and codebook == 0 and 0 <= forced_frame < len(_forced_talker_history):
             idx = _forced_talker_history[forced_frame]
         out_ids[b, 0] = idx

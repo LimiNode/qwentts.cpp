@@ -10,7 +10,12 @@
 
 namespace {
 
-bool run_case(const char * name, float temperature, float uniform, int expected, bool diagnostics = false) {
+bool run_case(const char * name,
+              float       temperature,
+              float       uniform,
+              int         expected,
+              bool        diagnostics = false,
+              int         forced_token = -1) {
     ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (!backend) {
         std::fprintf(stderr, "sampling graph contract: CPU backend unavailable\n");
@@ -32,6 +37,7 @@ bool run_case(const char * name, float temperature, float uniform, int expected,
     sampler_inputs_build(ctx, &sampler, 1, 1, 2);
     sampler.diagnostics.enabled     = diagnostics;
     sampler.diagnostics.target_step = 0;
+    sampler.forced_enabled           = forced_token >= 0;
     ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 1);
     ggml_tensor * output = sampler_tail_build(ctx, logits, &sampler, 0);
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 256, false);
@@ -48,6 +54,8 @@ bool run_case(const char * name, float temperature, float uniform, int expected,
     const float state_values[] = { temperature, uniform };
     ggml_backend_tensor_set(logits, logit_values, 0, sizeof(logit_values));
     ggml_backend_tensor_set(sampler.state, state_values, 0, sizeof(state_values));
+    const int32_t forced_values[] = { forced_token };
+    sampler_forced_codes_upload(&sampler, forced_token >= 0 ? forced_values : nullptr, 1);
     if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "sampling graph contract: graph compute failed for %s\n", name);
         ggml_backend_buffer_free(buffer);
@@ -107,5 +115,8 @@ int main() {
     // Greedy must remain argmax (3), even though the first surviving vocab id
     // is 1. This catches accidental reuse of the stochastic CDF ordering.
     const bool greedy = run_case("greedy-argmax", 1.0F, -1.0F, 3);
-    return (stochastic && greedy) ? 0 : 1;
+    // A forced predictor prefix must override the selected id inside the graph
+    // so subsequent codebook steps consume the requested history.
+    const bool forced = run_case("forced-prefix-token", 1.0F, 0.20F, 2, false, 2);
+    return (stochastic && greedy && forced) ? 0 : 1;
 }

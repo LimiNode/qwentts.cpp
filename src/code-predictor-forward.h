@@ -536,9 +536,12 @@ static bool code_predictor_frame_step(const CodePredictorWeights * cw,
         }
 
         // The sampler graph normally keeps all of these tensors device-local.
-        // For the bounded frame-2 investigation, retain and read back the
-        // actual graph intermediates rather than reconstructing them offline.
-        if (frame_index == 2 && N == 1 && sp->diagnostics.enabled && sp->diagnostics.masked_logits) {
+        // For a bounded investigation, retain and read back the actual graph
+        // intermediates at the configured frame/step rather than rebuilding
+        // them offline. The target is diagnostic-only and never affects the
+        // sampled ids.
+        if (frame_index == sp->diagnostics.target_frame && N == 1 && sp->diagnostics.enabled
+            && sp->diagnostics.masked_logits) {
             const SamplerInputs::Diagnostics & sd = sp->diagnostics;
             const int n_vocab = (int) sd.scaled_logits->ne[0];
             const int top_k   = (int) sd.top_ids->ne[0];
@@ -568,26 +571,45 @@ static bool code_predictor_frame_step(const CodePredictorWeights * cw,
             candidate_ids = top_ids;
             std::sort(candidate_ids.begin(), candidate_ids.end());
 
-            debug_dump_1d(&d, "sampler-frame2-step9-scaled-logits", scaled.data(), n_vocab);
-            debug_dump_i32_as_f32(&d, "sampler-frame2-step9-top-order", order.data(), &vocab_shape, 1);
-            debug_dump_i32_as_f32(&d, "sampler-frame2-step9-top-k-ids", top_ids.data(), &top_k_shape, 1);
-            debug_dump_1d(&d, "sampler-frame2-step9-top-k-logits", top_values.data(), top_k);
-            debug_dump_1d(&d, "sampler-frame2-step9-masked-logits", masked.data(), n_vocab);
-            debug_dump_1d(&d, "sampler-frame2-step9-probabilities", probs.data(), n_vocab);
-            debug_dump_1d(&d, "sampler-frame2-step9-cdf", cdf.data(), n_vocab);
-            debug_dump_1d(&d, "sampler-frame2-step9-u", &uniform, 1);
-            debug_dump_i32_as_f32(&d, "sampler-frame2-step9-selected", &selected, &scalar_shape, 1);
+            char prefix[64];
+            snprintf(prefix, sizeof(prefix), "sampler-frame%d-step%d", sp->diagnostics.target_frame,
+                     sp->diagnostics.target_step);
+            char name[96];
+            snprintf(name, sizeof(name), "%s-scaled-logits", prefix);
+            debug_dump_1d(&d, name, scaled.data(), n_vocab);
+            snprintf(name, sizeof(name), "%s-top-order", prefix);
+            debug_dump_i32_as_f32(&d, name, order.data(), &vocab_shape, 1);
+            snprintf(name, sizeof(name), "%s-top-k-ids", prefix);
+            debug_dump_i32_as_f32(&d, name, top_ids.data(), &top_k_shape, 1);
+            snprintf(name, sizeof(name), "%s-top-k-logits", prefix);
+            debug_dump_1d(&d, name, top_values.data(), top_k);
+            snprintf(name, sizeof(name), "%s-masked-logits", prefix);
+            debug_dump_1d(&d, name, masked.data(), n_vocab);
+            snprintf(name, sizeof(name), "%s-probabilities", prefix);
+            debug_dump_1d(&d, name, probs.data(), n_vocab);
+            snprintf(name, sizeof(name), "%s-cdf", prefix);
+            debug_dump_1d(&d, name, cdf.data(), n_vocab);
+            snprintf(name, sizeof(name), "%s-u", prefix);
+            debug_dump_1d(&d, name, &uniform, 1);
+            snprintf(name, sizeof(name), "%s-selected", prefix);
+            debug_dump_i32_as_f32(&d, name, &selected, &scalar_shape, 1);
 
             char summary_path[1024];
-            snprintf(summary_path, sizeof(summary_path), "%s/sampler-frame2-step9.txt", d.dir);
+            snprintf(summary_path, sizeof(summary_path), "%s/%s.txt", d.dir, prefix);
             if (FILE * f = utf8_fopen(summary_path, "wb")) {
                 const int kth_id = (top_k > 0) ? order[(size_t) top_k - 1] : -1;
                 const int next_id = (top_k < n_vocab) ? order[(size_t) top_k] : -1;
                 const float kth = (kth_id >= 0) ? scaled[(size_t) kth_id] : 0.0f;
                 const float next = (next_id >= 0) ? scaled[(size_t) next_id] : 0.0f;
-                fprintf(f, "frame=2\nstep=9\nlogical_codebook=10\n");
+                fprintf(f, "frame=%d\nstep=%d\nlogical_codebook=%d\n", sp->diagnostics.target_frame,
+                        sp->diagnostics.target_step, sp->diagnostics.target_step + 1);
                 fprintf(f, "vocab=%d\ntop_k=%d\n", n_vocab, top_k);
                 fprintf(f, "u=%.10g\nselected=%d\n", (double) uniform, (int) selected);
+                if (selected >= 0 && selected < n_vocab) {
+                    fprintf(f, "selected_cdf_before=%.10g\n",
+                            selected > 0 ? (double) cdf[(size_t) selected - 1] : 0.0);
+                    fprintf(f, "selected_cdf=%.10g\n", (double) cdf[(size_t) selected]);
+                }
                 fprintf(f, "kth_id=%d\nkth_logit=%.10g\n", kth_id, (double) kth);
                 fprintf(f, "k_plus_one_id=%d\nk_plus_one_logit=%.10g\n", next_id, (double) next);
                 fprintf(f, "top_order_hash=0x%016llx\n", (unsigned long long) debug_hash64(order.data(), order.size() * sizeof(int32_t)));
@@ -599,15 +621,6 @@ static bool code_predictor_frame_step(const CodePredictorWeights * cw,
                         (unsigned long long) debug_hash64(probs.data(), probs.size() * sizeof(float)));
                 fprintf(f, "cdf_hash=0x%016llx\n",
                         (unsigned long long) debug_hash64(cdf.data(), cdf.size() * sizeof(float)));
-                for (int token : {1168, 1180}) {
-                    if (token >= 0 && token < n_vocab) {
-                        fprintf(f, "token_%d_logit=%.10g\n", token, (double) masked[(size_t) token]);
-                        fprintf(f, "token_%d_probability=%.10g\n", token, (double) probs[(size_t) token]);
-                        fprintf(f, "token_%d_cdf_before=%.10g\n", token,
-                                token > 0 ? (double) cdf[(size_t) token - 1] : 0.0);
-                        fprintf(f, "token_%d_cdf=%.10g\n", token, (double) cdf[(size_t) token]);
-                    }
-                }
                 fclose(f);
             }
         }

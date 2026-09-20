@@ -36,6 +36,7 @@ bool run_case(const char * name,
     SamplerInputs sampler;
     sampler_inputs_build(ctx, &sampler, 1, 1, 2);
     sampler.diagnostics.enabled     = diagnostics;
+    sampler.diagnostics.target_frame = 0;
     sampler.diagnostics.target_step = 0;
     sampler.forced_enabled           = forced_token >= 0;
     ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 1);

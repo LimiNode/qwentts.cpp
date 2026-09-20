@@ -140,6 +140,75 @@ static std::vector<std::vector<int32_t>> load_forced_predictor_frames(const char
     return out;
 }
 
+struct SamplerDiagnosticTarget {
+    int  frame = 2;
+    int  step  = 9;
+    bool present = false;
+    bool valid = true;
+};
+
+// A diagnostic-only target sidecar keeps the public C ABI stable while making
+// the actual sampler graph capture selectable by the harness. The file lives
+// at <dump_dir>/sampler-target.txt and contains `frame=<n>` and `step=<n>`.
+// Missing files preserve the historical frame 2 / step 9 target.
+static SamplerDiagnosticTarget load_sampler_diagnostic_target(const char * dump_dir) {
+    SamplerDiagnosticTarget result;
+    if (dump_dir == NULL || *dump_dir == '\0') {
+        return result;
+    }
+    std::string path(dump_dir);
+    if (!path.empty() && path.back() != '/' && path.back() != '\\') {
+        path.push_back('/');
+    }
+    path += "sampler-target.txt";
+    std::ifstream input(path);
+    if (!input) {
+        return result;
+    }
+    result.present = true;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty()) {
+            continue;
+        }
+        const size_t equals = line.find('=');
+        if (equals == std::string::npos) {
+            result.valid = false;
+            continue;
+        }
+        const std::string key = line.substr(0, equals);
+        int value = 0;
+        try {
+            size_t consumed = 0;
+            value = std::stoi(line.substr(equals + 1), &consumed);
+            if (consumed != line.size() - equals - 1) {
+                result.valid = false;
+                continue;
+            }
+        } catch (...) {
+            result.valid = false;
+            continue;
+        }
+        if (value < 0 || value >= 128) {
+            result.valid = false;
+            continue;
+        }
+        if (key == "frame") {
+            result.frame = value;
+        } else if (key == "step") {
+            result.step = value;
+        } else {
+            result.valid = false;
+        }
+    }
+    if (!input.eof() || !result.valid) {
+        result.frame = 2;
+        result.step  = 9;
+        result.valid = false;
+    }
+    return result;
+}
+
 static void parse_codec_specials(const GGUFModel & gf, CodecSpecials & cs) {
     cs.pad_id       = (int) gf_get_u32(gf, "qwen3-tts.codec.pad_id");
     cs.bos_id       = (int) gf_get_u32(gf, "qwen3-tts.codec.bos_id");
@@ -227,12 +296,17 @@ static void parse_generation_defaults(const GGUFModel & gf, GenerationDefaults &
 // frame graph over one persistent sampler state. Built lazily on the
 // first frame at a given width, then replayed for the process
 // lifetime.
-static bool pipeline_tts_cp_graphs_ensure(PipelineTTS * pt, int N, bool diagnostics = false) {
+static bool pipeline_tts_cp_graphs_ensure(PipelineTTS * pt,
+                                          int          N,
+                                          bool         diagnostics = false,
+                                          int          target_frame = 2,
+                                          int          target_step  = 9) {
     if ((int) pt->cp_graphs.size() < N) {
         pt->cp_graphs.resize((size_t) N);
     }
     CodePredGraphSet & s = pt->cp_graphs[(size_t) (N - 1)];
-    if (s.frame.ctx != NULL && (!diagnostics || s.sampler_diagnostics)) {
+    const bool same_target = s.sampler_target_frame == target_frame && s.sampler_target_step == target_step;
+    if (s.frame.ctx != NULL && (!diagnostics || (s.sampler_diagnostics && same_target))) {
         return true;
     }
 
@@ -268,6 +342,8 @@ static bool pipeline_tts_cp_graphs_ensure(PipelineTTS * pt, int N, bool diagnost
     }
 
     s.sampler.diagnostics.enabled = diagnostics;
+    s.sampler.diagnostics.target_frame = target_frame;
+    s.sampler.diagnostics.target_step  = target_step;
     s.sampler.forced_enabled = diagnostics;
 
     const bool ok = code_predictor_frame_graph_build(&pt->code_predictor, &pt->code_predictor_kv, pt->backend,
@@ -275,6 +351,8 @@ static bool pipeline_tts_cp_graphs_ensure(PipelineTTS * pt, int N, bool diagnost
                                                      pt->use_flash_attn, pt->clamp_fp16, diagnostics, &s.frame);
     if (ok) {
         s.sampler_diagnostics = diagnostics;
+        s.sampler_target_frame = diagnostics ? target_frame : -1;
+        s.sampler_target_step  = diagnostics ? target_step : -1;
     }
     return ok;
 }
@@ -664,6 +742,8 @@ struct TtsSlot {
     std::vector<int32_t> forced_talker_history; // diagnostic replay override
     std::vector<std::vector<int32_t>> forced_talker_frames; // complete frame replay
     std::vector<std::vector<int32_t>> forced_predictor_frames; // acoustic prefix replay
+    int                               sampler_target_frame;
+    int                               sampler_target_step;
     std::vector<int32_t> prev_ids;        // previous frame codes [num_code_groups]
     const float *        prev_overlay;    // trailing text row or tts_pad row
     std::vector<float>   logits;          // pending c0 logits [vocab]
@@ -983,6 +1063,18 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
     s.perf             = {};
     s.t_total.reset();
     s.forced_talker_history = load_forced_talker_history(params->dump_dir);
+    const SamplerDiagnosticTarget sampler_target = load_sampler_diagnostic_target(params->dump_dir);
+    s.sampler_target_frame = sampler_target.frame;
+    s.sampler_target_step  = sampler_target.step;
+    if (sampler_target.present) {
+        if (!sampler_target.valid) {
+            qt_log(QT_LOG_WARN, "[Pipeline] ignoring invalid sampler-target.txt; using frame=%d step=%d",
+                   sampler_target.frame, sampler_target.step);
+        } else {
+            qt_log(QT_LOG_INFO, "[Pipeline] sampler diagnostic target: frame=%d step=%d",
+                   sampler_target.frame, sampler_target.step);
+        }
+    }
     if (!s.forced_talker_history.empty()) {
         bool valid = true;
         for (int32_t token : s.forced_talker_history) {
@@ -1541,12 +1633,18 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
         CodePredictorOutput cp;
 
         bool diagnostics = false;
+        int  diagnostic_target_frame = 2;
+        int  diagnostic_target_step  = 9;
         if (N == 1) {
             for (const TtsSlot & slot : e->slots) {
                 diagnostics = diagnostics || (slot.has_frame && slot.job->params->dump_dir != NULL);
+                if (slot.has_frame && slot.job->params->dump_dir != NULL) {
+                    diagnostic_target_frame = slot.sampler_target_frame;
+                    diagnostic_target_step  = slot.sampler_target_step;
+                }
             }
         }
-        if (!pipeline_tts_cp_graphs_ensure(pt, N, diagnostics)) {
+        if (!pipeline_tts_cp_graphs_ensure(pt, N, diagnostics, diagnostic_target_frame, diagnostic_target_step)) {
             qt_set_error("tts_engine_step: code predictor graph build failed (N=%d)", N);
             for (TtsSlot & s : e->slots) {
                 s.finished   = true;

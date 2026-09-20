@@ -22,6 +22,7 @@
 struct SamplerInputs {
     struct Diagnostics {
         bool                 enabled      = false;
+        int                  target_frame = 2;
         int                  target_step  = 9;
         struct ggml_tensor * scaled_logits = nullptr;
         struct ggml_tensor * top_order    = nullptr;

@@ -103,6 +103,8 @@ struct CodePredGraphSet {
     struct ggml_context * sampler_ctx = nullptr;
     ggml_backend_buffer_t sampler_buf = nullptr;
     bool                  sampler_diagnostics = false;
+    int                   sampler_target_frame = -1;
+    int                   sampler_target_step  = -1;
 };
 
 static inline void code_predictor_graph_set_free(CodePredGraphSet * s) {
@@ -117,6 +119,8 @@ static inline void code_predictor_graph_set_free(CodePredGraphSet * s) {
     }
     s->sampler = SamplerInputs();
     s->sampler_diagnostics = false;
+    s->sampler_target_frame = -1;
+    s->sampler_target_step  = -1;
 }
 
 struct PipelineTTS {

@@ -278,7 +278,9 @@ static void code_predictor_pass_append(struct ggml_context *           gctx,
                                        int                             N,
                                        bool                            use_flash_attn,
                                        bool                            clamp_fp16,
+                                       bool                            diagnostic_outputs,
                                        struct ggml_tensor **           logits_out,
+                                       struct ggml_tensor **           hidden_out,
                                        std::vector<CodePredPassBake> & bake) {
     const int T        = hidden_bridge ? 2 : 1;
     const int n_past   = hidden_bridge ? 0 : g_head + 1;
@@ -352,6 +354,12 @@ static void code_predictor_pass_append(struct ggml_context *           gctx,
                                                (size_t) (T - 1) * h_final->nb[1]));
     }
 
+    if (diagnostic_outputs) {
+        // Retain the post-norm state for a bounded host readback. The normal
+        // graph does not keep this intermediate alive.
+        ggml_set_output(h_final);
+    }
+
     struct ggml_tensor * logits = ggml_mul_mat(gctx, cw->lm_head[(size_t) g_head], h_final);
     ggml_set_name(logits, "logits");
     ggml_set_output(logits);
@@ -361,6 +369,9 @@ static void code_predictor_pass_append(struct ggml_context *           gctx,
 
     bake.push_back({ pos_in, rows_in, mask_in, T, n_past });
     *logits_out = logits;
+    if (hidden_out) {
+        *hidden_out = diagnostic_outputs ? h_final : nullptr;
+    }
 }
 
 // Build the unrolled frame graph over sets [0, N): the T=2 prefill and
@@ -379,6 +390,7 @@ static bool code_predictor_frame_graph_build(const CodePredictorWeights * cw,
                                              int                          N,
                                              bool                         use_flash_attn,
                                              bool                         clamp_fp16,
+                                             bool                         diagnostic_outputs,
                                              CodePredGraph *              cp) {
     const int n_layers   = cw->num_hidden_layers;
     const int n_acoustic = cw->num_acoustic_codebooks;
@@ -398,15 +410,20 @@ static bool code_predictor_frame_graph_build(const CodePredictorWeights * cw,
     bake.reserve((size_t) n_acoustic);
     std::vector<struct ggml_tensor *> logits_steps;
     logits_steps.reserve((size_t) n_acoustic);
+    std::vector<struct ggml_tensor *> hidden_steps;
+    hidden_steps.reserve((size_t) n_acoustic);
     struct ggml_tensor * logits = NULL;
+    struct ggml_tensor * hidden = NULL;
 
     code_predictor_pass_append(cp->ctx, gf, cw, kv, talker_embd_table, hidden_bridge, sp, 0, N, use_flash_attn,
-                               clamp_fp16, &logits, bake);
+                               clamp_fp16, diagnostic_outputs, &logits, &hidden, bake);
     logits_steps.push_back(logits);
+    hidden_steps.push_back(hidden);
     for (int g = 1; g < n_acoustic; g++) {
         code_predictor_pass_append(cp->ctx, gf, cw, kv, cw->codec_embedding[(size_t) (g - 1)], NULL, sp, g, N,
-                                   use_flash_attn, clamp_fp16, &logits, bake);
+                                   use_flash_attn, clamp_fp16, diagnostic_outputs, &logits, &hidden, bake);
         logits_steps.push_back(logits);
+        hidden_steps.push_back(hidden);
     }
 
     cp->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -420,6 +437,7 @@ static bool code_predictor_frame_graph_build(const CodePredictorWeights * cw,
     cp->gf     = gf;
     cp->logits = logits;
     cp->logits_steps = std::move(logits_steps);
+    cp->hidden_steps = std::move(hidden_steps);
     cp->N      = N;
     return true;
 }
@@ -493,6 +511,26 @@ static bool code_predictor_frame_step(const CodePredictorWeights * cw,
                 snprintf(name, sizeof(name), "predictor-logits-frame%d-step%zu", frame_index, g);
             }
             debug_dump_1d(&d, name, values.data(), vocab);
+        }
+
+        // The post-norm hidden state is the exact input to each predictor
+        // lm_head. Reading it back alongside logits distinguishes drift in
+        // predictor state/attention from a head or vocabulary issue.
+        for (size_t g = 0; g < frame_graph->hidden_steps.size(); g++) {
+            struct ggml_tensor * hidden = frame_graph->hidden_steps[g];
+            if (!hidden) {
+                continue;
+            }
+            const int hidden_size = (int) hidden->ne[0];
+            std::vector<float> values((size_t) hidden_size * (size_t) N);
+            ggml_backend_tensor_get(hidden, values.data(), 0, values.size() * sizeof(float));
+            char name[64];
+            if (frame_index == 0) {
+                snprintf(name, sizeof(name), "predictor-hidden-step%zu", g);
+            } else {
+                snprintf(name, sizeof(name), "predictor-hidden-frame%d-step%zu", frame_index, g);
+            }
+            debug_dump_1d(&d, name, values.data(), hidden_size);
         }
 
         // The sampler graph normally keeps all of these tensors device-local.

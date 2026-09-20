@@ -257,6 +257,26 @@ def install_clone_hooks(model, dump_dir, dump_predictor_logits=False):
         # each Python codebook head with the same frame-indexed naming.
         predictor = model.talker.code_predictor
         predictor_frames = [0] * len(predictor.lm_head)
+        predictor_hidden_calls = [0]
+        predictor_norm = getattr(predictor, "norm", None)
+        if predictor_norm is not None:
+            def hook_predictor_hidden(module, args, output):
+                call = predictor_hidden_calls[0]
+                predictor_hidden_calls[0] += 1
+                frame, step = divmod(call, len(predictor.lm_head))
+                if frame >= 128:
+                    return
+                hidden = output[0] if isinstance(output, tuple) else output
+                if getattr(hidden, "dim", lambda: 0)() == 3:
+                    hidden = hidden[:, -1, :]
+                if getattr(hidden, "dim", lambda: 0)() == 2:
+                    name = (
+                        f"predictor-hidden-step{step}.bin"
+                        if frame == 0
+                        else f"predictor-hidden-frame{frame}-step{step}.bin"
+                    )
+                    cc.save_dump(os.path.join(dump_dir, name), hidden[0])
+            predictor_norm.register_forward_hook(hook_predictor_hidden)
         for step, head in enumerate(predictor.lm_head):
             def hook_predictor(module, args, output, step=step):
                 frame = predictor_frames[step]
@@ -670,7 +690,24 @@ def main():
                     f"max: {mx:.4e} mean: {mean:.4e}"
                 )
                 compared += 1
-            if compared == 0:
+            hidden_compared = 0
+            for step in range(32):
+                name = (
+                    f"predictor-hidden-step{step}.bin"
+                    if frame == 0
+                    else f"predictor-hidden-frame{frame}-step{step}.bin"
+                )
+                try:
+                    aa, ab = cc.pair(name, DUMP_CPP, DUMP_PT)
+                except FileNotFoundError:
+                    break
+                c, mx, mean = cc.metric(aa, ab)
+                print(
+                    f"[Cossim] PredictorHiddenFrame{frame}Step{step} cos: {c:.6f} "
+                    f"max: {mx:.4e} mean: {mean:.4e}"
+                )
+                hidden_compared += 1
+            if compared == 0 and hidden_compared == 0:
                 break
     cc.compare_exact_i32("codes-full.bin", DUMP_CPP, DUMP_PT, "CodesFull")
 

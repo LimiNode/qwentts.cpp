@@ -229,7 +229,7 @@ static bool pipeline_tts_cp_graphs_ensure(PipelineTTS * pt, int N, bool diagnost
 
     const bool ok = code_predictor_frame_graph_build(&pt->code_predictor, &pt->code_predictor_kv, pt->backend,
                                                      pt->talker.codec_embedding, pt->hidden_bridge, &s.sampler, N,
-                                                     pt->use_flash_attn, pt->clamp_fp16, &s.frame);
+                                                     pt->use_flash_attn, pt->clamp_fp16, diagnostics, &s.frame);
     if (ok) {
         s.sampler_diagnostics = diagnostics;
     }

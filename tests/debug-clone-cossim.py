@@ -359,9 +359,13 @@ def main():
     ap.add_argument("--trace",          action="store_true",
                     help="print per sample u and idx for the first 32 samples")
     ap.add_argument("--dump-sampler-intermediates", default=None,
-                    help="capture actual Python multinomial probabilities and both CDF views at --sampler-subseq")
-    ap.add_argument("--sampler-subseq", type=int, default=42,
-                    help="Philox subsequence to capture with --dump-sampler-intermediates")
+                    help="capture actual Python multinomial probabilities and both CDF views at the target")
+    ap.add_argument("--sampler-frame", type=int, default=2,
+                    help="predictor frame for bounded sampler diagnostics (default: 2)")
+    ap.add_argument("--sampler-step", type=int, default=9,
+                    help="predictor step for bounded sampler diagnostics (default: 9)")
+    ap.add_argument("--sampler-subseq", type=int, default=None,
+                    help="override the Philox subsequence used by Python sampler diagnostics")
     ap.add_argument("--forced-talker-history", default=None,
                     help="comma-separated Talker c0 tokens to force in a diagnostic replay")
     ap.add_argument("--forced-talker-frames", default=None,
@@ -381,6 +385,16 @@ def main():
     ap.add_argument("--disable-eos", action="store_true",
                     help="use a private impossible EOS id so diagnostics retain every requested frame")
     args = ap.parse_args()
+
+    if args.sampler_frame < 0 or args.sampler_frame >= 128:
+        ap.error("--sampler-frame must be in [0, 127]")
+    if args.sampler_step < 0 or args.sampler_step >= 32:
+        ap.error("--sampler-step must be in [0, 31]")
+    sampler_subseq = args.sampler_subseq
+    if sampler_subseq is None:
+        sampler_subseq = args.sampler_frame * 16 + 1 + args.sampler_step
+    if sampler_subseq < 0:
+        ap.error("--sampler-subseq must be non-negative")
 
     cc.ensure_dir(DUMP_PT)
     cc.ensure_dir(DUMP_CPP)
@@ -438,7 +452,7 @@ def main():
         if args.dump_sampler_intermediates:
             cc.enable_sampler_diagnostic(
                 args.dump_sampler_intermediates,
-                subseq=args.sampler_subseq,
+                subseq=sampler_subseq,
             )
         generation_kwargs = dict(cc.GEN_KWARGS_STOCHASTIC)
         generation_kwargs.update(
@@ -658,6 +672,15 @@ def main():
     else:
         try:
             os.remove(os.path.join(DUMP_CPP, "forced-predictor-frames.txt"))
+        except FileNotFoundError:
+            pass
+    if args.dump_sampler_intermediates:
+        os.makedirs(DUMP_CPP, exist_ok=True)
+        with open(os.path.join(DUMP_CPP, "sampler-target.txt"), "w", encoding="ascii") as f:
+            f.write(f"frame={args.sampler_frame}\nstep={args.sampler_step}\n")
+    else:
+        try:
+            os.remove(os.path.join(DUMP_CPP, "sampler-target.txt"))
         except FileNotFoundError:
             pass
     if args.export_reference_latents:

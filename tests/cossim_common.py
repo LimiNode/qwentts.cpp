@@ -286,7 +286,11 @@ def patched_multinomial(input, num_samples, replacement=False, generator=None, o
             save_dump(os.path.join(dump_dir, "sampler-u.bin"), np.asarray([u], dtype=np.float32))
             save_dump_i32(os.path.join(dump_dir, "sampler-selected.bin"), np.asarray([idx], dtype=np.int64))
             with open(os.path.join(dump_dir, "sampler-diagnostic.txt"), "w", encoding="utf-8") as f:
+                frame = seq // 16
+                step = (seq % 16) - 1
                 f.write(f"subseq={seq}\n")
+                f.write(f"frame={frame}\n")
+                f.write(f"predictor_step={step}\n")
                 f.write(f"vocab={vocab}\n")
                 f.write(f"candidate_count={candidate_ids.size}\n")
                 f.write(f"u={float(u):.10f}\n")
@@ -353,7 +357,8 @@ def cos(a, b):
     n = min(len(a), len(b))
     a, b = a[:n], b[:n]
     d = float(np.linalg.norm(a) * np.linalg.norm(b))
-    return float(np.dot(a, b) / d) if d > 1e-10 else 0.0
+    value = float(np.dot(a, b) / d) if d > 1e-10 else 0.0
+    return float(np.clip(value, -1.0, 1.0))
 
 def stft_cos(a, b, win=2048, hop=512):
     a = a.astype(np.float64).ravel()
@@ -497,7 +502,8 @@ def metric(a, b):
     d     = np.abs(af - bf)
     nrm_a = float(np.linalg.norm(af))
     nrm_b = float(np.linalg.norm(bf))
-    c     = float(np.dot(af, bf) / (nrm_a * nrm_b)) if nrm_a > 1e-10 and nrm_b > 1e-10 else 0.0
+    c_raw = float(np.dot(af, bf) / (nrm_a * nrm_b)) if nrm_a > 1e-10 and nrm_b > 1e-10 else 0.0
+    c     = float(np.clip(c_raw, -1.0, 1.0))
     return c, float(d.max()), float(d.mean())
 
 def compare_stages(stages, dump_cpp, dump_pt):

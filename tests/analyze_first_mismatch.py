@@ -71,7 +71,11 @@ def _metric(native: Path, python: Path) -> dict[str, float] | None:
         return None
     shape_a, a = load_f32_dump(native)
     shape_b, b = load_f32_dump(python)
-    n = min(len(a), len(b))
+    if shape_a != shape_b:
+        raise ValueError(
+            f"paired metric dumps must have identical shapes, got {shape_a} and {shape_b}"
+        )
+    n = len(a)
     if not n:
         return {"cosine": 0.0, "max_abs": 0.0, "mean_abs": 0.0}
     aa = a[:n]
@@ -94,8 +98,12 @@ def analyze(native_dir: Path, python_dir: Path) -> dict[str, Any]:
     """Build a machine-readable first-mismatch report for paired runs."""
     native_shape, native = _codes(native_dir / "codes-full.bin")
     python_shape, python = _codes(python_dir / "codes-full.bin")
-    common_frames = min(len(native), len(python))
-    common_groups = min(native_shape[1], python_shape[1])
+    if native_shape != python_shape:
+        raise ValueError(
+            f"paired code dumps must have identical shapes, got {native_shape} and {python_shape}"
+        )
+    common_frames = len(native)
+    common_groups = native_shape[1]
 
     mismatch: dict[str, Any] | None = None
     for frame in range(common_frames):

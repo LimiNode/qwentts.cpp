@@ -460,6 +460,7 @@ static bool code_predictor_frame_step(const CodePredictorWeights * cw,
                                       const float *                temperature,
                                       const int64_t *              seed,
                                       const int64_t *              subseq_base,
+                                      const int32_t *              forced_codes,
                                       const char *                 dump_dir,
                                       int                          frame_index,
                                       CodePredictorOutput *        out) {
@@ -468,6 +469,7 @@ static bool code_predictor_frame_step(const CodePredictorWeights * cw,
 
     ggml_backend_tensor_set(sp->codes, c0, 0, (size_t) N * sizeof(int32_t));
     sampler_inputs_upload(sp, temperature, seed, subseq_base, N);
+    sampler_forced_codes_upload(sp, forced_codes, N);
 
     if (ggml_backend_graph_compute(backend, frame_graph->gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "[CodePredictor] FATAL: frame graph compute failed\n");

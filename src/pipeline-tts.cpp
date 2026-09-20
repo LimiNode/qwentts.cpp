@@ -98,6 +98,48 @@ static std::vector<std::vector<int32_t>> load_forced_talker_frames(const char * 
     return out;
 }
 
+// A diagnostic-only predictor-prefix replay sidecar. Each non-empty line in
+// <dump_dir>/forced-predictor-frames.txt contains the 15 acoustic codebook
+// ids (codebooks 1..15) for one frame. A value is consumed inside the graph's
+// sampling tail, so later predictor steps read the forced prefix immediately.
+static std::vector<std::vector<int32_t>> load_forced_predictor_frames(const char * dump_dir) {
+    if (dump_dir == NULL || *dump_dir == '\0') {
+        return {};
+    }
+    std::string path(dump_dir);
+    if (!path.empty() && path.back() != '/' && path.back() != '\\') {
+        path.push_back('/');
+    }
+    path += "forced-predictor-frames.txt";
+    std::ifstream input(path);
+    if (!input) {
+        return {};
+    }
+    std::vector<std::vector<int32_t>> out;
+    std::string line;
+    while (std::getline(input, line)) {
+        std::istringstream row(line);
+        std::vector<int32_t> frame;
+        int64_t value = 0;
+        while (row >> value) {
+            if (value < 0 || value > std::numeric_limits<int32_t>::max()) {
+                return {};
+            }
+            frame.push_back((int32_t) value);
+        }
+        if (!row.eof()) {
+            return {};
+        }
+        if (!frame.empty()) {
+            out.push_back(std::move(frame));
+        }
+    }
+    if (!input.eof()) {
+        return {};
+    }
+    return out;
+}
+
 static void parse_codec_specials(const GGUFModel & gf, CodecSpecials & cs) {
     cs.pad_id       = (int) gf_get_u32(gf, "qwen3-tts.codec.pad_id");
     cs.bos_id       = (int) gf_get_u32(gf, "qwen3-tts.codec.bos_id");
@@ -620,6 +662,7 @@ struct TtsSlot {
     std::vector<int32_t> talker_history;  // emitted c0, feeds repetition penalty
     std::vector<int32_t> forced_talker_history; // diagnostic replay override
     std::vector<std::vector<int32_t>> forced_talker_frames; // complete frame replay
+    std::vector<std::vector<int32_t>> forced_predictor_frames; // acoustic prefix replay
     std::vector<int32_t> prev_ids;        // previous frame codes [num_code_groups]
     const float *        prev_overlay;    // trailing text row or tts_pad row
     std::vector<float>   logits;          // pending c0 logits [vocab]
@@ -971,6 +1014,26 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
         } else {
             qt_log(QT_LOG_INFO, "[Pipeline] forced Talker frames: %d complete frames",
                    (int) s.forced_talker_frames.size());
+        }
+    }
+    s.forced_predictor_frames = load_forced_predictor_frames(params->dump_dir);
+    if (!s.forced_predictor_frames.empty()) {
+        bool valid = true;
+        for (const std::vector<int32_t> & frame : s.forced_predictor_frames) {
+            if ((int) frame.size() != pt->num_code_groups - 1) {
+                valid = false;
+                break;
+            }
+            for (int32_t token : frame) {
+                valid = valid && token >= 0 && token < pt->code_predictor.vocab_size;
+            }
+        }
+        if (!valid) {
+            qt_log(QT_LOG_WARN, "[Pipeline] ignoring invalid forced predictor frames sidecar");
+            s.forced_predictor_frames.clear();
+        } else {
+            qt_log(QT_LOG_INFO, "[Pipeline] forced predictor frames: %d acoustic prefixes",
+                   (int) s.forced_predictor_frames.size());
         }
     }
 
@@ -1495,6 +1558,7 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
             std::vector<float>   temps((size_t) N, 0.0f);
             std::vector<int64_t> seeds((size_t) N, 0);
             std::vector<int64_t> subseqs((size_t) N, 0);
+            std::vector<int32_t> forced_predictor((size_t) N * (size_t) (num_codebooks - 1), -1);
             const char *         cp_dump = NULL;
             int                  cp_frame = 0;
             for (int i = 0; i < N; i++) {
@@ -1507,6 +1571,12 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                 temps[(size_t) i]              = s.subtk_T;
                 seeds[(size_t) i]              = s.job->resolved_seed;
                 subseqs[(size_t) i]            = s.subseq_counter - 1;
+                if (s.step >= 0 && (size_t) s.step < s.forced_predictor_frames.size()) {
+                    const std::vector<int32_t> & forced = s.forced_predictor_frames[(size_t) s.step];
+                    for (int g = 0; g < num_codebooks - 1; g++) {
+                        forced_predictor[(size_t) g * (size_t) N + (size_t) i] = forced[(size_t) g];
+                    }
+                }
                 if (N == 1 && p->dump_dir && s.step < 128) {
                     cp_dump = p->dump_dir;
                     cp_frame = s.step;
@@ -1532,7 +1602,7 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
             Timer t_pred;
             bool  pred_ok =
                 code_predictor_frame_step(&pt->code_predictor, pt->backend, &gs.frame, &gs.sampler, c0s.data(), N,
-                                          temps.data(), seeds.data(), subseqs.data(), cp_dump,
+                                          temps.data(), seeds.data(), subseqs.data(), forced_predictor.data(), cp_dump,
                                           cp_frame, &cp);
             if (!pred_ok) {
                 for (TtsSlot & s : e->slots) {

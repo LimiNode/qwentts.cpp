@@ -366,6 +366,8 @@ def main():
                     help="comma-separated Talker c0 tokens to force in a diagnostic replay")
     ap.add_argument("--forced-talker-frames", default=None,
                     help="text file with one complete 16-codebook Talker frame per line")
+    ap.add_argument("--forced-predictor-frames", default=None,
+                    help="text file with one 15-codebook predictor prefix per line")
     ap.add_argument("--dump-predictor-logits", action="store_true",
                     help="dump bounded frame-indexed Python code-predictor logits")
     ap.add_argument("--export-reference-latents", default=None,
@@ -401,6 +403,7 @@ def main():
     np.random.seed(args.seed)
     forced_history = []
     forced_frames = []
+    forced_predictor_frames = []
     if args.forced_talker_history and args.forced_talker_frames:
         ap.error("--forced-talker-history and --forced-talker-frames are mutually exclusive")
     if args.forced_talker_frames:
@@ -412,6 +415,15 @@ def main():
                 if len(frame) != 16:
                     ap.error("every --forced-talker-frames line must contain 16 integers")
                 forced_frames.append(frame)
+    if args.forced_predictor_frames:
+        with open(args.forced_predictor_frames, "r", encoding="ascii") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                frame = [int(token) for token in line.split()]
+                if len(frame) != 15:
+                    ap.error("every --forced-predictor-frames line must contain 15 integers")
+                forced_predictor_frames.append(frame)
     if args.stochastic:
         cc.enable_philox_sampling(args.seed, trace=args.trace)
         if args.forced_talker_history:
@@ -419,6 +431,8 @@ def main():
             cc.set_forced_talker_history(forced_history)
         if forced_frames:
             cc.set_forced_talker_frames(forced_frames)
+        if forced_predictor_frames:
+            cc.set_forced_predictor_frames(forced_predictor_frames)
         if args.dump_sampler_intermediates:
             cc.enable_sampler_diagnostic(
                 args.dump_sampler_intermediates,
@@ -613,6 +627,16 @@ def main():
     else:
         try:
             os.remove(os.path.join(DUMP_CPP, "forced-talker-frames.txt"))
+        except FileNotFoundError:
+            pass
+    if forced_predictor_frames:
+        os.makedirs(DUMP_CPP, exist_ok=True)
+        with open(os.path.join(DUMP_CPP, "forced-predictor-frames.txt"), "w", encoding="ascii") as f:
+            for frame in forced_predictor_frames:
+                f.write(" ".join(str(token) for token in frame) + "\n")
+    else:
+        try:
+            os.remove(os.path.join(DUMP_CPP, "forced-predictor-frames.txt"))
         except FileNotFoundError:
             pass
     if args.export_reference_latents:

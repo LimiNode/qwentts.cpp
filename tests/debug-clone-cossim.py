@@ -461,7 +461,11 @@ def main():
         # private impossible id for both the inner GenerationMixin call and
         # the outer post-processing length calculation; this is diagnostic
         # harness state only and never changes production generation.
-        generation_kwargs["eos_token_id"] = -1
+        # Use a positive id outside the model vocabulary.  An empty EOS list
+        # is rejected by recent Transformers when it derives the pad token,
+        # while a negative scalar is treated as a real criterion by some
+        # releases.
+        generation_kwargs["eos_token_id"] = 65535
 
     cc.register_qwen3_tts()
 
@@ -478,7 +482,7 @@ def main():
         # returned code tensor, after the inner Talker generation has finished.
         # Keep that post-processing in lock-step with the private EOS sentinel
         # passed through ``generation_kwargs`` above.
-        model.config.talker_config.codec_eos_token_id = -1
+        model.config.talker_config.codec_eos_token_id = 65535
     processor = cc.AutoProcessor.from_pretrained(CKPT, fix_mistral_regex=True)
 
     # Install codec encoder + ECAPA front end hooks before any encode call,

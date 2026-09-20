@@ -378,6 +378,8 @@ def main():
     ap.add_argument("--top-k",           type=int, default=50)
     ap.add_argument("--top-p",           type=float, default=1.0)
     ap.add_argument("--repetition-penalty", type=float, default=1.05)
+    ap.add_argument("--disable-eos", action="store_true",
+                    help="use a private impossible EOS id so diagnostics retain every requested frame")
     args = ap.parse_args()
 
     cc.ensure_dir(DUMP_PT)
@@ -452,6 +454,15 @@ def main():
         cc.set_trace(args.trace)
         generation_kwargs = cc.GEN_KWARGS_GREEDY
 
+    if args.disable_eos:
+        # The public generator trims the returned tensor at the configured
+        # codec EOS token. A diagnostic replay needs the complete requested
+        # prefix, including frames after a backend-specific early EOS. Use a
+        # private impossible id for both the inner GenerationMixin call and
+        # the outer post-processing length calculation; this is diagnostic
+        # harness state only and never changes production generation.
+        generation_kwargs["eos_token_id"] = -1
+
     cc.register_qwen3_tts()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -462,6 +473,12 @@ def main():
         dtype=torch.float32,
         attn_implementation="eager",
     ).eval()
+    if args.disable_eos:
+        # ``Qwen3TTS.generate`` uses this value again while trimming the
+        # returned code tensor, after the inner Talker generation has finished.
+        # Keep that post-processing in lock-step with the private EOS sentinel
+        # passed through ``generation_kwargs`` above.
+        model.config.talker_config.codec_eos_token_id = -1
     processor = cc.AutoProcessor.from_pretrained(CKPT, fix_mistral_regex=True)
 
     # Install codec encoder + ECAPA front end hooks before any encode call,

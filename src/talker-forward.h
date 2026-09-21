@@ -61,6 +61,10 @@ struct TalkerForwardOutput {
     // Codec head logits for the last position [vocab] f32.
     std::vector<float> logits_last;
 
+    // Selected decoder-layer outputs for bounded diagnostic readback. Each
+    // entry is [hidden, N] with one contiguous hidden column per slot.
+    std::vector<std::vector<float>> layer_hidden;
+
     int hidden;
     int vocab;
 };
@@ -630,6 +634,7 @@ static bool talker_decode_graph_build(const TalkerWeights *        tw,
                                       int                          N,
                                       bool                         use_flash_attn,
                                       bool                         clamp_fp16,
+                                      bool                         record_layer_taps,
                                       TalkerDecodeGraph *          tg) {
     const int hidden   = tw->hidden_size;
     const int n_layers = tw->num_hidden_layers;
@@ -676,10 +681,23 @@ static bool talker_decode_graph_build(const TalkerWeights *        tw,
     struct ggml_cgraph * gf = ggml_new_graph_custom(gctx, max_nodes, false);
 
     struct ggml_tensor * h = x_in;
+    tg->layer_taps.clear();
+    if (record_layer_taps) {
+        tg->layer_taps.assign(TALKER_N_BISECT_LAYERS, nullptr);
+    }
     for (int l = 0; l < n_layers; l++) {
         h = talker_layer_forward_batch(gctx, tw, tw->layers[(size_t) l], h, pos_in, mask_in, rows_in,
                                        kv->k4[(size_t) l], kv->v4[(size_t) l], N, n_kv_pad, use_flash_attn, clamp_fp16,
                                        gf);
+        if (record_layer_taps && talker_is_bisect_layer(l)) {
+            for (int i = 0; i < TALKER_N_BISECT_LAYERS; i++) {
+                if (TALKER_BISECT_LAYERS[i] == l) {
+                    tg->layer_taps[(size_t) i] = h;
+                    ggml_set_output(h);
+                    break;
+                }
+            }
+        }
     }
 
     struct ggml_tensor * h_final = ggml_rms_norm(gctx, h, tw->rms_norm_eps);
@@ -694,6 +712,13 @@ static bool talker_decode_graph_build(const TalkerWeights *        tw,
     ggml_set_output(logits);
     ggml_build_forward_expand(gf, logits);
     ggml_build_forward_expand(gf, bridge_cpy);
+    if (record_layer_taps) {
+        for (struct ggml_tensor * tap : tg->layer_taps) {
+            if (tap) {
+                ggml_build_forward_expand(gf, tap);
+            }
+        }
+    }
 
     tg->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     if (!tg->galloc || !ggml_gallocr_alloc_graph(tg->galloc, gf)) {
@@ -726,7 +751,7 @@ static bool talker_decode_graph_build(const TalkerWeights *        tw,
 // window covers max over sets of (cur_len + 1); caller ensures every
 // cur_len + 1 <= max_seq_len holds by cache sizing. Logits fill
 // out->logits_last as [vocab, N] column blocks; read_hidden_host pulls
-// the bridge back as [hidden, N] for dump paths.
+// the bridge and the L0/7/14/21/27 layer taps back for dump paths.
 static bool talker_forward_decode(const TalkerWeights *            tw,
                                   KVCache *                        kv,
                                   ggml_backend_t                   backend,
@@ -755,13 +780,14 @@ static bool talker_forward_decode(const TalkerWeights *            tw,
     }
     const int kv_pad_raw = (int) GGML_PAD(max_len, 256);
     const int n_kv_pad   = kv_pad_raw < kv->max_seq_len ? kv_pad_raw : kv->max_seq_len;
+    const bool record_layer_taps = read_hidden_host;
 
     TalkerDecodeGraph * tg = &graphs[(size_t) ((n_kv_pad + 255) / 256 - 1)];
-    if (tg->ctx && tg->N != N) {
+    if (tg->ctx && (tg->N != N || (!tg->layer_taps.empty()) != record_layer_taps)) {
         talker_decode_graph_free(tg);
     }
     if (!tg->ctx && !talker_decode_graph_build(tw, kv, backend, hidden_bridge, acoustic_embd, n_acoustic, n_kv_pad, N,
-                                               use_flash_attn, clamp_fp16, tg)) {
+                                               use_flash_attn, clamp_fp16, record_layer_taps, tg)) {
         return false;
     }
 
@@ -804,6 +830,15 @@ static bool talker_forward_decode(const TalkerWeights *            tw,
         out->hidden_last.assign((size_t) tw->hidden_size * (size_t) N, 0.0f);
         ggml_backend_tensor_get(hidden_bridge, out->hidden_last.data(), 0,
                                 (size_t) tw->hidden_size * (size_t) N * sizeof(float));
+        out->layer_hidden.resize(TALKER_N_BISECT_LAYERS);
+        for (int i = 0; i < TALKER_N_BISECT_LAYERS; i++) {
+            if (!tg->layer_taps[(size_t) i]) {
+                continue;
+            }
+            out->layer_hidden[(size_t) i].assign((size_t) tw->hidden_size * (size_t) N, 0.0f);
+            ggml_backend_tensor_get(tg->layer_taps[(size_t) i], out->layer_hidden[(size_t) i].data(), 0,
+                                     out->layer_hidden[(size_t) i].size() * sizeof(float));
+        }
     }
 
     for (int i = 0; i < N; i++) {

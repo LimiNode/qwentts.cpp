@@ -396,14 +396,22 @@ def install_hooks(model, dump_dir, bisect_layers=(0, 7, 14, 21, 27)):
     talker_lm    = model.talker
 
     seen_layers = {idx: False for idx in bisect_layers}
+    decode_layer_calls = {idx: 0 for idx in bisect_layers}
     def make_layer_hook(layer_idx):
         def hook(module, inputs, output):
-            if seen_layers[layer_idx]:
-                return
             h = output[0] if isinstance(output, tuple) else output
-            if h.dim() == 3:
+            if h.dim() != 3:
+                return
+            if h.shape[1] > 1:
+                if seen_layers[layer_idx]:
+                    return
                 save_dump(os.path.join(dump_dir, f"talker-hidden-prefill-l{layer_idx}.bin"), h[0])
                 seen_layers[layer_idx] = True
+                return
+            frame = decode_layer_calls[layer_idx] + 1
+            decode_layer_calls[layer_idx] = frame
+            if frame <= 128:
+                save_dump(os.path.join(dump_dir, f"talker-hidden-frame{frame}-l{layer_idx}.bin"), h[0, -1])
         return hook
     for layer_idx in bisect_layers:
         talker_model.layers[layer_idx].register_forward_hook(make_layer_hook(layer_idx))

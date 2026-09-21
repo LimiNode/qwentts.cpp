@@ -22,6 +22,7 @@ struct TalkerDecodeGraph {
     struct ggml_tensor *     rows_in = nullptr;  // [1, 1, N] i64
     struct ggml_tensor *     mask_in = nullptr;  // [n_kv_pad, 1, 1, N] f16
     struct ggml_tensor *     logits  = nullptr;  // [vocab, N] f32
+    std::vector<struct ggml_tensor *> layer_taps; // optional [hidden, N] diagnostic outputs
     std::vector<ggml_fp16_t> mask;               // [n_kv_pad * N] f16
     std::vector<int32_t>     pos_data;           // [N] host staging
     std::vector<int64_t>     rows_data;          // [N] host staging
@@ -45,6 +46,7 @@ static void talker_decode_graph_free(TalkerDecodeGraph * tg) {
     tg->rows_in = nullptr;
     tg->mask_in = nullptr;
     tg->logits  = nullptr;
+    tg->layer_taps.clear();
     tg->mask.clear();
     tg->pos_data.clear();
     tg->rows_data.clear();

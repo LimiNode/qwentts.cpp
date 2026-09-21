@@ -66,6 +66,13 @@ def _summary(path: Path) -> dict[str, str]:
     return result
 
 
+def predictor_dump_name(kind: str, frame: int, step: int) -> str:
+    """Return the native/Python predictor dump name for a frame and step."""
+    if frame == 0:
+        return f"predictor-{kind}-step{step}.bin"
+    return f"predictor-{kind}-frame{frame}-step{step}.bin"
+
+
 def _metric(native: Path, python: Path) -> dict[str, float] | None:
     if not native.is_file() or not python.is_file():
         return None
@@ -136,10 +143,10 @@ def analyze(native_dir: Path, python_dir: Path) -> dict[str, Any]:
 
     frame = mismatch["frame"]
     step = mismatch["graph_step"]
-    native_prefix = f"predictor-logits-frame{frame}-step{step}.bin"
+    native_prefix = predictor_dump_name("logits", frame, step)
     python_prefix = native_prefix
     report["predictor_logits"] = _metric(native_dir / native_prefix, python_dir / python_prefix)
-    native_hidden = f"predictor-hidden-frame{frame}-step{step}.bin"
+    native_hidden = predictor_dump_name("hidden", frame, step)
     report["predictor_hidden"] = _metric(native_dir / native_hidden, python_dir / native_hidden)
     native_summary_path = native_dir / f"sampler-frame{frame}-step{step}.txt"
     python_summary_path = python_dir / "sampler-diagnostic.txt"

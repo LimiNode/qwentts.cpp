@@ -253,4 +253,7 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME sampler_diagnostic_python
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_sampler_diagnostic.py)
+    add_test(NAME first_mismatch_python
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_first_mismatch.py)
 endif()

@@ -61,6 +61,10 @@ struct TalkerForwardOutput {
     // Codec head logits for the last position [vocab] f32.
     std::vector<float> logits_last;
 
+    // Actual decode input embedding after codebook gathers and overlay [hidden, N].
+    // Filled only for bounded diagnostic readback paths.
+    std::vector<float> input_embed;
+
     // Selected decoder-layer outputs for bounded diagnostic readback. Each
     // entry is [hidden, N] with one contiguous hidden column per slot.
     std::vector<std::vector<float>> layer_hidden;
@@ -677,6 +681,9 @@ static bool talker_decode_graph_build(const TalkerWeights *        tw,
     }
     x_in = ggml_add(gctx, x_in, overlay);
     ggml_set_name(x_in, "input_embed");
+    if (record_layer_taps) {
+        ggml_set_output(x_in);
+    }
 
     struct ggml_cgraph * gf = ggml_new_graph_custom(gctx, max_nodes, false);
 
@@ -729,6 +736,7 @@ static bool talker_decode_graph_build(const TalkerWeights *        tw,
 
     tg->gf      = gf;
     tg->ids_in  = ids_in;
+    tg->input_embed = x_in;
     tg->overlay = overlay;
     tg->pos_in  = pos_in;
     tg->rows_in = rows_in;
@@ -827,6 +835,9 @@ static bool talker_forward_decode(const TalkerWeights *            tw,
     ggml_backend_tensor_get(tg->logits, out->logits_last.data(), 0,
                             (size_t) tw->vocab_size * (size_t) N * sizeof(float));
     if (read_hidden_host) {
+        out->input_embed.assign((size_t) tw->hidden_size * (size_t) N, 0.0f);
+        ggml_backend_tensor_get(tg->input_embed, out->input_embed.data(), 0,
+                                out->input_embed.size() * sizeof(float));
         out->hidden_last.assign((size_t) tw->hidden_size * (size_t) N, 0.0f);
         ggml_backend_tensor_get(hidden_bridge, out->hidden_last.data(), 0,
                                 (size_t) tw->hidden_size * (size_t) N * sizeof(float));

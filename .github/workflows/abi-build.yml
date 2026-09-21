@@ -19,7 +19,7 @@ jobs:
       - name: Run ABI probe and sampling contract
         run: |
           ./build/test-abi-c
-          ctest --test-dir build --output-on-failure -R '^(sampling(_graph)?_contract(_python_parity)?|sampler_diagnostic_python)$'
+          ctest --test-dir build --output-on-failure -R '^(sampling(_graph)?_contract(_python_parity)?|sampler_diagnostic_python|first_mismatch_python)$'
 
   windows-msvc-shared:
     runs-on: windows-latest
@@ -37,4 +37,4 @@ jobs:
         shell: pwsh
         run: |
           .\build\Release\test-abi-c.exe
-          ctest --test-dir build -C Release --output-on-failure -R '^(sampling(_graph)?_contract(_python_parity)?|sampler_diagnostic_python)$'
+          ctest --test-dir build -C Release --output-on-failure -R '^(sampling(_graph)?_contract(_python_parity)?|sampler_diagnostic_python|first_mismatch_python)$'

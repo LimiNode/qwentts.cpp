@@ -21,6 +21,13 @@ def _write_dump(path: Path, rows: list[list[int]]) -> None:
     )
 
 
+def _write_vector(path: Path, values: list[float]) -> None:
+    path.write_bytes(
+        struct.pack("<i i", 1, len(values))
+        + struct.pack(f"<{len(values)}f", *values)
+    )
+
+
 class FirstMismatchTest(unittest.TestCase):
     """The first mismatch must identify the producing graph pass."""
 
@@ -76,6 +83,24 @@ class FirstMismatchTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "identical shapes"):
                 afm.analyze(native_dir, python_dir)
+
+    def test_frame_zero_predictor_dumps_are_found(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            native_dir = Path(temp_dir) / "native"
+            python_dir = Path(temp_dir) / "python"
+            native_dir.mkdir()
+            python_dir.mkdir()
+            _write_dump(native_dir / "codes-full.bin", [[10, 20, 30]])
+            _write_dump(python_dir / "codes-full.bin", [[10, 20, 31]])
+            for directory in (native_dir, python_dir):
+                _write_vector(directory / "predictor-logits-step1.bin", [1.0, 2.0])
+                _write_vector(directory / "predictor-hidden-step1.bin", [3.0, 4.0])
+
+            report = afm.analyze(native_dir, python_dir)
+
+            self.assertEqual(report["first_mismatch"]["frame"], 0)
+            self.assertIsNotNone(report["predictor_logits"])
+            self.assertIsNotNone(report["predictor_hidden"])
 
 
 if __name__ == "__main__":

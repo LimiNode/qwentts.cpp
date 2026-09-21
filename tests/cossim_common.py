@@ -437,6 +437,9 @@ def install_hooks(model, dump_dir, bisect_layers=(0, 7, 14, 21, 27)):
             return
         if ie.shape[1] > 1:
             return
+        frame = talker_step["n"] + 1
+        if frame <= 128:
+            save_dump(os.path.join(dump_dir, f"talker-input-frame{frame}.bin"), ie[0, 0])
         if talker_step["n"] == 0:
             save_dump(os.path.join(dump_dir, "next-emb-step0.bin"), ie[0, 0])
         talker_step["n"] += 1

@@ -1467,6 +1467,12 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                                       fw.hidden_last.data() + (size_t) i * (size_t) hidden,
                                       hidden);
                     }
+                    if (!fw.input_embed.empty()) {
+                        snprintf(name, sizeof(name), "talker-input-frame%d", s.step);
+                        debug_dump_1d(&d, name,
+                                      fw.input_embed.data() + (size_t) i * (size_t) hidden,
+                                      hidden);
+                    }
                     for (int tap = 0; tap < TALKER_N_BISECT_LAYERS; tap++) {
                         if (fw.layer_hidden.size() <= (size_t) tap || fw.layer_hidden[(size_t) tap].empty()) {
                             continue;

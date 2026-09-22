@@ -1406,6 +1406,7 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
     const int num_codebooks = pt->num_code_groups;
     const int codec_eos_id  = pt->codec_specials.eos_id;
     const int n_acoustic    = pt->code_predictor.num_acoustic_codebooks;
+    const bool full_ar_trace = std::getenv("QWEN_TTS_FULL_AR_TRACE") != NULL;
 
     // 1) Batched talker decode over the slots past their prefill. The
     // freshly admitted slots form a contiguous tail (step == 0) and
@@ -1582,11 +1583,17 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                    c0);
         }
 
-        // Keep a bounded full-frame trace for transparency checks.  This is
-        // logging only: it does not retain diagnostic graph outputs, read
-        // device tensors, or alter the sampler/graph path.  The 128-frame
+        // Keep a bounded full-frame trace for transparency checks only when
+        // explicitly requested (or when the existing dump path is active).
+        // This is logging only: it does not retain diagnostic graph outputs,
+        // read device tensors, or alter the sampler/graph path. The 128-frame
         // bound prevents a runaway request from producing unbounded logs.
-        if (s.step < 128) {
+        if ((full_ar_trace || p->dump_dir != NULL) && s.step < 128) {
+            // The compact first-32 trace remains available on the normal path
+            // for the existing sampler diagnostics.
+            qt_log(QT_LOG_DEBUG, "[Sample] step=%d c0=%d u=%.10f subseq=%lld", s.step, c0, (double) u_c0,
+                   (long long) (s.subseq_counter - 1));
+        } else if ((s.subseq_counter - 1) < 32) {
             qt_log(QT_LOG_DEBUG, "[Sample] step=%d c0=%d u=%.10f subseq=%lld", s.step, c0, (double) u_c0,
                    (long long) (s.subseq_counter - 1));
         }
@@ -1775,7 +1782,7 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                                s.step, sampled_codes[0], sampled_codes[1], sampled_codes[2], sampled_codes[3],
                                codes[0], codes[1], codes[2], codes[3]);
                     }
-                    if (s.step < 128) {
+                    if ((full_ar_trace || p->dump_dir != NULL) && s.step < 128) {
                         std::string code_text;
                         for (int code : codes) {
                             if (!code_text.empty()) {

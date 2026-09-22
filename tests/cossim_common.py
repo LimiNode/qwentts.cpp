@@ -395,6 +395,29 @@ def install_hooks(model, dump_dir, bisect_layers=(0, 7, 14, 21, 27)):
     talker_model = model.talker.model
     talker_lm    = model.talker
 
+    # Capture the exact terms used to assemble each single-token Talker
+    # decode input.  This mirrors the native graph's
+    # codec_embedding + acoustic_embedding_sum + overlay decomposition and
+    # is intentionally bounded to the first 128 generated frames.
+    predictor = talker_lm.code_predictor
+    predictor_tokens = {"value": None}
+    orig_predictor_generate = predictor.generate
+    def hooked_predictor_generate(*args, **kwargs):
+        result = orig_predictor_generate(*args, **kwargs)
+        seq = getattr(result, "sequences", result)
+        if isinstance(seq, torch.Tensor):
+            predictor_tokens["value"] = seq.detach()
+        return result
+    predictor.generate = hooked_predictor_generate
+    orig_predictor_fast = getattr(predictor, "generate_fast", None)
+    if orig_predictor_fast is not None:
+        def hooked_predictor_fast(*args, **kwargs):
+            result = orig_predictor_fast(*args, **kwargs)
+            if isinstance(result, torch.Tensor):
+                predictor_tokens["value"] = result.detach()
+            return result
+        predictor.generate_fast = hooked_predictor_fast
+
     seen_layers = {idx: False for idx in bisect_layers}
     decode_layer_calls = {idx: 0 for idx in bisect_layers}
     def make_layer_hook(layer_idx):
@@ -474,7 +497,39 @@ def install_hooks(model, dump_dir, bisect_layers=(0, 7, 14, 21, 27)):
                 and inputs_embeds.shape[1] > 1 and not seen_prefill["done"]):
             save_dump(os.path.join(dump_dir, "talker-input-embed.bin"), inputs_embeds[0])
             seen_prefill["done"] = True
+        decode_input_ids = kwargs.get("input_ids", None)
+        decode_step = kwargs.get("generation_step", None)
         out = orig_talker_forward(*args, **kwargs)
+        if (isinstance(decode_input_ids, torch.Tensor)
+                and decode_input_ids.dim() == 2 and decode_input_ids.shape[1] == 1
+                and decode_step is not None and predictor_tokens["value"] is not None):
+            frame = int(decode_step) + 1
+            if 1 <= frame <= 128:
+                tokens = predictor_tokens["value"].to(decode_input_ids.device)
+                codec = talker_lm.get_input_embeddings()(decode_input_ids)
+                terms = [codec]
+                for i in range(tokens.shape[-1]):
+                    terms.append(predictor.get_input_embeddings()[i](tokens[:, i:i + 1]))
+                # Match the native production accumulation order (codec-0
+                # first, then each acoustic codebook in order).  The
+                # acoustic diagnostic is defined from that same accumulated
+                # tensor so native and Python compare identical arithmetic.
+                pre_overlay = codec
+                for term in terms[1:]:
+                    pre_overlay = pre_overlay + term
+                acoustic = pre_overlay - codec
+                trailing = kwargs.get("trailing_text_hidden", None)
+                pad = kwargs.get("tts_pad_embed", None)
+                if (trailing is not None and int(decode_step) < trailing.shape[1]):
+                    overlay = trailing[:, int(decode_step):int(decode_step) + 1, :]
+                else:
+                    overlay = pad
+                prefix = os.path.join(dump_dir, f"talker-input-frame{frame}")
+                save_dump(prefix + "-codec-embed.bin", codec[0, 0])
+                save_dump(prefix + "-acoustic-embed-sum.bin", acoustic[0, 0])
+                save_dump(prefix + "-pre-overlay-embed.bin", pre_overlay[0, 0])
+                if overlay is not None:
+                    save_dump(prefix + "-overlay.bin", overlay[0, 0])
         if (out is not None and getattr(out, "logits", None) is not None
                 and not seen_codes["done"]):
             logits = out.logits

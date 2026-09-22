@@ -749,6 +749,30 @@ def main():
     cc.compare_exact_i32("prompt-ids.bin", DUMP_CPP, DUMP_PT, "PromptIDs")
     cc.compare_exact_i32("ref-codes.bin",  DUMP_CPP, DUMP_PT, "RefCodes")
     cc.compare_stages(STAGES_CLONE, DUMP_CPP, DUMP_PT)
+    # Component bisection for the single-token Talker decode input.  Keep the
+    # names frame-indexed so the first divergent composition term can be read
+    # directly from the paired native/Python artifacts.
+    for frame in range(1, min(args.max_new_tokens + 1, 129)):
+        found = False
+        for suffix, label in (
+            ("codec-embed", "CodecEmbed"),
+            ("acoustic-embed-sum", "AcousticEmbedSum"),
+            ("pre-overlay-embed", "PreOverlayEmbed"),
+            ("overlay", "Overlay"),
+        ):
+            name = f"talker-input-frame{frame}-{suffix}.bin"
+            try:
+                aa, ab = cc.pair(name, DUMP_CPP, DUMP_PT)
+            except FileNotFoundError:
+                continue
+            c, mx, mean = cc.metric(aa, ab)
+            print(
+                f"[Cossim] {label}Frame{frame} cos: {c:.9f} "
+                f"max: {mx:.4e} mean: {mean:.4e}"
+            )
+            found = True
+        if not found:
+            break
     if args.dump_predictor_logits:
         for frame in range(min(args.max_new_tokens, 128)):
             compared = 0

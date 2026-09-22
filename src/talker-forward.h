@@ -65,6 +65,13 @@ struct TalkerForwardOutput {
     // Filled only for bounded diagnostic readback paths.
     std::vector<float> input_embed;
 
+    // Components of the decode input, retained only for bounded diagnostics.
+    // Each vector is [hidden, N] with one contiguous hidden column per slot.
+    std::vector<float> codec_embed;
+    std::vector<float> acoustic_embed;
+    std::vector<float> pre_overlay;
+    std::vector<float> overlay;
+
     // Selected decoder-layer outputs for bounded diagnostic readback. Each
     // entry is [hidden, N] with one contiguous hidden column per slot.
     std::vector<std::vector<float>> layer_hidden;
@@ -674,14 +681,22 @@ static bool talker_decode_graph_build(const TalkerWeights *        tw,
     // contiguous [N] view and gathers its own table, summed across the
     // 16 codebooks, plus the per slot overlay row.
     struct ggml_tensor * id0  = ggml_view_1d(gctx, ids_in, N, 0);
-    struct ggml_tensor * x_in = ggml_get_rows(gctx, tw->codec_embedding, id0);
+    struct ggml_tensor * codec = ggml_get_rows(gctx, tw->codec_embedding, id0);
+    ggml_set_name(codec, "codec_embed");
+    // Keep the production input accumulation order unchanged: codec-0 is
+    // the left operand and every acoustic term is added in codebook order.
+    struct ggml_tensor * pre_overlay = codec;
     for (int g = 0; g < n_acoustic; g++) {
         struct ggml_tensor * idg = ggml_view_1d(gctx, ids_in, N, (size_t) (g + 1) * (size_t) N * sizeof(int32_t));
-        x_in                     = ggml_add(gctx, x_in, ggml_get_rows(gctx, acoustic_embd[g], idg));
+        struct ggml_tensor * term = ggml_get_rows(gctx, acoustic_embd[g], idg);
+        pre_overlay = ggml_add(gctx, pre_overlay, term);
     }
-    x_in = ggml_add(gctx, x_in, overlay);
+    ggml_set_name(pre_overlay, "pre_overlay_embed");
+    struct ggml_tensor * x_in = ggml_add(gctx, pre_overlay, overlay);
     ggml_set_name(x_in, "input_embed");
     if (record_layer_taps) {
+        ggml_set_output(codec);
+        ggml_set_output(pre_overlay);
         ggml_set_output(x_in);
     }
 
@@ -736,6 +751,9 @@ static bool talker_decode_graph_build(const TalkerWeights *        tw,
 
     tg->gf      = gf;
     tg->ids_in  = ids_in;
+    tg->codec_embed = codec;
+    tg->acoustic_embed = nullptr;
+    tg->pre_overlay = pre_overlay;
     tg->input_embed = x_in;
     tg->overlay = overlay;
     tg->pos_in  = pos_in;
@@ -835,6 +853,23 @@ static bool talker_forward_decode(const TalkerWeights *            tw,
     ggml_backend_tensor_get(tg->logits, out->logits_last.data(), 0,
                             (size_t) tw->vocab_size * (size_t) N * sizeof(float));
     if (read_hidden_host) {
+        out->codec_embed.assign((size_t) tw->hidden_size * (size_t) N, 0.0f);
+        ggml_backend_tensor_get(tg->codec_embed, out->codec_embed.data(), 0,
+                                out->codec_embed.size() * sizeof(float));
+        out->pre_overlay.assign((size_t) tw->hidden_size * (size_t) N, 0.0f);
+        ggml_backend_tensor_get(tg->pre_overlay, out->pre_overlay.data(), 0,
+                                out->pre_overlay.size() * sizeof(float));
+        // Recover the aggregate acoustic contribution from tensors already
+        // present in the production path.  Adding a second acoustic-only
+        // graph root changes CUDA graph scheduling and is intentionally
+        // avoided by this diagnostic path.
+        out->acoustic_embed.resize(out->pre_overlay.size());
+        for (size_t j = 0; j < out->acoustic_embed.size(); j++) {
+            out->acoustic_embed[j] = out->pre_overlay[j] - out->codec_embed[j];
+        }
+        out->overlay.assign((size_t) tw->hidden_size * (size_t) N, 0.0f);
+        ggml_backend_tensor_get(tg->overlay, out->overlay.data(), 0,
+                                out->overlay.size() * sizeof(float));
         out->input_embed.assign((size_t) tw->hidden_size * (size_t) N, 0.0f);
         ggml_backend_tensor_get(tg->input_embed, out->input_embed.data(), 0,
                                 out->input_embed.size() * sizeof(float));

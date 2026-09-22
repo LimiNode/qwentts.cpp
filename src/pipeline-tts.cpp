@@ -1473,6 +1473,24 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                                       fw.input_embed.data() + (size_t) i * (size_t) hidden,
                                       hidden);
                     }
+                    const struct {
+                        const char * suffix;
+                        const std::vector<float> * values;
+                    } input_parts[] = {
+                        {"codec-embed", &fw.codec_embed},
+                        {"acoustic-embed-sum", &fw.acoustic_embed},
+                        {"pre-overlay-embed", &fw.pre_overlay},
+                        {"overlay", &fw.overlay},
+                    };
+                    for (const auto & part : input_parts) {
+                        if (part.values->empty()) {
+                            continue;
+                        }
+                        snprintf(name, sizeof(name), "talker-input-frame%d-%s", s.step, part.suffix);
+                        debug_dump_1d(&d, name,
+                                      part.values->data() + (size_t) i * (size_t) hidden,
+                                      hidden);
+                    }
                     for (int tap = 0; tap < TALKER_N_BISECT_LAYERS; tap++) {
                         if (fw.layer_hidden.size() <= (size_t) tap || fw.layer_hidden[(size_t) tap].empty()) {
                             continue;

@@ -1582,10 +1582,11 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                    c0);
         }
 
-        // Keep the compact first-32 trace for ordinary diagnostics.  A dump
-        // run opts into the bounded full-frame trace so long-horizon parity
-        // can compare every generated Talker step without unbounded logs.
-        if ((s.subseq_counter - 1) < 32 || (p->dump_dir && s.step < 128)) {
+        // Keep a bounded full-frame trace for transparency checks.  This is
+        // logging only: it does not retain diagnostic graph outputs, read
+        // device tensors, or alter the sampler/graph path.  The 128-frame
+        // bound prevents a runaway request from producing unbounded logs.
+        if (s.step < 128) {
             qt_log(QT_LOG_DEBUG, "[Sample] step=%d c0=%d u=%.10f subseq=%lld", s.step, c0, (double) u_c0,
                    (long long) (s.subseq_counter - 1));
         }
@@ -1774,7 +1775,7 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                                s.step, sampled_codes[0], sampled_codes[1], sampled_codes[2], sampled_codes[3],
                                codes[0], codes[1], codes[2], codes[3]);
                     }
-                    if (p->dump_dir && s.step < 128) {
+                    if (s.step < 128) {
                         std::string code_text;
                         for (int code : codes) {
                             if (!code_text.empty()) {

@@ -867,9 +867,12 @@ static bool talker_forward_decode(const TalkerWeights *            tw,
         for (size_t j = 0; j < out->acoustic_embed.size(); j++) {
             out->acoustic_embed[j] = out->pre_overlay[j] - out->codec_embed[j];
         }
-        out->overlay.assign((size_t) tw->hidden_size * (size_t) N, 0.0f);
-        ggml_backend_tensor_get(tg->overlay, out->overlay.data(), 0,
-                                out->overlay.size() * sizeof(float));
+        // The overlay tensor is a graph input.  Its allocator storage may be
+        // reused after the add node consumes it, so reading tg->overlay back
+        // after compute can return the final input embedding instead of the
+        // supplied overlay row.  Preserve the host upload for an exact,
+        // side-effect-free diagnostic readback.
+        out->overlay.assign(overlays, overlays + (size_t) tw->hidden_size * (size_t) N);
         out->input_embed.assign((size_t) tw->hidden_size * (size_t) N, 0.0f);
         ggml_backend_tensor_get(tg->input_embed, out->input_embed.data(), 0,
                                 out->input_embed.size() * sizeof(float));

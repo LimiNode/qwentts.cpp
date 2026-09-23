@@ -752,7 +752,6 @@ static bool talker_decode_graph_build(const TalkerWeights *        tw,
     tg->gf      = gf;
     tg->ids_in  = ids_in;
     tg->codec_embed = codec;
-    tg->acoustic_embed = nullptr;
     tg->pre_overlay = pre_overlay;
     tg->input_embed = x_in;
     tg->overlay = overlay;

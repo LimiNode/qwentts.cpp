@@ -18,7 +18,6 @@ struct TalkerDecodeGraph {
     ggml_gallocr_t           galloc  = nullptr;
     struct ggml_tensor *     ids_in  = nullptr;  // [(1 + n_acoustic) * N] i32, group major: g * N + slot
     struct ggml_tensor *     codec_embed = nullptr; // [hidden, N] codebook-0 embedding
-    struct ggml_tensor *     acoustic_embed = nullptr; // [hidden, N] sum of codebooks 1..15
     struct ggml_tensor *     pre_overlay = nullptr; // [hidden, N] codec + acoustic
     struct ggml_tensor *     input_embed = nullptr; // [hidden, N] f32, post-gather decode input
     struct ggml_tensor *     overlay = nullptr;  // [hidden, N] f32
@@ -46,7 +45,6 @@ static void talker_decode_graph_free(TalkerDecodeGraph * tg) {
     tg->gf      = nullptr;
     tg->ids_in  = nullptr;
     tg->codec_embed = nullptr;
-    tg->acoustic_embed = nullptr;
     tg->pre_overlay = nullptr;
     tg->input_embed = nullptr;
     tg->overlay = nullptr;

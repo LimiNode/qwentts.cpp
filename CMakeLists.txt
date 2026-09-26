@@ -256,4 +256,15 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME first_mismatch_python
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_first_mismatch.py)
+  endif()
+
+add_executable(test-eos-guard-contract tests/eos-guard-contract.cpp)
+target_include_directories(test-eos-guard-contract PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+if(MSVC)
+    target_compile_options(test-eos-guard-contract PRIVATE /W4 /WX)
+else()
+    target_compile_options(test-eos-guard-contract PRIVATE -Wall -Wextra -Werror -pedantic)
 endif()
+add_test(NAME eos_guard_contract COMMAND test-eos-guard-contract)

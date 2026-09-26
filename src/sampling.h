@@ -148,7 +148,10 @@ static inline void apply_suppress(float * logits, int V, int lo, int hi, int kee
 // available for later steps, but make the first-frame contract explicit so
 // callers never receive a successful empty stream.
 static inline void suppress_initial_eos(float * logits, int V, int eos_id, int step) {
-    if (step == 0 && eos_id >= 0 && eos_id < V) {
+    // Upstream Qwen3-TTS uses min_new_tokens=2 for the Talker stream.  Keep
+    // both initial codec frames non-terminal so a valid request cannot finish
+    // before it has emitted an audible frame and its first continuation.
+    if (step < 2 && eos_id >= 0 && eos_id < V) {
         logits[(size_t) eos_id] = -INFINITY;
     }
 }

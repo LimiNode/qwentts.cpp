@@ -92,7 +92,7 @@ int main(void) {
 
     /* Sanity-check a few default values, including the abi_version and
      * the use_fa / clamp_fp16 / on_chunk / codec framing slots. */
-    if (params.max_new_tokens != 2048) {
+    if (params.max_new_tokens != 2048 || params.eos_guard_enabled) {
         fprintf(stderr, "[Probe] default values do not match\n");
         return 1;
     }

@@ -39,5 +39,19 @@ int main() {
                "negative boost clamps to zero")) {
         return 1;
     }
+
+    EosGuardConfig safe;
+    const std::int64_t huge = eos_guard_expected_frames(2147483647, true, safe);
+    const EosGuardPlan capped = eos_guard_plan(huge, safe, 128);
+    if (!check(capped.force_step <= 128, "thresholds respect the generation cap")) {
+        return 1;
+    }
+    const EosGuardPlan tiny = eos_guard_plan(huge, safe, 1);
+    if (!check(tiny.soft_start == 1 && tiny.max_boost_step == 1 && tiny.force_step == 1,
+               "tiny generation cap keeps ordered thresholds") ||
+        !check(std::fabs(eos_guard_boost(tiny, 1) - safe.max_boost) < 1e-6F,
+               "tiny generation cap reaches finite boost")) {
+        return 1;
+    }
     return 0;
 }

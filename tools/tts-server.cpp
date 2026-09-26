@@ -222,7 +222,9 @@ int main(int argc, char ** argv) {
     // voiceless.
     be.synthesize = [q, &lang](const tts_request & req, const tts_sink & sink, std::string & err) -> int {
         struct qt_tts_params p;
-        qt_tts_default_params(&p);
+        if (qt_tts_default_params_ex(&p, sizeof(p)) != QT_STATUS_OK) {
+            throw std::runtime_error(qt_last_error());
+        }
         p.text = req.input.c_str();
         p.lang = lang.c_str();
 

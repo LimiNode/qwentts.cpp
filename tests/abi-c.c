@@ -34,6 +34,40 @@ static bool stub_on_chunk(const float * samples, int n_samples, void * ud) {
     return true;
 }
 
+/* Frozen copy of the public ABI-5 layout. This deliberately does not use the
+ * current qt_tts_params type: the regression must model an already-compiled
+ * caller whose allocation physically ends before the ABI-6 guard tail. */
+struct qt_tts_params_abi5 {
+    int abi_version;
+    const char * text;
+    const char * lang;
+    const char * instruct;
+    const char * speaker;
+    const float * ref_audio_24k;
+    int ref_n_samples;
+    const char * ref_text;
+    int64_t seed;
+    int max_new_tokens;
+    bool do_sample;
+    float temperature;
+    int top_k;
+    float top_p;
+    float repetition_penalty;
+    bool subtalker_do_sample;
+    float subtalker_temperature;
+    int subtalker_top_k;
+    float subtalker_top_p;
+    const char * dump_dir;
+    qt_cancel_cb cancel;
+    void * cancel_user_data;
+    qt_audio_chunk_cb on_chunk;
+    void * on_chunk_user_data;
+    const float * ref_spk_emb;
+    int ref_spk_dim;
+    const int32_t * ref_codes;
+    int ref_T;
+};
+
 /* Counter incremented by the stub log callback. The probe checks that at
  * least one log line was routed through the callback by triggering a
  * qt_init failure (which emits a [Qwen] ERROR line via qt_log). */
@@ -63,6 +97,12 @@ int main(void) {
         fprintf(stderr, "[Probe] initial finish reason must be unknown\n");
         return 1;
     }
+    volatile int forced_reason = QT_FINISH_EOS_FORCED;
+    volatile int assisted_reason = QT_FINISH_EOS_ASSISTED;
+    if (forced_reason != 3 || assisted_reason != 4) {
+        fprintf(stderr, "[Probe] finish-reason numeric ABI changed\n");
+        return 1;
+    }
     struct qt_synthesis_metrics metrics = { 0 };
     qt_last_synthesis_metrics(&metrics, sizeof(metrics));
     if (metrics.abi_version != QT_ABI_VERSION || metrics.n_frames != 0) {
@@ -88,7 +128,44 @@ int main(void) {
     qt_init_default_params(&iparams);
 
     struct qt_tts_params params;
-    qt_tts_default_params(&params);
+    if (qt_tts_default_params_ex(&params, sizeof(params)) != QT_STATUS_OK) {
+        fprintf(stderr, "[Probe] ABI-6 default initialisation failed\n");
+        return 1;
+    }
+    if (qt_tts_default_params_ex(NULL, sizeof(params)) != QT_STATUS_INVALID_PARAMS ||
+        qt_tts_default_params_ex(&params, QT_TTS_PARAMS_ABI5_SIZE - 1) != QT_STATUS_INVALID_PARAMS) {
+        fprintf(stderr, "[Probe] invalid default-initializer arguments were accepted\n");
+        return 1;
+    }
+    {
+        unsigned char ambiguous[QT_TTS_PARAMS_ABI5_SIZE + 1];
+        memset(ambiguous, 0xA5, sizeof(ambiguous));
+        if (qt_tts_default_params_ex((struct qt_tts_params *) ambiguous, sizeof(ambiguous)) !=
+            QT_STATUS_INVALID_PARAMS || ambiguous[0] != 0xA5 || ambiguous[sizeof(ambiguous) - 1] != 0xA5) {
+            fprintf(stderr, "[Probe] ambiguous ABI parameter size was not rejected safely\n");
+            return 1;
+        }
+    }
+
+    /* Simulate a caller compiled with the ABI-5 header: the canary begins
+     * exactly where the ABI-6 tail would start. The legacy initializer must
+     * not write into it. */
+    struct {
+        struct qt_tts_params_abi5 params;
+        unsigned char canary[8];
+    } abi5;
+    volatile size_t abi5_prefix_size = offsetof(struct qt_tts_params_abi5, ref_T) + sizeof(int);
+    if (abi5_prefix_size != QT_TTS_PARAMS_ABI5_SIZE) {
+        fprintf(stderr, "[Probe] frozen ABI-5 layout no longer matches the compatibility prefix\n");
+        return 1;
+    }
+    memset(&abi5, 0xA5, sizeof(abi5));
+    qt_tts_default_params((struct qt_tts_params *) &abi5.params);
+    if (abi5.params.abi_version != QT_ABI_MIN_VERSION ||
+        abi5.canary[0] != 0xA5 || abi5.canary[sizeof(abi5.canary) - 1] != 0xA5) {
+        fprintf(stderr, "[Probe] ABI-5 default initializer overwrote its canary\n");
+        return 1;
+    }
 
     /* Sanity-check a few default values, including the abi_version and
      * the use_fa / clamp_fp16 / on_chunk / codec framing slots. */

@@ -14,8 +14,9 @@ distribution is correct for every utterance:
 4. terminate with `QT_FINISH_EOS_FORCED` at `1.5 * expected` frames.
 
 The terminal categories are kept distinct in the C ABI:
-`QT_FINISH_EOS`, `QT_FINISH_MAX_TOKENS`, and `QT_FINISH_EOS_FORCED`.  A forced
-termination is not reported as natural EOS.
+`QT_FINISH_EOS`, `QT_FINISH_EOS_ASSISTED`, `QT_FINISH_MAX_TOKENS`, and
+`QT_FINISH_EOS_FORCED`. EOS sampled after a positive guard bias is reported as
+assisted; a hard cutoff is never reported as natural EOS.
 
 These defaults are an initial, configurable experiment.  They are based on
 the independently published `darkautism/qwen3-tts` implementation, which uses
@@ -41,15 +42,16 @@ EOS evidence; `max_new_tokens` was 2048 unless stated otherwise.
 
 | Seed / policy | Result | Frames | Audio |
 |---|---|---:|---:|
-| 1000, guard enabled | natural EOS | 101 | 8.08 s |
+| 1000, guard enabled | assisted EOS | 101 | 8.08 s |
 | 1002, guard enabled | natural EOS | 25 | 2.00 s |
-| 1006, guard enabled | natural EOS | 89 | 7.12 s |
-| 1008, guard enabled | natural EOS | 98 | 7.84 s |
+| 1006, guard enabled | assisted EOS | 89 | 7.12 s |
+| 1008, guard enabled | assisted EOS | 98 | 7.84 s |
 | 1008, guard disabled, `max_new=256` | max tokens | 256 | 20.48 s |
 | 1000, guard enabled, boost `0` | forced EOS | 171 | 13.68 s |
 
 This is a bounded regression smoke, not a quality or release-acceptance claim.
 It demonstrates that the opt-in policy prevents the observed 256-frame
 runaway on this exact Q8/CUDA setup and that forced termination is surfaced as
-`eos_forced`, while normal EOS remains `natural_eos`. The generated WAVs and
-stderr logs are intentionally kept outside the repository.
+`eos_forced`, while model-selected EOS remains distinguishable from
+`eos_assisted`. The generated WAVs and stderr logs are intentionally kept
+outside the repository.

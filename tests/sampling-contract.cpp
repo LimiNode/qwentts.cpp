@@ -76,10 +76,17 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    float second_step[] = {1.0F, 100.0F, 2.0F};
+    suppress_initial_eos(second_step, 3, 1, 1);
+    if (!check(std::isinf(second_step[1]) && second_step[1] < 0.0F,
+               "EOS is masked at the second step")) {
+        return 1;
+    }
+
     float later_step[] = {1.0F, 100.0F, 2.0F};
-    suppress_initial_eos(later_step, 3, 1, 1);
+    suppress_initial_eos(later_step, 3, 1, 2);
     if (!check(later_step[1] == 100.0F,
-               "EOS remains eligible after the first step")) {
+               "EOS remains eligible after the first two steps")) {
         return 1;
     }
 

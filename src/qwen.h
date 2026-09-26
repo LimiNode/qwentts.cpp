@@ -60,7 +60,7 @@ extern "C" {
 // git short hash + commit date string returned by qt_version(); for
 // binding compat checks, QT_ABI_VERSION is the only number that
 // matters.
-#define QT_ABI_VERSION 5
+#define QT_ABI_VERSION 6
 
 // Oldest struct layout this build addresses. ABI 5 is required because the
 // current qt_init_params tail includes stream_max_chunk_frames; older layouts
@@ -87,9 +87,10 @@ enum qt_status {
 // cancellation and failures; successful requests must report EOS or
 // MAX_TOKENS so callers can enforce a natural-EOS acceptance gate.
 enum qt_finish_reason {
-    QT_FINISH_UNKNOWN    = 0,
-    QT_FINISH_EOS        = 1,
-    QT_FINISH_MAX_TOKENS = 2,
+    QT_FINISH_UNKNOWN        = 0,
+    QT_FINISH_EOS            = 1,
+    QT_FINISH_MAX_TOKENS     = 2,
+    QT_FINISH_EOS_FORCED     = 3,
 };
 
 // Returns the last error message produced on the calling thread by any
@@ -397,6 +398,19 @@ struct qt_tts_params {
     int             ref_spk_dim;
     const int32_t * ref_codes;
     int             ref_T;
+
+    // Optional adaptive EOS convergence guard (ABI 6 tail). Disabled by
+    // default so existing sampling behaviour remains unchanged. When enabled,
+    // EOS receives a bounded logit bias after the configured fraction of the
+    // estimated duration and generation terminates at the hard fraction.
+    bool  eos_guard_enabled;
+    float eos_guard_start_ratio;
+    float eos_guard_max_ratio;
+    float eos_guard_force_ratio;
+    float eos_guard_max_boost;
+    float eos_guard_voice_multiplier;
+    int   eos_guard_min_expected_frames;
+    int   eos_guard_frames_per_text_token;
 };
 
 // Initialise to the standard defaults. Strings NULL, seed -1,

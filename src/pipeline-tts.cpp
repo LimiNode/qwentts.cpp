@@ -3,6 +3,7 @@
 // and provide a structured load-time summary for --load-only mode.
 
 #include "pipeline-tts.h"
+#include "eos-guard.h"
 
 #include "audio-io.h"
 #include "bpe.h"
@@ -744,6 +745,8 @@ struct TtsSlot {
     std::vector<std::vector<int32_t>> forced_predictor_frames; // acoustic prefix replay
     int                               sampler_target_frame;
     int                               sampler_target_step;
+    bool                              eos_guard_enabled;
+    EosGuardPlan                      eos_guard;
     std::vector<int32_t> prev_ids;        // previous frame codes [num_code_groups]
     const float *        prev_overlay;    // trailing text row or tts_pad row
     std::vector<float>   logits;          // pending c0 logits [vocab]
@@ -1066,6 +1069,8 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
     const SamplerDiagnosticTarget sampler_target = load_sampler_diagnostic_target(params->dump_dir);
     s.sampler_target_frame = sampler_target.frame;
     s.sampler_target_step  = sampler_target.step;
+    s.eos_guard_enabled = false;
+    s.eos_guard = {};
     if (sampler_target.present) {
         if (!sampler_target.valid) {
             qt_log(QT_LOG_WARN, "[Pipeline] ignoring invalid sampler-target.txt; using frame=%d step=%d",
@@ -1226,6 +1231,31 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
 
     s.talker_T = params->do_sample ? params->temperature : 0.0f;
     s.subtk_T  = params->subtalker_do_sample ? params->subtalker_temperature : 0.0f;
+    if (params->abi_version >= 6 && params->eos_guard_enabled) {
+        EosGuardConfig guard;
+        guard.enabled          = true;
+        guard.start_ratio      = params->eos_guard_start_ratio;
+        guard.max_ratio        = params->eos_guard_max_ratio;
+        guard.force_ratio      = params->eos_guard_force_ratio;
+        guard.max_boost        = params->eos_guard_max_boost;
+        guard.voice_multiplier = params->eos_guard_voice_multiplier;
+        guard.min_expected     = params->eos_guard_min_expected_frames;
+        guard.frames_per_text  = params->eos_guard_frames_per_text_token;
+        if (!eos_guard_config_valid(guard)) {
+            qt_log(QT_LOG_WARN,
+                   "[Pipeline] ignoring invalid EOS guard configuration; expected monotonic finite ratios "
+                   "and positive duration parameters");
+        } else {
+            const bool has_voice = ref_spk_emb_ptr != NULL;
+            const int expected = eos_guard_expected_frames(s.prompt.N_text, has_voice, guard);
+            s.eos_guard_enabled = true;
+            s.eos_guard = eos_guard_plan(expected, guard);
+            qt_log(QT_LOG_INFO,
+                   "[Pipeline] EOS guard enabled: expected=%d soft=%d max=%d force=%d boost=%.2f",
+                   s.eos_guard.expected_frames, s.eos_guard.soft_start, s.eos_guard.max_boost_step,
+                   s.eos_guard.force_step, (double) s.eos_guard.max_boost);
+        }
+    }
     s.prev_ids.assign((size_t) pt->num_code_groups, 0);
     s.all_codes.reserve((size_t) params->max_new_tokens);
     s.talker_history.reserve((size_t) params->max_new_tokens);
@@ -1530,6 +1560,13 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
         }
         const struct qt_tts_params * p = s.job->params;
 
+        if (s.eos_guard_enabled && eos_guard_force(s.eos_guard, s.step)) {
+            qt_log(QT_LOG_INFO, "[Pipeline] EOS guard forced termination at step %d (slot %d)", s.step, i);
+            s.finished = true;
+            s.finish_reason = QT_FINISH_EOS_FORCED;
+            continue;
+        }
+
         // Cooperative cancellation, polled at every step. Granularity is
         // one AR frame = 1 / 12.5 Hz ~ 83 ms of audio, which is well
         // below any reasonable UX cancel latency target.
@@ -1549,6 +1586,9 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
         // it on the first step produces a misleading successful empty audio
         // result (and makes the worker fail only after the model call).
         suppress_initial_eos(s.logits.data(), vocab, codec_eos_id, s.step);
+        if (s.eos_guard_enabled) {
+            s.logits[(size_t) codec_eos_id] += eos_guard_boost(s.eos_guard, s.step);
+        }
         const bool diagnostic_frame = p->dump_dir && s.step < 128;
         std::vector<float> suppressed_logits;
         if (diagnostic_frame) {

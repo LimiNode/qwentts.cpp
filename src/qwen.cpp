@@ -284,6 +284,14 @@ void qt_tts_default_params(struct qt_tts_params * p) {
     p->ref_spk_dim           = 0;
     p->ref_codes             = nullptr;
     p->ref_T                 = 0;
+    p->eos_guard_enabled             = false;
+    p->eos_guard_start_ratio         = 0.6F;
+    p->eos_guard_max_ratio           = 1.2F;
+    p->eos_guard_force_ratio         = 1.5F;
+    p->eos_guard_max_boost           = 25.0F;
+    p->eos_guard_voice_multiplier    = 1.5F;
+    p->eos_guard_min_expected_frames = 24;
+    p->eos_guard_frames_per_text_token = 4;
 }
 
 int qt_num_codebooks(const struct qt_context * q) {

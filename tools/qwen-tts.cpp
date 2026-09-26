@@ -65,6 +65,12 @@ static void print_usage(const char * prog) {
             "  --sub-temp <f>          Sub-talker temperature (default: 0.9)\n"
             "  --sub-top-k <n>         Sub-talker top-k (default: 50)\n"
             "  --sub-top-p <f>         Sub-talker top-p (default: 1.0)\n\n"
+            "EOS convergence guard (opt-in):\n"
+            "  --eos-guard             Bound runaway generation with a progressive EOS bias\n"
+            "  --eos-start <f>         Soft threshold ratio (default: 0.6)\n"
+            "  --eos-max <f>           Maximum-bias threshold ratio (default: 1.2)\n"
+            "  --eos-force <f>         Hard termination threshold ratio (default: 1.5)\n"
+            "  --eos-boost <f>         Maximum EOS logit increment (default: 25.0)\n\n"
             "Debug:\n"
             "  --no-fa                 Disable flash attention\n"
             "  --clamp-fp16            Clamp hidden states to FP16 range\n"
@@ -99,8 +105,26 @@ struct Args {
     bool         use_fa;
     bool         clamp_fp16;
     bool         stream_by_line;
+    bool         eos_guard;
+    float        eos_start_ratio;
+    float        eos_max_ratio;
+    float        eos_force_ratio;
+    float        eos_max_boost;
     float        codec_chunk_sec;
 };
+
+static const char * finish_reason_name(enum qt_finish_reason reason) {
+    switch (reason) {
+        case QT_FINISH_EOS:        return "natural_eos";
+        case QT_FINISH_MAX_TOKENS: return "max_tokens";
+        case QT_FINISH_EOS_FORCED: return "eos_forced";
+        default:                   return "unknown";
+    }
+}
+
+static void print_finish_reason() {
+    fprintf(stderr, "[Pipeline] Finish reason: %s\n", finish_reason_name(qt_last_finish_reason()));
+}
 
 // Read all of stdin into a string. Binary mode on Windows so UTF-16 input
 // survives CRLF translation, then normalised to UTF-8. Trims trailing
@@ -195,6 +219,11 @@ static bool parse_args(int argc, char ** argv, Args & a) {
     a.use_fa                = true;
     a.clamp_fp16            = false;
     a.stream_by_line        = false;
+    a.eos_guard             = false;
+    a.eos_start_ratio       = 0.6F;
+    a.eos_max_ratio         = 1.2F;
+    a.eos_force_ratio       = 1.5F;
+    a.eos_max_boost         = 25.0F;
     // Chunk sentinel : qt_init resolves a non positive value to the
     // library default.
     a.codec_chunk_sec       = 0.0f;
@@ -251,6 +280,16 @@ static bool parse_args(int argc, char ** argv, Args & a) {
             a.subtalker_top_k = std::atoi(argv[++i]);
         } else if (std::strcmp(arg, "--sub-top-p") == 0 && i + 1 < argc) {
             a.subtalker_top_p = (float) std::atof(argv[++i]);
+        } else if (std::strcmp(arg, "--eos-guard") == 0) {
+            a.eos_guard = true;
+        } else if (std::strcmp(arg, "--eos-start") == 0 && i + 1 < argc) {
+            a.eos_start_ratio = (float) std::atof(argv[++i]);
+        } else if (std::strcmp(arg, "--eos-max") == 0 && i + 1 < argc) {
+            a.eos_max_ratio = (float) std::atof(argv[++i]);
+        } else if (std::strcmp(arg, "--eos-force") == 0 && i + 1 < argc) {
+            a.eos_force_ratio = (float) std::atof(argv[++i]);
+        } else if (std::strcmp(arg, "--eos-boost") == 0 && i + 1 < argc) {
+            a.eos_max_boost = (float) std::atof(argv[++i]);
         } else if (std::strcmp(arg, "--no-fa") == 0) {
             a.use_fa = false;
         } else if (std::strcmp(arg, "--clamp-fp16") == 0) {
@@ -411,6 +450,11 @@ static int run(const Args & a) {
     params.subtalker_temperature = a.subtalker_temperature;
     params.subtalker_top_k       = a.subtalker_top_k;
     params.subtalker_top_p       = a.subtalker_top_p;
+    params.eos_guard_enabled     = a.eos_guard;
+    params.eos_guard_start_ratio = a.eos_start_ratio;
+    params.eos_guard_max_ratio   = a.eos_max_ratio;
+    params.eos_guard_force_ratio = a.eos_force_ratio;
+    params.eos_guard_max_boost   = a.eos_max_boost;
     params.dump_dir              = a.dump_dir;
 
     if (stream_to_stdout) {
@@ -469,6 +513,7 @@ static int run(const Args & a) {
                             qt_free(q);
                             return 1;
                         }
+                        print_finish_reason();
                         n_lines++;
                         need_header = true;
                     }
@@ -493,6 +538,7 @@ static int run(const Args & a) {
             qt_free(q);
             return 1;
         }
+        print_finish_reason();
         qt_audio_free(&audio);
         qt_free(q);
         fprintf(stderr, "[Pipeline] Streamed to <stdout>\n");
@@ -507,6 +553,7 @@ static int run(const Args & a) {
         qt_free(q);
         return 1;
     }
+    print_finish_reason();
 
     if (audio.n_samples > 0) {
         if (!audio_write_wav(out_path, audio.samples, audio.n_samples, audio.sample_rate, wav_fmt)) {

@@ -18,6 +18,7 @@
 
 #include "backend.h"
 #include "bpe.h"
+#include "eos-guard.h"
 #include "pipeline-tts.h"
 #include "qt-error.h"
 #include "speaker-encoder-extract.h"
@@ -255,8 +256,14 @@ void qt_init_default_params(struct qt_init_params * p) {
     p->stream_max_chunk_frames = QT_STREAM_MAX_CHUNK_FRAMES_DEFAULT;
 }
 
-void qt_tts_default_params(struct qt_tts_params * p) {
-    p->abi_version           = QT_ABI_VERSION;
+enum qt_status qt_tts_default_params_ex(struct qt_tts_params * p, size_t size) {
+    if (!p || (size != QT_TTS_PARAMS_ABI5_SIZE && size < sizeof(struct qt_tts_params))) {
+        qt_set_error("qt_tts_default_params_ex: unsupported params size");
+        return QT_STATUS_INVALID_PARAMS;
+    }
+    std::memset(p, 0, std::min(size, sizeof(struct qt_tts_params)));
+    const bool abi6 = size >= sizeof(struct qt_tts_params);
+    p->abi_version           = abi6 ? QT_ABI_VERSION : QT_ABI_MIN_VERSION;
     p->text                  = nullptr;
     p->lang                  = nullptr;
     p->instruct              = nullptr;
@@ -284,14 +291,21 @@ void qt_tts_default_params(struct qt_tts_params * p) {
     p->ref_spk_dim           = 0;
     p->ref_codes             = nullptr;
     p->ref_T                 = 0;
-    p->eos_guard_enabled             = false;
-    p->eos_guard_start_ratio         = 0.6F;
-    p->eos_guard_max_ratio           = 1.2F;
-    p->eos_guard_force_ratio         = 1.5F;
-    p->eos_guard_max_boost           = 25.0F;
-    p->eos_guard_voice_multiplier    = 1.5F;
-    p->eos_guard_min_expected_frames = 24;
-    p->eos_guard_frames_per_text_token = 4;
+    if (abi6) {
+        p->eos_guard_enabled               = false;
+        p->eos_guard_start_ratio           = 0.6F;
+        p->eos_guard_max_ratio             = 1.2F;
+        p->eos_guard_force_ratio           = 1.5F;
+        p->eos_guard_max_boost             = 25.0F;
+        p->eos_guard_voice_multiplier      = 1.5F;
+        p->eos_guard_min_expected_frames   = 24;
+        p->eos_guard_frames_per_text_token = 4;
+    }
+    return QT_STATUS_OK;
+}
+
+void qt_tts_default_params(struct qt_tts_params * p) {
+    (void) qt_tts_default_params_ex(p, QT_TTS_PARAMS_ABI5_SIZE);
 }
 
 int qt_num_codebooks(const struct qt_context * q) {
@@ -577,6 +591,7 @@ enum qt_status qt_extract_voice_ref(struct qt_context *   q,
         qt_set_error("qt_extract_voice_ref: q, ref_audio_24k or out is NULL");
         return QT_STATUS_INVALID_PARAMS;
     }
+
     if (ref_n_samples < TOKENIZER_HOP_LENGTH) {
         qt_set_error("qt_extract_voice_ref: ref_audio_24k too short for RVQ encode (%d samples, need at least %d)",
                      ref_n_samples, TOKENIZER_HOP_LENGTH);
@@ -647,6 +662,32 @@ enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params *
             qt_audio_free(out);
         }
         return QT_STATUS_INVALID_PARAMS;
+    }
+
+    if (params->max_new_tokens <= 0) {
+        qt_set_error("qt_synthesize: max_new_tokens must be positive");
+        if (out) {
+            qt_audio_free(out);
+        }
+        return QT_STATUS_INVALID_PARAMS;
+    }
+
+    if (params->abi_version >= 6 && params->eos_guard_enabled) {
+        EosGuardConfig guard;
+        guard.start_ratio      = params->eos_guard_start_ratio;
+        guard.max_ratio        = params->eos_guard_max_ratio;
+        guard.force_ratio      = params->eos_guard_force_ratio;
+        guard.max_boost        = params->eos_guard_max_boost;
+        guard.voice_multiplier = params->eos_guard_voice_multiplier;
+        guard.min_expected     = params->eos_guard_min_expected_frames;
+        guard.frames_per_text  = params->eos_guard_frames_per_text_token;
+        if (!eos_guard_config_valid(guard)) {
+            qt_set_error("qt_synthesize: invalid EOS guard configuration");
+            if (out) {
+                qt_audio_free(out);
+            }
+            return QT_STATUS_INVALID_PARAMS;
+        }
     }
 
     if (!params->text || !params->text[0]) {

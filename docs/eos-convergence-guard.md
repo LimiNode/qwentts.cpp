@@ -14,8 +14,9 @@ distribution is correct for every utterance:
 4. terminate with `QT_FINISH_EOS_FORCED` at `1.5 * expected` frames.
 
 The terminal categories are kept distinct in the C ABI:
-`QT_FINISH_EOS`, `QT_FINISH_MAX_TOKENS`, and `QT_FINISH_EOS_FORCED`.  A forced
-termination is not reported as natural EOS.
+`QT_FINISH_EOS`, `QT_FINISH_EOS_ASSISTED`, `QT_FINISH_MAX_TOKENS`, and
+`QT_FINISH_EOS_FORCED`. EOS sampled after a positive guard bias is reported as
+assisted; a hard cutoff is never reported as natural EOS.
 
 These defaults are an initial, configurable experiment.  They are based on
 the independently published `darkautism/qwen3-tts` implementation, which uses
@@ -32,24 +33,35 @@ on Talker steps 0 and 1; EOS is eligible from step 2 onward.
 
 ## Local CMP 50HX smoke
 
-The first bounded CUDA smoke was run after commit `142066a` with the Release
-`sm_75` build, Q8/Q8 1.7B Base GGUFs, and the exported ICL voice latents. The
-model and codec SHA-256 values were `4b9a33a236908dd9435a42f7a396e38038329d053b704342a6413c08544c4fda`
+The corrected bounded CUDA smoke was run at commit `e0bce55` with the Release
+`sm_75` binary (SHA-256 `6b20e3cff34cc0aa9c9150d4aac6e768ea7bd692e49b65e80a959dab26754209`),
+Q8/Q8 1.7B Base GGUFs, and the exported ICL voice latents. The model and codec
+SHA-256 values were `4b9a33a236908dd9435a42f7a396e38038329d053b704342a6413c08544c4fda`
 and `1883beeed99348fc35e23dd225e9082f93f6f8c109330a33d935baa8acdbfd94`.
-The target was the short Russian Kraftwerk sentence used by the historical
-EOS evidence; `max_new_tokens` was 2048 unless stated otherwise.
+The UTF-8 target bytes (SHA-256
+`8ebe62424bf837f6aea658a3affe955e55482f6117aa1b47300e24e6cf291399`)
+were redirected directly to stdin; `max_new_tokens` was 2048 unless stated
+otherwise.
+
+This supersedes the initial table from commit `142066a`. That run used
+`Get-Content | qwen-tts.exe` under Windows PowerShell 5.1, whose ASCII
+`$OutputEncoding` replaced the Cyrillic target with `?` before it reached the
+process. Replaying that exact historical input path still produces the same
+101-frame seed-1000 trajectory and now classifies it correctly as
+`eos_assisted`, but it is not Russian-text quality evidence.
 
 | Seed / policy | Result | Frames | Audio |
 |---|---|---:|---:|
-| 1000, guard enabled | natural EOS | 101 | 8.08 s |
-| 1002, guard enabled | natural EOS | 25 | 2.00 s |
-| 1006, guard enabled | natural EOS | 89 | 7.12 s |
-| 1008, guard enabled | natural EOS | 98 | 7.84 s |
+| 1000, guard enabled | assisted EOS | 75 | 6.00 s |
+| 1002, guard enabled | assisted EOS | 67 | 5.36 s |
+| 1006, guard enabled | assisted EOS | 66 | 5.28 s |
+| 1008, guard enabled | assisted EOS | 69 | 5.52 s |
 | 1008, guard disabled, `max_new=256` | max tokens | 256 | 20.48 s |
-| 1000, guard enabled, boost `0` | forced EOS | 171 | 13.68 s |
+| 1000, guard enabled, boost `0` | forced EOS | 126 | 10.08 s |
 
 This is a bounded regression smoke, not a quality or release-acceptance claim.
 It demonstrates that the opt-in policy prevents the observed 256-frame
 runaway on this exact Q8/CUDA setup and that forced termination is surfaced as
-`eos_forced`, while normal EOS remains `natural_eos`. The generated WAVs and
-stderr logs are intentionally kept outside the repository.
+`eos_forced`, while model-selected EOS remains distinguishable from
+`eos_assisted`. The generated WAVs and stderr logs are intentionally kept
+outside the repository.

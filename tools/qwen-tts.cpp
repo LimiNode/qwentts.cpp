@@ -118,6 +118,7 @@ static const char * finish_reason_name(enum qt_finish_reason reason) {
         case QT_FINISH_EOS:        return "natural_eos";
         case QT_FINISH_MAX_TOKENS: return "max_tokens";
         case QT_FINISH_EOS_FORCED: return "eos_forced";
+        case QT_FINISH_EOS_ASSISTED: return "eos_assisted";
         default:                   return "unknown";
     }
 }
@@ -427,7 +428,11 @@ static int run(const Args & a) {
     // Translate CLI args into the facade params. Seed -1 is forwarded
     // verbatim and resolved by qt_synthesize via std::random_device.
     qt_tts_params params;
-    qt_tts_default_params(&params);
+    if (qt_tts_default_params_ex(&params, sizeof(params)) != QT_STATUS_OK) {
+        fprintf(stderr, "[CLI] ERROR: cannot initialise synthesis parameters: %s\n", qt_last_error());
+        qt_free(q);
+        return 1;
+    }
     params.text                  = text;
     params.lang                  = a.lang;
     params.instruct              = a.instruct;

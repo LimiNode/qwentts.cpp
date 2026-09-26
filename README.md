@@ -169,7 +169,7 @@ iparams.codec_path  = "models/qwen-tokenizer-12hz-Q8_0.gguf";
 struct qt_context * q = qt_init(&iparams);
 
 struct qt_tts_params params;
-qt_tts_default_params(&params);
+qt_tts_default_params_ex(&params, sizeof(params));
 params.text = "Hello world.";
 params.lang = "English";
 

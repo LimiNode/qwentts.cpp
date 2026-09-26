@@ -747,6 +747,7 @@ struct TtsSlot {
     int                               sampler_target_step;
     bool                              eos_guard_enabled;
     EosGuardPlan                      eos_guard;
+    float                             eos_guard_applied_boost;
     std::vector<int32_t> prev_ids;        // previous frame codes [num_code_groups]
     const float *        prev_overlay;    // trailing text row or tts_pad row
     std::vector<float>   logits;          // pending c0 logits [vocab]
@@ -1071,6 +1072,7 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
     s.sampler_target_step  = sampler_target.step;
     s.eos_guard_enabled = false;
     s.eos_guard = {};
+    s.eos_guard_applied_boost = 0.0F;
     if (sampler_target.present) {
         if (!sampler_target.valid) {
             qt_log(QT_LOG_WARN, "[Pipeline] ignoring invalid sampler-target.txt; using frame=%d step=%d",
@@ -1241,20 +1243,15 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
         guard.voice_multiplier = params->eos_guard_voice_multiplier;
         guard.min_expected     = params->eos_guard_min_expected_frames;
         guard.frames_per_text  = params->eos_guard_frames_per_text_token;
-        if (!eos_guard_config_valid(guard)) {
-            qt_log(QT_LOG_WARN,
-                   "[Pipeline] ignoring invalid EOS guard configuration; expected monotonic finite ratios "
-                   "and positive duration parameters");
-        } else {
-            const bool has_voice = ref_spk_emb_ptr != NULL;
-            const int expected = eos_guard_expected_frames(s.prompt.N_text, has_voice, guard);
-            s.eos_guard_enabled = true;
-            s.eos_guard = eos_guard_plan(expected, guard);
-            qt_log(QT_LOG_INFO,
-                   "[Pipeline] EOS guard enabled: expected=%d soft=%d max=%d force=%d boost=%.2f",
-                   s.eos_guard.expected_frames, s.eos_guard.soft_start, s.eos_guard.max_boost_step,
-                   s.eos_guard.force_step, (double) s.eos_guard.max_boost);
-        }
+        const bool has_voice = ref_spk_emb_ptr != NULL;
+        const std::int64_t expected = eos_guard_expected_frames(s.prompt.N_text, has_voice, guard);
+        s.eos_guard_enabled = true;
+        s.eos_guard = eos_guard_plan(expected, guard, params->max_new_tokens);
+        qt_log(QT_LOG_INFO,
+               "[Pipeline] EOS guard enabled: expected=%lld soft=%lld max=%lld force=%lld boost=%.2f",
+               (long long) s.eos_guard.expected_frames, (long long) s.eos_guard.soft_start,
+               (long long) s.eos_guard.max_boost_step, (long long) s.eos_guard.force_step,
+               (double) s.eos_guard.max_boost);
     }
     s.prev_ids.assign((size_t) pt->num_code_groups, 0);
     s.all_codes.reserve((size_t) params->max_new_tokens);
@@ -1560,13 +1557,6 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
         }
         const struct qt_tts_params * p = s.job->params;
 
-        if (s.eos_guard_enabled && eos_guard_force(s.eos_guard, s.step)) {
-            qt_log(QT_LOG_INFO, "[Pipeline] EOS guard forced termination at step %d (slot %d)", s.step, i);
-            s.finished = true;
-            s.finish_reason = QT_FINISH_EOS_FORCED;
-            continue;
-        }
-
         // Cooperative cancellation, polled at every step. Granularity is
         // one AR frame = 1 / 12.5 Hz ~ 83 ms of audio, which is well
         // below any reasonable UX cancel latency target.
@@ -1574,6 +1564,13 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
             qt_log(QT_LOG_INFO, "[Pipeline] cancelled at step %d (slot %d)", s.step, i);
             s.finished   = true;
             s.fin_status = QT_STATUS_CANCELLED;
+            continue;
+        }
+
+        if (s.eos_guard_enabled && eos_guard_force(s.eos_guard, s.step)) {
+            qt_log(QT_LOG_INFO, "[Pipeline] EOS guard forced termination at step %d (slot %d)", s.step, i);
+            s.finished = true;
+            s.finish_reason = QT_FINISH_EOS_FORCED;
             continue;
         }
 
@@ -1586,9 +1583,8 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
         // it on the first step produces a misleading successful empty audio
         // result (and makes the worker fail only after the model call).
         suppress_initial_eos(s.logits.data(), vocab, codec_eos_id, s.step);
-        if (s.eos_guard_enabled) {
-            s.logits[(size_t) codec_eos_id] += eos_guard_boost(s.eos_guard, s.step);
-        }
+        s.eos_guard_applied_boost = s.eos_guard_enabled ? eos_guard_boost(s.eos_guard, s.step) : 0.0F;
+        s.logits[(size_t) codec_eos_id] += s.eos_guard_applied_boost;
         const bool diagnostic_frame = p->dump_dir && s.step < 128;
         std::vector<float> suppressed_logits;
         if (diagnostic_frame) {
@@ -1696,7 +1692,7 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
         if (c0 == codec_eos_id) {
             qt_log(QT_LOG_INFO, "[Pipeline] EOS at step %d, stopping (slot %d)", s.step, i);
             s.finished = true;
-            s.finish_reason = QT_FINISH_EOS;
+            s.finish_reason = s.eos_guard_applied_boost > 0.0F ? QT_FINISH_EOS_ASSISTED : QT_FINISH_EOS;
             continue;
         }
         s.pending_c0 = c0;

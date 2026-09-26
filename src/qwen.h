@@ -46,15 +46,11 @@ extern "C" {
 #endif
 
 // Struct ABI version. Incremented every time a public POD struct
-// changes layout. Callers fill `.abi_version = QT_ABI_VERSION` (or let
-// qwen_*_default_params set it). Entries that consume those structs
-// accept the closed range [QT_ABI_MIN_VERSION, QT_ABI_VERSION] and
-// reject anything outside it with a diagnostic rather than reading
-// fields at offsets the caller never wrote: above the ceiling the
-// struct comes from a newer header, below the floor it carries a
-// layout this build no longer addresses. Fields appended at the tail
-// keep older callers valid down to the floor, since their unwritten
-// tail is zero init and the lib gates on abi_version before reading it.
+// changes layout. Callers fill `.abi_version = QT_ABI_VERSION` (or use
+// qt_tts_default_params_ex for a current-size qt_tts_params). Entries that
+// consume those structs accept the closed range [QT_ABI_MIN_VERSION,
+// QT_ABI_VERSION] and reject anything outside it rather than reading fields
+// at offsets the caller never wrote.
 //
 // There is no separate semver triple. The runtime build identity is the
 // git short hash + commit date string returned by qt_version(); for
@@ -91,6 +87,7 @@ enum qt_finish_reason {
     QT_FINISH_EOS            = 1,
     QT_FINISH_MAX_TOKENS     = 2,
     QT_FINISH_EOS_FORCED     = 3,
+    QT_FINISH_EOS_ASSISTED   = 4,
 };
 
 // Returns the last error message produced on the calling thread by any
@@ -413,10 +410,21 @@ struct qt_tts_params {
     int   eos_guard_frames_per_text_token;
 };
 
-// Initialise to the standard defaults. Strings NULL, seed -1,
-// max_new_tokens 2048, do_sample true, temperature 0.9, top_k 50,
-// top_p 1.0, repetition_penalty 1.05, subtalker mirrors talker,
-// dump_dir NULL, cancel NULL, on_chunk NULL.
+// Size of the ABI-5 prefix of qt_tts_params. ABI-5 callers allocate exactly
+// this many bytes and must never be passed to a function that writes the ABI-6
+// tail without an explicit size.
+#define QT_TTS_PARAMS_ABI5_SIZE (offsetof(struct qt_tts_params, ref_T) + sizeof(int))
+
+// Initialise qt_tts_params using the caller-provided allocation size. The
+// size must be exactly ABI-5's prefix size or at least sizeof(qt_tts_params).
+// ABI-5 callers receive abi_version=5 and the guard tail is not touched;
+// current callers receive ABI-6 defaults. Returns INVALID_PARAMS for a NULL
+// pointer or an ambiguous intermediate size.
+QT_API enum qt_status qt_tts_default_params_ex(struct qt_tts_params * p, size_t size);
+
+// Legacy ABI-safe initializer. It writes only the ABI-5 prefix and therefore
+// never overruns a struct compiled from the ABI-5 header. New code should use
+// qt_tts_default_params_ex(p, sizeof *p) to opt into ABI-6 defaults.
 QT_API void qt_tts_default_params(struct qt_tts_params * p);
 
 // Number of RVQ codebooks (K) of the loaded codec. Pre-encoded ICL

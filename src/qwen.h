@@ -410,10 +410,14 @@ struct qt_tts_params {
     int   eos_guard_frames_per_text_token;
 };
 
-// Size of the ABI-5 prefix of qt_tts_params. ABI-5 callers allocate exactly
-// this many bytes and must never be passed to a function that writes the ABI-6
-// tail without an explicit size.
-#define QT_TTS_PARAMS_ABI5_SIZE (offsetof(struct qt_tts_params, ref_T) + sizeof(int))
+// Number of bytes through the last meaningful ABI-5 field of qt_tts_params.
+// This is a prefix length, not necessarily sizeof(the old ABI-5 struct): a
+// separately compiled ABI-5 type may include trailing padding after ref_T.
+#define QT_TTS_PARAMS_ABI5_PREFIX_SIZE (offsetof(struct qt_tts_params, ref_T) + sizeof(int))
+
+// Compatibility spelling retained for clients that adopted the original
+// ABI-6 preview. New code should use the explicit PREFIX name above.
+#define QT_TTS_PARAMS_ABI5_SIZE QT_TTS_PARAMS_ABI5_PREFIX_SIZE
 
 // Initialise qt_tts_params using the caller-provided allocation size. The
 // size must be exactly ABI-5's prefix size or at least sizeof(qt_tts_params).

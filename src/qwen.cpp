@@ -257,7 +257,7 @@ void qt_init_default_params(struct qt_init_params * p) {
 }
 
 enum qt_status qt_tts_default_params_ex(struct qt_tts_params * p, size_t size) {
-    if (!p || (size != QT_TTS_PARAMS_ABI5_SIZE && size < sizeof(struct qt_tts_params))) {
+    if (!p || (size != QT_TTS_PARAMS_ABI5_PREFIX_SIZE && size < sizeof(struct qt_tts_params))) {
         qt_set_error("qt_tts_default_params_ex: unsupported params size");
         return QT_STATUS_INVALID_PARAMS;
     }
@@ -305,7 +305,7 @@ enum qt_status qt_tts_default_params_ex(struct qt_tts_params * p, size_t size) {
 }
 
 void qt_tts_default_params(struct qt_tts_params * p) {
-    (void) qt_tts_default_params_ex(p, QT_TTS_PARAMS_ABI5_SIZE);
+    (void) qt_tts_default_params_ex(p, QT_TTS_PARAMS_ABI5_PREFIX_SIZE);
 }
 
 int qt_num_codebooks(const struct qt_context * q) {

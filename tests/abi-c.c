@@ -133,12 +133,12 @@ int main(void) {
         return 1;
     }
     if (qt_tts_default_params_ex(NULL, sizeof(params)) != QT_STATUS_INVALID_PARAMS ||
-        qt_tts_default_params_ex(&params, QT_TTS_PARAMS_ABI5_SIZE - 1) != QT_STATUS_INVALID_PARAMS) {
+        qt_tts_default_params_ex(&params, QT_TTS_PARAMS_ABI5_PREFIX_SIZE - 1) != QT_STATUS_INVALID_PARAMS) {
         fprintf(stderr, "[Probe] invalid default-initializer arguments were accepted\n");
         return 1;
     }
     {
-        unsigned char ambiguous[QT_TTS_PARAMS_ABI5_SIZE + 1];
+        unsigned char ambiguous[QT_TTS_PARAMS_ABI5_PREFIX_SIZE + 1];
         memset(ambiguous, 0xA5, sizeof(ambiguous));
         if (qt_tts_default_params_ex((struct qt_tts_params *) ambiguous, sizeof(ambiguous)) !=
             QT_STATUS_INVALID_PARAMS || ambiguous[0] != 0xA5 || ambiguous[sizeof(ambiguous) - 1] != 0xA5) {
@@ -155,7 +155,8 @@ int main(void) {
         unsigned char canary[8];
     } abi5;
     volatile size_t abi5_prefix_size = offsetof(struct qt_tts_params_abi5, ref_T) + sizeof(int);
-    if (abi5_prefix_size != QT_TTS_PARAMS_ABI5_SIZE) {
+    if (abi5_prefix_size != QT_TTS_PARAMS_ABI5_PREFIX_SIZE ||
+        QT_TTS_PARAMS_ABI5_SIZE != QT_TTS_PARAMS_ABI5_PREFIX_SIZE) {
         fprintf(stderr, "[Probe] frozen ABI-5 layout no longer matches the compatibility prefix\n");
         return 1;
     }

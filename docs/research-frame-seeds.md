@@ -126,3 +126,34 @@ its seed schedule. They do not themselves implement early-EOS recovery.
 CMP results and retained evidence identities are reported in
 [Bridge PR #331](https://github.com/LimiNode/qwen3-tts-bridge-cpp/pull/331).
 No RTX run or listening verdict is implied by this research target.
+
+## Selection timestamps and expanded corpus
+
+The probe's optional boolean `observe_decisions` defaults true; false installs
+no observer and performs no observer clock reads. This is probe-only, not a
+production setting. In research builds the internal observer timestamps the
+effective Talker selection after optional forcing and before predictor/codec
+work. It copies at most eight early decisions plus one later EOS into fixed
+storage. `decisions` records common-clock milliseconds, zero-based frame,
+sampled/effective tokens, forcing, EOS, serial and slot. Per-lane admission
+start/end times separate serial prefill stalls. Errors, cancellation and
+guard-forced termination do not fabricate sampled EOS events. There is no
+selector, PCM gate, state fork or public ABI change.
+
+`python tests/run_eos_corpus.py --help` prepares a frozen 142-group N=1 plan;
+only `--execute` launches it, always into a new output directory. It accepts
+exact previously prepared Kraftwerk inputs, explicit talker/codec/probe paths,
+dependency directories and the CMP 50HX UUID. Eight RU/EN texts each use seeds
+64..79 plus repeat64; six original-text controls use seeds 2/14/42 twice.
+Of the 128 corpus pairs, 32 were already in the earlier baseline matrix and
+96 were not; these are not 128 independent held-out cases. Four short-valid
+texts are excluded from the non-short duration proxy.
+
+Each model has a 900-second runner budget, 600-second child watchdog and
+60-second group deadline; the caller bounds a combined multi-model study.
+It retains flushed results/WAVs on later failure and records every planned
+disposition. Frame tracing is OFF unless `--trace-frames` is requested;
+`--timing-off` disables the observer for matched transparency controls.
+Old probes without observation metadata are rejected as timing evidence.
+Callback/selection wall times are not physical playback or Bridge commit
+measurements. Raw duration and natural EOS still do not establish coverage.

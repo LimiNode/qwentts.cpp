@@ -66,11 +66,77 @@ struct Chunk { double ms; size_t samples; };
 struct Step { double ms; int active; size_t retired; };
 struct Lane {
     Clock::time_point start, deadline;
+    double admission_started_ms = 0.0;
+    double admission_completed_ms = 0.0;
     std::vector<float> pcm;
     std::vector<Chunk> chunks;
+    std::array<TtsResearchDecision, TTS_RESEARCH_MAX_DECISIONS> decisions{};
+    size_t decision_count = 0;
+    bool decision_overflow = false;
     bool invalid_pcm = false;
     bool capacity_exceeded = false;
 };
+struct DecisionCapture {
+    std::array<Lane, 2> * observations;
+    const std::array<TtsJob, 2> * jobs;
+    size_t lanes;
+    bool unknown_job = false;
+};
+
+void on_decision(const TtsResearchDecision & decision, void * pointer) noexcept {
+    auto & capture = *static_cast<DecisionCapture *>(pointer);
+    for (size_t index = 0; index < capture.lanes; ++index) {
+        if (decision.job != &(*capture.jobs)[index]) continue;
+        auto & lane = (*capture.observations)[index];
+        if (lane.decision_count == lane.decisions.size()) {
+            lane.decision_overflow = true;
+            return;
+        }
+        lane.decisions[lane.decision_count++] = decision;
+        return;
+    }
+    capture.unknown_job = true;
+}
+
+void observer_self_test() {
+    std::array<Lane, 2> observations;
+    std::array<TtsJob, 2> jobs{};
+    DecisionCapture capture{&observations, &jobs, 2};
+    const auto start = Clock::time_point{};
+    for (int frame = 0; frame <= 30; ++frame) {
+        const bool eos = frame == 30;
+        if (tts_research_wants_decision(frame, eos)) {
+            on_decision({start + std::chrono::milliseconds(frame), &jobs[1],
+                         7, 1, frame, eos ? 2048 : 10, 10, false, eos}, &capture);
+        }
+    }
+    const auto & late = observations[1];
+    if (late.decision_count != TTS_RESEARCH_MAX_DECISIONS || late.decision_overflow ||
+        late.decisions[7].frame != 7 || late.decisions[8].frame != 30 ||
+        !late.decisions[8].eos || late.decisions[8].job != &jobs[1] ||
+        late.decisions[8].selected_at - start != std::chrono::milliseconds(30) ||
+        observations[0].decision_count != 0 || !late.pcm.empty() || !late.chunks.empty()) {
+        throw std::runtime_error("bounded observer/routing contract failed");
+    }
+    for (int frame = 0; frame <= 3; ++frame) {
+        on_decision({start, &jobs[0], 9, 0, frame, frame == 3 ? 2048 : 5,
+                     5, frame < 2, frame == 3}, &capture);
+    }
+    if (observations[0].decision_count != 4 || !observations[0].decisions[3].eos ||
+        !observations[0].decisions[0].forced || observations[0].decision_overflow ||
+        capture.unknown_job || tts_research_wants_decision(-1, true) ||
+        tts_research_wants_decision(8, false)) {
+        throw std::runtime_error("early EOS/forced-token observer contract failed");
+    }
+    on_decision(late.decisions[8], &capture);
+    TtsJob unknown{};
+    on_decision({start, &unknown, 0, 0, 0, 0, 0, false, false}, &capture);
+    if (!observations[1].decision_overflow || !capture.unknown_job ||
+        observations[1].decision_count != TTS_RESEARCH_MAX_DECISIONS) {
+        throw std::runtime_error("observer overflow/unknown-job detection failed");
+    }
+    std::fprintf(stderr, "research observer contract passed (no model/backend loaded)\n");
+}
 double elapsed(Clock::time_point start) {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 }
@@ -98,6 +164,10 @@ bool on_audio(const float * samples, int count, void * pointer) {
 
 int main(int argc, char ** argv) {
     try {
+        if (argc == 2 && std::strcmp(argv[1], "--self-test") == 0) {
+            observer_self_test();
+            return 0;
+        }
         if (argc != 3) throw std::runtime_error("usage: eos-research-probe manifest.json NEW-output-dir");
         const auto manifest = read_bytes(argv[1], 1024 * 1024);
         JsonDoc doc(yyjson_read(manifest.data(), manifest.size(), 0), yyjson_doc_free);
@@ -120,6 +190,9 @@ int main(int argc, char ** argv) {
         const int deadline_ms = integer_field(root, "deadline_ms", 1, 120000);
         const int max_chunk = integer_field(root, "stream_max_chunk_frames", 1, 8);
         if (max_chunk != 1 && max_chunk != 2 && max_chunk != 4 && max_chunk != 8) throw std::runtime_error("invalid chunk cap");
+        yyjson_val * observe_value = yyjson_obj_get(root, "observe_decisions");
+        if (observe_value && !yyjson_is_bool(observe_value)) throw std::runtime_error("observe_decisions must be boolean");
+        const bool observe_decisions = !observe_value || yyjson_get_bool(observe_value);
         yyjson_val * groups = yyjson_obj_get(root, "groups");
         if (!yyjson_is_arr(groups) || yyjson_arr_size(groups) == 0 || yyjson_arr_size(groups) > 256) {
             throw std::runtime_error("expected 1..256 groups");
@@ -160,6 +233,8 @@ int main(int argc, char ** argv) {
             std::array<qt_tts_params, 2> params{};
             std::array<qt_audio, 2> audio{};
             std::array<TtsJob, 2> jobs{};
+            DecisionCapture capture{&observations, &jobs, lanes};
+            tts_engine_set_research_observer(owner.engine, observe_decisions ? on_decision : nullptr, &capture);
             const auto start = Clock::now();
             for (size_t lane = 0; lane < lanes; ++lane) {
                 yyjson_val * seed = yyjson_arr_get(seeds, lane);
@@ -176,7 +251,9 @@ int main(int argc, char ** argv) {
                 p.on_chunk = on_audio; p.on_chunk_user_data = &observations[lane];
                 p.cancel = cancelled; p.cancel_user_data = &observations[lane];
                 jobs[lane].params = &p; jobs[lane].resolved_seed = p.seed; jobs[lane].out = &audio[lane];
+                observations[lane].admission_started_ms = elapsed(start);
                 if (!tts_engine_admit(owner.engine, &jobs[lane])) throw std::runtime_error("admission failed: " + jobs[lane].error);
+                observations[lane].admission_completed_ms = elapsed(start);
             }
             if (tts_engine_active(owner.engine) != static_cast<int>(lanes)) throw std::runtime_error("not co-admitted");
             const double admitted_ms = elapsed(start);
@@ -187,6 +264,7 @@ int main(int argc, char ** argv) {
                 steps.push_back({elapsed(start), tts_engine_active(owner.engine), retired.size()});
             }
             const double group_total_ms = elapsed(start);
+            tts_engine_set_research_observer(owner.engine, nullptr, nullptr);
             if (retired.size() != lanes) throw std::runtime_error("terminal count mismatch");
             for (size_t lane = 0; lane < lanes; ++lane) {
                 const auto & observation = observations[lane];
@@ -204,11 +282,27 @@ int main(int argc, char ** argv) {
                     << ",\"status\":" << job.status << ",\"finish_reason\":" << job.finish_reason
                     << ",\"frames\":" << job.n_frames << ",\"samples\":" << observation.pcm.size()
                     << ",\"admitted_together\":" << lanes << ",\"admitted_ms\":" << admitted_ms
+                    << ",\"admission_started_ms\":" << observation.admission_started_ms
+                    << ",\"admission_completed_ms\":" << observation.admission_completed_ms
                     << ",\"prefill_ms\":" << job.prefill_ms << ",\"total_ms\":" << job.total_ms
                     << ",\"group_total_ms\":" << group_total_ms
+                    << ",\"decision_observation_enabled\":" << (observe_decisions ? "true" : "false")
+                    << ",\"decision_capture_invalid\":" << (capture.unknown_job || observation.decision_overflow ? "true" : "false")
                     << ",\"invalid_pcm\":" << (observation.invalid_pcm ? "true" : "false")
                     << ",\"capacity_exceeded\":" << (observation.capacity_exceeded ? "true" : "false")
-                    << ",\"chunks\":[";
+                    << ",\"decisions\":[";
+                for (size_t index = 0; index < observation.decision_count; ++index) {
+                    if (index) results << ',';
+                    const auto & decision = observation.decisions[index];
+                    const double decision_ms =
+                        std::chrono::duration<double, std::milli>(decision.selected_at - start).count();
+                    results << "{\"ms\":" << decision_ms << ",\"frame\":" << decision.frame
+                            << ",\"token\":" << decision.token << ",\"sampled_token\":" << decision.sampled_token
+                            << ",\"forced\":" << (decision.forced ? "true" : "false")
+                            << ",\"eos\":" << (decision.eos ? "true" : "false")
+                            << ",\"serial\":" << decision.serial << ",\"slot\":" << decision.slot << '}';
+                }
+                results << "],\"chunks\":[";
                 for (size_t index = 0; index < observation.chunks.size(); ++index) {
                     if (index) results << ',';
                     results << "{\"ms\":" << observation.chunks[index].ms << ",\"samples\":" << observation.chunks[index].samples << '}';

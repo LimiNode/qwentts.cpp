@@ -225,8 +225,10 @@ link_ggml_backends(test-abi-c)
 enable_testing()
 if(QWEN_RESEARCH_FRAME_SEEDS)
     add_executable(eos-research-probe tests/eos_research_probe.cpp)
+    target_compile_definitions(eos-research-probe PRIVATE QWEN_RESEARCH_FRAME_SEEDS=1)
     target_link_libraries(eos-research-probe PRIVATE qwen-core yyjson)
     link_ggml_backends(eos-research-probe)
+    add_test(NAME eos_research_observer_contract COMMAND eos-research-probe --self-test)
 endif()
 add_executable(test-frame-seed-contract tests/frame_seed_contract.cpp)
 target_include_directories(test-frame-seed-contract PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -265,6 +267,9 @@ add_test(NAME sampling_graph_contract COMMAND test-sampling-graph-contract)
 # reference implementation over fixed edge-case vectors.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
+    add_test(NAME eos_research_corpus_python
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_eos_corpus.py)
     add_test(NAME eos_research_runner_python
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_eos_research_runner.py)

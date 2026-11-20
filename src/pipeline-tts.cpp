@@ -781,6 +781,10 @@ struct TtsEngine {
     BPETokenizer *       tok;
     std::vector<TtsSlot> slots;
     int64_t              next_serial;
+#ifdef QWEN_RESEARCH_FRAME_SEEDS
+    TtsResearchDecisionObserver research_observer = nullptr;
+    void * research_observer_user = nullptr;
+#endif
 
     // Shared codec streaming ramp, lockstep over the compacted lanes
     // [0, codec_M): every streaming slot accumulates into the same
@@ -798,6 +802,13 @@ struct TtsEngine {
     std::vector<float>   codec_audio;      // [lane][8 * hop] flush output
     std::vector<float *> codec_outs;       // per lane out or NULL
 };
+
+#ifdef QWEN_RESEARCH_FRAME_SEEDS
+void tts_engine_set_research_observer(TtsEngine * e, TtsResearchDecisionObserver observer, void * user) {
+    e->research_observer = observer;
+    e->research_observer_user = user;
+}
+#endif
 
 TtsEngine * tts_engine_new(PipelineTTS * pt, BPETokenizer * tok) {
     TtsEngine * e      = new TtsEngine();
@@ -1660,10 +1671,24 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                                (s.step >= 0 && (size_t) s.step < s.forced_talker_history.size());
         if (forced_frame) {
             c0 = s.forced_talker_frames[(size_t) s.step][0];
+        } else if (forced_c0) {
+            c0 = s.forced_talker_history[(size_t) s.step];
+        }
+
+#ifdef QWEN_RESEARCH_FRAME_SEEDS
+        if (e->research_observer && tts_research_wants_decision(s.step, c0 == codec_eos_id)) {
+            // Timestamp effective selection before logging or predictor/codec
+            // work. The observer copies this bounded event; no device readback.
+            const TtsResearchDecision decision{
+                std::chrono::steady_clock::now(), s.job, s.serial, i, s.step,
+                c0, sampled_c0, forced_c0, c0 == codec_eos_id};
+            e->research_observer(decision, e->research_observer_user);
+        }
+#endif
+        if (forced_frame) {
             qt_log(QT_LOG_DEBUG, "[ARTrace] forced Talker frame c0 step=%d sampled=%d forced=%d", s.step,
                    sampled_c0, c0);
         } else if (forced_c0) {
-            c0 = s.forced_talker_history[(size_t) s.step];
             qt_log(QT_LOG_DEBUG, "[ARTrace] forced Talker c0 step=%d sampled=%d forced=%d", s.step, sampled_c0,
                    c0);
         }

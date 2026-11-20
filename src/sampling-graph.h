@@ -190,6 +190,8 @@ static inline struct ggml_tensor * sampler_tail_build(struct ggml_context * gctx
     // separate greedy contract explicitly instead of relying on candidate
     // ordering: u < 0 is the private greedy sentinel.
     struct ggml_tensor * greedy_mask = ggml_step(gctx, ggml_scale(gctx, u, -1.0f));
+    // Token ids are [N], while the broadcast uniform view is [1, N].
+    greedy_mask = ggml_reshape_1d(gctx, greedy_mask, N);
     struct ggml_tensor * idx_1d      = ggml_reshape_1d(gctx, idx, N);
     struct ggml_tensor * idx_f       = ggml_cast(gctx, idx_1d, GGML_TYPE_F32);
     struct ggml_tensor * argmax_f    = ggml_cast(gctx, ggml_argmax(gctx, logits), GGML_TYPE_F32);
@@ -197,7 +199,7 @@ static inline struct ggml_tensor * sampler_tail_build(struct ggml_context * gctx
         gctx, idx_f, ggml_mul(gctx, greedy_mask, ggml_sub(gctx, argmax_f, idx_f)));
     if (sp->forced_enabled) {
         struct ggml_tensor * forced =
-            ggml_view_2d(gctx, sp->forced, 1, N, sp->forced->nb[1], (size_t) step_idx * sp->forced->nb[1]);
+            ggml_view_1d(gctx, sp->forced, N, (size_t) step_idx * sp->forced->nb[1]);
         struct ggml_tensor * forced_mask = ggml_step(gctx, forced);
         selected_f = ggml_add(gctx, selected_f, ggml_mul(gctx, forced_mask, ggml_sub(gctx, forced, selected_f)));
     }

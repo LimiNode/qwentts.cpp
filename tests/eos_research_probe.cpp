@@ -128,7 +128,8 @@ int main(int argc, char ** argv) {
         const std::filesystem::path destination(argv[2]);
         if (!std::filesystem::create_directory(destination)) throw std::runtime_error("destination exists");
         std::ofstream results(destination / "results.jsonl", std::ios::binary);
-        if (!results) throw std::runtime_error("cannot open results");
+        std::ofstream errors(destination / "errors.log", std::ios::binary);
+        if (!results || !errors) throw std::runtime_error("cannot open results/errors");
         Owner owner;
         owner.bp = backend_init("Research");
         if (!owner.bp.backend || !owner.bp.has_gpu) throw std::runtime_error("research run requires selected GPU");
@@ -190,6 +191,10 @@ int main(int argc, char ** argv) {
             for (size_t lane = 0; lane < lanes; ++lane) {
                 const auto & observation = observations[lane];
                 const auto & job = jobs[lane];
+                if (!job.error.empty()) {
+                    errors << "group=" << group_index << " lane=" << lane << " error=" << job.error << '\n';
+                    errors.flush();
+                }
                 const auto filename = "group-" + std::to_string(group_index) + "-lane-" + std::to_string(lane) + ".f32";
                 std::ofstream pcm(destination / filename, std::ios::binary);
                 pcm.write(reinterpret_cast<const char *>(observation.pcm.data()),

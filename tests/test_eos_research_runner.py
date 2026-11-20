@@ -3,6 +3,8 @@
 import importlib.util
 import json
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -68,6 +70,25 @@ class RunnerContract(unittest.TestCase):
             self.assertEqual(json.loads(output.read_text()), result)
             with self.assertRaises(FileExistsError):
                 runner.write_json(output, result)
+
+    def test_watchdog_kills_independent_child(self):
+        with tempfile.TemporaryDirectory(dir=self.temp_root) as folder:
+            receipt = Path(folder) / "watchdog.json"
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"]
+            )
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    runner.wait_for_probe(child, 0.1, receipt)
+                self.assertIsNotNone(child.poll())
+                result = json.loads(
+                    receipt.with_name("watchdog-termination.json").read_text()
+                )
+                self.assertTrue(result["termination_observed_within_15s"])
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=15)
 
 
 if __name__ == "__main__":

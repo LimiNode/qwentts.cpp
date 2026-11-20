@@ -53,6 +53,26 @@ def write_json(path: Path, value: object) -> None:
         stream.write("\n")
 
 
+def wait_for_probe(process: subprocess.Popen, timeout: float, watchdog: Path) -> int:
+    """Bound an owned child independently of engine threads/device progress."""
+    try:
+        return process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        write_json(watchdog, {"pid": process.pid, "timeout": True})
+        # The probe launches no children; no external kill helper is needed.
+        process.kill()
+        observed = False
+        try:
+            process.wait(timeout=15)
+            observed = True
+        finally:
+            write_json(
+                watchdog.with_name(watchdog.stem + "-termination.json"),
+                {"pid": process.pid, "termination_observed_within_15s": observed},
+            )
+        raise
+
+
 def dump_body(path: Path) -> tuple[tuple[int, ...], bytes]:
     if not 8 <= path.stat().st_size <= 1024 * 1024:
         raise ValueError("retained dump outside bounded size")
@@ -444,18 +464,9 @@ def main() -> None:
             process = subprocess.Popen(
                 command, stdout=stdout, stderr=stderr, env=env, cwd=args.probe.parent
             )
-            try:
-                status = process.wait(timeout=min(240, remaining))
-            except subprocess.TimeoutExpired:
-                write_json(
-                    args.output / f"{name}-watchdog.json",
-                    {"pid": process.pid, "timeout": True},
-                )
-                # This probe launches no children. Terminate the owned process
-                # directly so the watchdog does not depend on a helper process.
-                process.kill()
-                process.wait(timeout=15)
-                raise
+            status = wait_for_probe(
+                process, min(240, remaining), args.output / f"{name}-watchdog.json"
+            )
         if status:
             write_json(
                 args.output / f"{name}-process-failure.json",

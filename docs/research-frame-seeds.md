@@ -82,3 +82,47 @@ complete early frames when QWEN_TTS_FULL_AR_TRACE is set.
 Two pre-admitted identical-prefix slots duplicate prefill and codec work.
 They establish neither an efficient generation fork nor zero added TTFA.
 Changing a lane's future seed does not prove that its speech is complete.
+
+## Bounded runner and offline analysis
+
+`python tests/run_eos_research.py --help` exposes the explicit model,
+conditioning-dump, registry, discovery-analysis, executable, GPU UUID and
+new-output paths. It uses only the standard library. The runner is purposely
+specific to the retained 2048-dimensional, 226-frame Kraftwerk RU-stress case;
+it rejects other input shapes rather than silently substituting conditioning.
+It freezes a plan before GPU work, preserves exact UTF-8 reference whitespace,
+and records source, runtime, model and prepared-input hashes.
+
+The prespecified matrix contains 288 lane observations, including repeats.
+It includes the known seeds 2/4/14/21/31, healthy controls, four input texts,
+independent seeds 64..71, self-seed prefix replays, and genuine batched pairs.
+Repeats are not additional independent seeds. The 12-frame duration proxy
+does not apply to the legitimate short input `Да!` and is not a speech label.
+Every successful or short generation retains raw f32 PCM and a listening WAV.
+Process aborts and watchdogs retain their logs/receipts and are not scored as
+successful recovery. No output directory or WAV is overwritten.
+
+An external process watchdog bounds each child to 240 seconds; the direct
+probe has no child processes and is terminated directly on timeout. One run
+has a 1,800-second total budget and requires at least 2 GiB free disk.
+The cooperative group deadline does not replace that independent watchdog.
+
+`python tests/analyze_eos_research.py MATRIX_DIR NEW_JSON` verifies raw PCM
+hashes, compares matched first-occurrence seeds, reports repeated-seed
+determinism separately, and checks full 16-codebook prefix/first-PCM equality.
+It retains incomplete runs as unscored rather than making them successes.
+Fourth-step completion versus the first audio-chunk budget is hypothetical;
+there is no live branch selector or physical underrun measurement.
+Use `--self-test` for model-free offline analysis tests.
+
+The actual experiment exposed an existing N>1 predictor sampler shape bug.
+The corrected greedy path uses a contiguous `[N]` uniform/mask, matching
+selected IDs, and forced rows use their actual contiguous slot stride. Forced
+token zero is valid; only -1 is the no-override sentinel. Mixed N=1/2/3 CPU
+tests cover stochastic, greedy and zero/nonzero forced tokens at step 1.
+These corrections change neither the ordinary sampler's probabilities nor
+its seed schedule. They do not themselves implement early-EOS recovery.
+
+CMP results and retained evidence identities are reported in
+[Bridge PR #331](https://github.com/LimiNode/qwen3-tts-bridge-cpp/pull/331).
+No RTX run or listening verdict is implied by this research target.

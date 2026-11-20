@@ -147,6 +147,11 @@ target_include_directories(qwen-core PUBLIC src)
 target_link_libraries(qwen-core PUBLIC ggml)
 link_ggml_backends(qwen-core)
 
+option(QWEN_RESEARCH_FRAME_SEEDS "Enable experimental per-codec-frame Philox key schedules" OFF)
+if(QWEN_RESEARCH_FRAME_SEEDS)
+    target_compile_definitions(qwen-core PRIVATE QWEN_RESEARCH_FRAME_SEEDS=1)
+endif()
+
 # Public shared library for ABI consumers (Python ctypes, Rust bindgen,
 # Go cgo). Opt-in : -DQWEN_SHARED=ON at configure time. Exports only
 # the QT_API-marked symbols ; every internal pipeline_* / backend_*
@@ -166,6 +171,9 @@ if(QWEN_SHARED)
         VISIBILITY_INLINES_HIDDEN ON
     )
     link_ggml_backends(qwen)
+    if(QWEN_RESEARCH_FRAME_SEEDS)
+        target_compile_definitions(qwen PRIVATE QWEN_RESEARCH_FRAME_SEEDS=1)
+    endif()
 endif()
 
 # quantize: GGUF requantizer (BF16 -> K-quants), shared policy with
@@ -215,6 +223,22 @@ link_ggml_backends(test-abi-c)
 # Model-free sampling contract regression: EOS is masked only for the first
 # codec frame and remains eligible on subsequent generation steps.
 enable_testing()
+if(QWEN_RESEARCH_FRAME_SEEDS)
+    add_executable(eos-research-probe tests/eos_research_probe.cpp)
+    target_compile_definitions(eos-research-probe PRIVATE QWEN_RESEARCH_FRAME_SEEDS=1)
+    target_link_libraries(eos-research-probe PRIVATE qwen-core yyjson)
+    link_ggml_backends(eos-research-probe)
+    add_test(NAME eos_research_observer_contract COMMAND eos-research-probe --self-test)
+endif()
+add_executable(test-frame-seed-contract tests/frame_seed_contract.cpp)
+target_include_directories(test-frame-seed-contract PRIVATE ${CMAKE_SOURCE_DIR}/src)
+if(MSVC)
+    target_compile_options(test-frame-seed-contract PRIVATE /W4 /WX)
+else()
+    target_compile_options(test-frame-seed-contract PRIVATE -Wall -Wextra -Werror -pedantic)
+endif()
+add_test(NAME frame_seed_contract COMMAND test-frame-seed-contract)
+
 add_executable(test-sampling-contract tests/sampling-contract.cpp)
 target_include_directories(test-sampling-contract PRIVATE
     ${CMAKE_SOURCE_DIR}/src
@@ -243,6 +267,15 @@ add_test(NAME sampling_graph_contract COMMAND test-sampling-graph-contract)
 # reference implementation over fixed edge-case vectors.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
+    add_test(NAME eos_research_corpus_python
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_eos_corpus.py)
+    add_test(NAME eos_research_runner_python
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_eos_research_runner.py)
+    add_test(NAME eos_research_analysis_python
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/analyze_eos_research.py --self-test)
     add_test(NAME sampling_contract_python_parity
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/verify-sampling-parity.py

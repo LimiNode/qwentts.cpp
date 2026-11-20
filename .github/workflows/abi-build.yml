@@ -20,6 +20,11 @@ jobs:
         run: |
           ./build/test-abi-c
           ctest --test-dir build --output-on-failure -R '^(sampling(_graph)?_contract(_python_parity)?|sampler_diagnostic_python|first_mismatch_python|eos_guard_contract)$'
+      - name: Build and test opt-in research seam
+        run: |
+          cmake -S . -B build -DQWEN_RESEARCH_FRAME_SEEDS=ON
+          cmake --build build --target eos-research-probe test-frame-seed-contract --parallel 2
+          ctest --test-dir build --output-on-failure -R '^(frame_seed_contract|eos_research_observer_contract|eos_research_(runner|analysis|corpus)_python)$'
 
   windows-msvc-shared:
     runs-on: windows-latest
@@ -38,3 +43,11 @@ jobs:
         run: |
           .\build\Release\test-abi-c.exe
           ctest --test-dir build -C Release --output-on-failure -R '^(sampling(_graph)?_contract(_python_parity)?|sampler_diagnostic_python|first_mismatch_python|eos_guard_contract)$'
+      - name: Build and test opt-in research seam
+        shell: pwsh
+        run: |
+          cmake -S . -B build -DQWEN_RESEARCH_FRAME_SEEDS=ON
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --config Release --target eos-research-probe test-frame-seed-contract --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ctest --test-dir build -C Release --output-on-failure -R '^(frame_seed_contract|eos_research_observer_contract|eos_research_(runner|analysis|corpus)_python)$'

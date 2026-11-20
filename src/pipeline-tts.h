@@ -25,6 +25,9 @@
 #include "talker-weights.h"
 
 #include <cstdint>
+#ifdef QWEN_RESEARCH_FRAME_SEEDS
+#include <chrono>
+#endif
 #include <string>
 #include <vector>
 
@@ -262,6 +265,39 @@ struct TtsJob {
 // owns the backend, which is the facade worker in qwen.cpp holding one
 // long lived engine per handle.
 struct TtsEngine;
+
+#ifdef QWEN_RESEARCH_FRAME_SEEDS
+// Internal observational seam, absent from ordinary builds and the public ABI.
+// The effective token is captured after optional prefix forcing and before
+// predictor/codec work. Cancellation, failed sampling and guard-forced stops
+// do not select a token and therefore do not manufacture a decision event.
+struct TtsResearchDecision {
+    std::chrono::steady_clock::time_point selected_at;
+    const TtsJob * job;
+    int64_t serial;
+    int slot;
+    int frame;          // zero-based next codec frame, including the EOS step
+    int token;          // effective Talker token, after optional prefix forcing
+    int sampled_token;  // original stochastic/greedy result before forcing
+    bool forced;
+    bool eos;
+};
+
+constexpr int TTS_RESEARCH_EARLY_DECISIONS = 8;
+constexpr size_t TTS_RESEARCH_MAX_DECISIONS = TTS_RESEARCH_EARLY_DECISIONS + 1;
+
+inline bool tts_research_wants_decision(int frame, bool eos) noexcept {
+    return frame >= 0 && (frame < TTS_RESEARCH_EARLY_DECISIONS || eos);
+}
+
+using TtsResearchDecisionObserver = void (*)(const TtsResearchDecision &, void *) noexcept;
+
+// Engine-thread only. Set before admission, clear after all jobs retire.
+// Callback must not allocate, block, log, throw or call back into the engine.
+// A null observer costs no clock read; at most eight early selections plus
+// one later EOS are emitted for each job. This installs no live selector.
+void tts_engine_set_research_observer(TtsEngine * e, TtsResearchDecisionObserver observer, void * user);
+#endif
 
 TtsEngine * tts_engine_new(PipelineTTS * pt, BPETokenizer * tok);
 void        tts_engine_free(TtsEngine * e);

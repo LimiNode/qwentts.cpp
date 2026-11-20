@@ -4,6 +4,10 @@
 
 #include "pipeline-tts.h"
 #include "eos-guard.h"
+#ifdef QWEN_RESEARCH_FRAME_SEEDS
+#include "research_frame_seed.h"
+#include "research_prefix.h"
+#endif
 
 #include "audio-io.h"
 #include "bpe.h"
@@ -739,6 +743,10 @@ struct TtsSlot {
     // AR state, one to one with the single sequence loop.
     int                  step;            // frames emitted so far
     int64_t              subseq_counter;  // Philox subsequence cursor
+#ifdef QWEN_RESEARCH_FRAME_SEEDS
+    ResearchFrameSeedSchedule frame_seed_schedule;
+    int64_t                   frame_seed_current;
+#endif
     std::vector<int32_t> talker_history;  // emitted c0, feeds repetition penalty
     std::vector<int32_t> forced_talker_history; // diagnostic replay override
     std::vector<std::vector<int32_t>> forced_talker_frames; // complete frame replay
@@ -773,6 +781,10 @@ struct TtsEngine {
     BPETokenizer *       tok;
     std::vector<TtsSlot> slots;
     int64_t              next_serial;
+#ifdef QWEN_RESEARCH_FRAME_SEEDS
+    TtsResearchDecisionObserver research_observer = nullptr;
+    void * research_observer_user = nullptr;
+#endif
 
     // Shared codec streaming ramp, lockstep over the compacted lanes
     // [0, codec_M): every streaming slot accumulates into the same
@@ -790,6 +802,13 @@ struct TtsEngine {
     std::vector<float>   codec_audio;      // [lane][8 * hop] flush output
     std::vector<float *> codec_outs;       // per lane out or NULL
 };
+
+#ifdef QWEN_RESEARCH_FRAME_SEEDS
+void tts_engine_set_research_observer(TtsEngine * e, TtsResearchDecisionObserver observer, void * user) {
+    e->research_observer = observer;
+    e->research_observer_user = user;
+}
+#endif
 
 TtsEngine * tts_engine_new(PipelineTTS * pt, BPETokenizer * tok) {
     TtsEngine * e      = new TtsEngine();
@@ -967,6 +986,14 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
         return tts_admit_fail(job, QT_STATUS_INVALID_PARAMS);
     }
 
+#ifdef QWEN_RESEARCH_FRAME_SEEDS
+    ResearchFrameSeedSchedule frame_seed_schedule;
+    if (!research_frame_seed_parse(std::getenv("QWEN_RESEARCH_FRAME_SEED_POLICY"), &frame_seed_schedule)) {
+        qt_set_error("tts_engine_admit: invalid QWEN_RESEARCH_FRAME_SEED_POLICY (schedule v1)");
+        return tts_admit_fail(job, QT_STATUS_INVALID_PARAMS);
+    }
+#endif
+
     const std::string instruct = params->instruct ? params->instruct : "";
     const std::string speaker  = params->speaker ? params->speaker : "";
     const std::string ref_text = params->ref_text ? params->ref_text : "";
@@ -1056,6 +1083,17 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
     s.ref_codes_T      = 0;
     s.step             = 0;
     s.subseq_counter   = 0;
+#ifdef QWEN_RESEARCH_FRAME_SEEDS
+    s.frame_seed_schedule = frame_seed_schedule;
+    s.frame_seed_current = job->resolved_seed;
+    qt_log(QT_LOG_INFO, "[ResearchJob] serial=%lld seed=%lld", (long long) s.serial,
+           (long long) job->resolved_seed);
+    if (frame_seed_schedule.mode != ResearchFrameSeedMode::Baseline) {
+        qt_log(QT_LOG_INFO, "[FrameSeed] version=1 serial=%lld policy=%s boundary=%u base=%016llx",
+               (long long) s.serial, research_frame_seed_mode_name(frame_seed_schedule.mode),
+               (unsigned int) frame_seed_schedule.frames, (unsigned long long) job->resolved_seed);
+    }
+#endif
     s.prev_overlay     = NULL;
     s.pending_c0       = -1;
     s.has_frame        = false;
@@ -1096,6 +1134,18 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
         }
     }
     s.forced_talker_frames = load_forced_talker_frames(params->dump_dir);
+#ifdef QWEN_RESEARCH_FRAME_SEEDS
+    if (const char * prefix = std::getenv("QWEN_RESEARCH_PREFIX_FILE")) {
+        if (params->dump_dir || !research_prefix_load(prefix, pt->num_code_groups,
+                pt->code_predictor.vocab_size, &s.forced_talker_frames)) {
+            qt_set_error("tts_engine_admit: invalid/conflicting QWEN_RESEARCH_PREFIX_FILE");
+            e->slots.pop_back();
+            return tts_admit_fail(job, QT_STATUS_INVALID_PARAMS);
+        }
+        qt_log(QT_LOG_INFO, "[ResearchPrefix] serial=%lld frames=%d", (long long) s.serial,
+               (int) s.forced_talker_frames.size());
+    }
+#endif
     if (!s.forced_talker_frames.empty()) {
         bool valid = true;
         for (const std::vector<int32_t> & frame : s.forced_talker_frames) {
@@ -1591,9 +1641,19 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
             suppressed_logits = s.logits;
         }
         float u_c0 = 0.0f;
+        int64_t frame_seed = s.job->resolved_seed;
+#ifdef QWEN_RESEARCH_FRAME_SEEDS
+        s.frame_seed_current = research_frame_seed_for(s.frame_seed_schedule, frame_seed, (uint32_t) s.step);
+        frame_seed = s.frame_seed_current;
+        if (s.frame_seed_schedule.mode != ResearchFrameSeedMode::Baseline && s.step < 128) {
+            qt_log(QT_LOG_DEBUG, "[FrameSeed] version=1 serial=%lld frame=%d key=%016llx subseq=%lld",
+                   (long long) s.serial, s.step, (unsigned long long) frame_seed,
+                   (long long) s.subseq_counter);
+        }
+#endif
         const int sampled_c0 = sample_top_k_p(s.logits.data(), vocab, s.talker_T, p->top_k, p->top_p,
                                               p->repetition_penalty, s.talker_history.data(),
-                                              (int) s.talker_history.size(), s.job->resolved_seed,
+                                              (int) s.talker_history.size(), frame_seed,
                                               s.subseq_counter, &u_c0);
         int c0 = sampled_c0;
         s.perf.host_ms += t_host.ms();
@@ -1611,10 +1671,24 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                                (s.step >= 0 && (size_t) s.step < s.forced_talker_history.size());
         if (forced_frame) {
             c0 = s.forced_talker_frames[(size_t) s.step][0];
+        } else if (forced_c0) {
+            c0 = s.forced_talker_history[(size_t) s.step];
+        }
+
+#ifdef QWEN_RESEARCH_FRAME_SEEDS
+        if (e->research_observer && tts_research_wants_decision(s.step, c0 == codec_eos_id)) {
+            // Timestamp effective selection before logging or predictor/codec
+            // work. The observer copies this bounded event; no device readback.
+            const TtsResearchDecision decision{
+                std::chrono::steady_clock::now(), s.job, s.serial, i, s.step,
+                c0, sampled_c0, forced_c0, c0 == codec_eos_id};
+            e->research_observer(decision, e->research_observer_user);
+        }
+#endif
+        if (forced_frame) {
             qt_log(QT_LOG_DEBUG, "[ARTrace] forced Talker frame c0 step=%d sampled=%d forced=%d", s.step,
                    sampled_c0, c0);
         } else if (forced_c0) {
-            c0 = s.forced_talker_history[(size_t) s.step];
             qt_log(QT_LOG_DEBUG, "[ARTrace] forced Talker c0 step=%d sampled=%d forced=%d", s.step, sampled_c0,
                    c0);
         }
@@ -1747,6 +1821,9 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                 c0s[(size_t) i]                = s.pending_c0;
                 temps[(size_t) i]              = s.subtk_T;
                 seeds[(size_t) i]              = s.job->resolved_seed;
+#ifdef QWEN_RESEARCH_FRAME_SEEDS
+                seeds[(size_t) i]              = s.frame_seed_current;
+#endif
                 subseqs[(size_t) i]            = s.subseq_counter - 1;
                 if (s.step >= 0 && (size_t) s.step < s.forced_predictor_frames.size()) {
                     const std::vector<int32_t> & forced = s.forced_predictor_frames[(size_t) s.step];
@@ -1827,6 +1904,10 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                             code_text += std::to_string(code);
                         }
                         qt_log(QT_LOG_DEBUG, "[ARTrace] predictor step=%d codes=%s", s.step, code_text.c_str());
+#ifdef QWEN_RESEARCH_FRAME_SEEDS
+                        qt_log(QT_LOG_DEBUG, "[ResearchFrame] serial=%lld slot=%d frame=%d codes=%s",
+                               (long long) s.serial, i, s.step, code_text.c_str());
+#endif
                     }
                     s.all_codes.push_back(codes);
                     s.talker_history.push_back(s.pending_c0);

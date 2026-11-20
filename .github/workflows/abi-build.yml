@@ -24,7 +24,7 @@ jobs:
         run: |
           cmake -S . -B build -DQWEN_RESEARCH_FRAME_SEEDS=ON
           cmake --build build --target eos-research-probe test-frame-seed-contract --parallel 2
-          ctest --test-dir build --output-on-failure -R '^(frame_seed_contract|eos_research_runner_python)$'
+          ctest --test-dir build --output-on-failure -R '^(frame_seed_contract|eos_research_(runner|analysis)_python)$'
 
   windows-msvc-shared:
     runs-on: windows-latest
@@ -50,4 +50,4 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build --config Release --target eos-research-probe test-frame-seed-contract --parallel 2
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ctest --test-dir build -C Release --output-on-failure -R '^(frame_seed_contract|eos_research_runner_python)$'
+          ctest --test-dir build -C Release --output-on-failure -R '^(frame_seed_contract|eos_research_(runner|analysis)_python)$'

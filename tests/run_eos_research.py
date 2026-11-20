@@ -457,6 +457,10 @@ def main() -> None:
                 process.wait(timeout=15)
                 raise
         if status:
+            write_json(
+                args.output / f"{name}-process-failure.json",
+                {"exit_code": status, "command": command, "evidence_preserved": True},
+            )
             raise RuntimeError(f"probe failed for {name}: {status}; evidence preserved")
         rows = [
             json.loads(line)

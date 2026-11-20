@@ -189,9 +189,10 @@ static inline struct ggml_tensor * sampler_tail_build(struct ggml_context * gctx
     // Vocabulary-order CDF is required for stochastic parity. Preserve the
     // separate greedy contract explicitly instead of relying on candidate
     // ordering: u < 0 is the private greedy sentinel.
-    struct ggml_tensor * greedy_mask = ggml_step(gctx, ggml_scale(gctx, u, -1.0f));
     // Token ids are [N], while the broadcast uniform view is [1, N].
-    greedy_mask = ggml_reshape_1d(gctx, greedy_mask, N);
+    // The uniform view is strided; scale also requires contiguous CPU input.
+    struct ggml_tensor * u_1d = ggml_reshape_1d(gctx, ggml_cont(gctx, u), N);
+    struct ggml_tensor * greedy_mask = ggml_step(gctx, ggml_scale(gctx, u_1d, -1.0f));
     struct ggml_tensor * idx_1d      = ggml_reshape_1d(gctx, idx, N);
     struct ggml_tensor * idx_f       = ggml_cast(gctx, idx_1d, GGML_TYPE_F32);
     struct ggml_tensor * argmax_f    = ggml_cast(gctx, ggml_argmax(gctx, logits), GGML_TYPE_F32);

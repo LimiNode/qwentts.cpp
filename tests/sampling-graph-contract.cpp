@@ -35,13 +35,13 @@ bool run_case(const char * name,
     }
 
     SamplerInputs sampler;
-    sampler_inputs_build(ctx, &sampler, lanes, 1, 2);
+    sampler_inputs_build(ctx, &sampler, lanes, 2, 2);
     sampler.diagnostics.enabled     = diagnostics;
     sampler.diagnostics.target_frame = 0;
-    sampler.diagnostics.target_step = 0;
+    sampler.diagnostics.target_step = 1;
     sampler.forced_enabled           = forced_token >= 0;
     ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, lanes);
-    ggml_tensor * output = sampler_tail_build(ctx, logits, &sampler, 0);
+    ggml_tensor * output = sampler_tail_build(ctx, logits, &sampler, 1);
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 256, false);
     ggml_build_forward_expand(graph, output);
 
@@ -57,8 +57,13 @@ bool run_case(const char * name,
     std::vector<int32_t> forced_values;
     for (int lane = 0; lane < lanes; ++lane) {
         logit_values.insert(logit_values.end(), {0.0F, 3.0F, 0.0F, 4.0F});
-        state_values.insert(state_values.end(), {temperature, lane % 2 ? -1.0F : uniform});
-        forced_values.push_back(lane % 2 ? -1 : forced_token);
+        forced_values.push_back(0); // The unused first step must not leak into step 1.
+    }
+    for (int step = 0; step < 2; ++step) {
+        for (int lane = 0; lane < lanes; ++lane) {
+            state_values.insert(state_values.end(), {temperature, lane % 2 ? -1.0F : uniform});
+            if (step == 1) forced_values.push_back(lane % 2 ? -1 : forced_token);
+        }
     }
     ggml_backend_tensor_set(logits, logit_values.data(), 0, logit_values.size() * sizeof(float));
     ggml_backend_tensor_set(sampler.state, state_values.data(), 0, state_values.size() * sizeof(float));
@@ -72,7 +77,7 @@ bool run_case(const char * name,
     }
 
     std::vector<int32_t> actuals(static_cast<size_t>(lanes), -1);
-    ggml_backend_tensor_get(sampler.codes, actuals.data(), sampler.codes->nb[1], actuals.size() * sizeof(int32_t));
+    ggml_backend_tensor_get(sampler.codes, actuals.data(), 2 * sampler.codes->nb[1], actuals.size() * sizeof(int32_t));
     const int32_t actual = actuals[0];
     bool passed = true;
     for (int lane = 0; lane < lanes; ++lane) {

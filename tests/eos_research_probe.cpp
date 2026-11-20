@@ -63,6 +63,7 @@ struct Owner {
     }
 };
 struct Chunk { double ms; size_t samples; };
+struct Step { double ms; int active; size_t retired; };
 struct Lane {
     Clock::time_point start, deadline;
     std::vector<float> pcm;
@@ -179,7 +180,11 @@ int main(int argc, char ** argv) {
             if (tts_engine_active(owner.engine) != static_cast<int>(lanes)) throw std::runtime_error("not co-admitted");
             const double admitted_ms = elapsed(start);
             std::vector<TtsJob *> retired;
-            while (tts_engine_active(owner.engine)) tts_engine_step(owner.engine, &retired);
+            std::vector<Step> steps;
+            while (tts_engine_active(owner.engine)) {
+                tts_engine_step(owner.engine, &retired);
+                steps.push_back({elapsed(start), tts_engine_active(owner.engine), retired.size()});
+            }
             const double group_total_ms = elapsed(start);
             if (retired.size() != lanes) throw std::runtime_error("terminal count mismatch");
             for (size_t lane = 0; lane < lanes; ++lane) {
@@ -202,6 +207,12 @@ int main(int argc, char ** argv) {
                 for (size_t index = 0; index < observation.chunks.size(); ++index) {
                     if (index) results << ',';
                     results << "{\"ms\":" << observation.chunks[index].ms << ",\"samples\":" << observation.chunks[index].samples << '}';
+                }
+                results << "],\"steps\":[";
+                for (size_t index = 0; index < steps.size(); ++index) {
+                    if (index) results << ',';
+                    results << "{\"ms\":" << steps[index].ms << ",\"active\":" << steps[index].active
+                            << ",\"retired\":" << steps[index].retired << '}';
                 }
                 results << "]}\n";
                 results.flush();

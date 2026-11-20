@@ -392,6 +392,7 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("probe", "output", "talker", "codec", "prepared-inputs"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--gpu-uuid", required=True)
+    parser.add_argument("--model-family", choices=("RU-stress", "Base"), default="RU-stress")
     parser.add_argument("--dependency-dir", type=Path, action="append", default=[])
     parser.add_argument(
         "--execute",
@@ -441,9 +442,10 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "cases": planned,
                 "scope": (
-                    "CMP 50HX / RU-stress / retained Kraftwerk / frontend OFF / "
+                    f"CMP 50HX / {args.model_family} / retained Kraftwerk / frontend OFF / "
                     "N=1 baseline, no prefix"
                 ),
+                "model_family": args.model_family,
                 "coverage": "unassessed",
                 "prior_exposure_caveat": (
                     "32/128 corpus seed/text pairs appeared in the earlier "

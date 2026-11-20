@@ -137,5 +137,7 @@ int main() {
     const bool batch_two = run_case("batched-mixed-two", 1.0F, 0.20F, 1, false, -1, 2);
     const bool batch_three = run_case("batched-mixed-three", 1.0F, 0.20F, 1, false, -1, 3);
     const bool batch_forced = run_case("batched-forced-mixed", 1.0F, 0.20F, 2, false, 2, 3);
-    return (stochastic && greedy && forced && batch_two && batch_three && batch_forced) ? 0 : 1;
+    const bool forced_zero = run_case("forced-zero-token", 1.0F, 0.20F, 0, false, 0);
+    const bool batch_zero = run_case("batched-forced-zero", 1.0F, 0.20F, 0, false, 0, 3);
+    return (stochastic && greedy && forced && batch_two && batch_three && batch_forced && forced_zero && batch_zero) ? 0 : 1;
 }

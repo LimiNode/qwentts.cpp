@@ -201,7 +201,7 @@ static inline struct ggml_tensor * sampler_tail_build(struct ggml_context * gctx
     if (sp->forced_enabled) {
         struct ggml_tensor * forced =
             ggml_view_1d(gctx, sp->forced, N, (size_t) step_idx * sp->forced->nb[1]);
-        struct ggml_tensor * forced_mask = ggml_step(gctx, forced);
+        struct ggml_tensor * forced_mask = ggml_step(gctx, ggml_scale_bias(gctx, forced, 1.0f, 0.5f));
         selected_f = ggml_add(gctx, selected_f, ggml_mul(gctx, forced_mask, ggml_sub(gctx, forced, selected_f)));
     }
     struct ggml_tensor * ids = ggml_cast(gctx, selected_f, GGML_TYPE_I32);

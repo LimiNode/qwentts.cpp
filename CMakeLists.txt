@@ -265,6 +265,9 @@ add_test(NAME sampling_graph_contract COMMAND test-sampling-graph-contract)
 # reference implementation over fixed edge-case vectors.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
+    add_test(NAME eos_research_runner_python
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_eos_research_runner.py)
     add_test(NAME sampling_contract_python_parity
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/verify-sampling-parity.py

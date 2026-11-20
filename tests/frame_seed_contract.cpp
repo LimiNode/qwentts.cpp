@@ -41,7 +41,8 @@ int main() {
                prefix == std::vector<std::vector<int32_t>>{{0, 1, 2, 3}, {4, 5, 6, 7}},
                "complete prefix frames")) return 1;
     for (const char * invalid : {"", "\n", "0 1 2\n", "0 1 2 3 4\n", "0 1 -2 3\n",
-                                 "0 1 2 8\n", "0 1 2 bad\n"}) {
+                                 "0 1 2 8\n", "0 1 2 bad\n",
+                                 "0 1 2 3 999999999999999999999999999999999999999"}) {
         std::istringstream input(invalid);
         if (!check(!research_prefix_parse(input, 4, 8, &prefix) && prefix.size() == 2,
                    "invalid prefix fails without partial assignment")) return 1;

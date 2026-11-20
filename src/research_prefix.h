@@ -15,7 +15,10 @@ static inline bool research_prefix_parse(std::istream & stream, int groups, int 
         std::istringstream row(line);
         std::vector<int32_t> frame;
         int64_t code;
-        while (row >> code) {
+        while (true) {
+            row >> std::ws;
+            if (row.eof()) break;
+            if (!(row >> code)) return false;
             if (code < 0 || code >= vocab || frame.size() >= static_cast<size_t>(groups)) {
                 return false;
             }

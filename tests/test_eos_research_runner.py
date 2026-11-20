@@ -15,6 +15,11 @@ SPEC.loader.exec_module(runner)
 
 
 class RunnerContract(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp_root = Path(__file__).resolve().parents[1] / ".tmp"
+        cls.temp_root.mkdir(exist_ok=True)
+
     def test_plan_is_fixed_and_matched(self):
         runs = runner.plan()
         self.assertEqual(len(runs), 17)
@@ -36,9 +41,7 @@ class RunnerContract(unittest.TestCase):
         )
 
     def test_trace_separates_interleaved_lanes(self):
-        with tempfile.TemporaryDirectory(
-            dir=Path(__file__).resolve().parents[3] / ".tmp"
-        ) as folder:
+        with tempfile.TemporaryDirectory(dir=self.temp_root) as folder:
             path = Path(folder) / "trace.log"
             codes = ",".join(str(value) for value in range(16))
             path.write_text(
@@ -52,9 +55,7 @@ class RunnerContract(unittest.TestCase):
             self.assertEqual(rows[1]["codes"], [list(range(16))])
 
     def test_outputs_are_exclusive_and_not_coverage(self):
-        with tempfile.TemporaryDirectory(
-            dir=Path(__file__).resolve().parents[3] / ".tmp"
-        ) as folder:
+        with tempfile.TemporaryDirectory(dir=self.temp_root) as folder:
             path = Path(folder) / "capture.f32"
             path.write_bytes(struct.pack("<fff", 0, 0.25, -0.25))
             result = runner.make_wav(path)

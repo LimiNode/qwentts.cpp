@@ -134,3 +134,32 @@ unchanged. Route logs are bounded by the four-request experiment and identify
 host dispatch, not complete CUDA kernel traces or timings. The runner rejects
 missing/ignored route controls. Remove only the applied patch after the run;
 never promote it to an engine default from this experiment.
+
+## Short utterances and separate timing
+
+`tests/run_prefill_short.py --help` expands the CustomVoice `ryan` control to
+eight short Russian/English phrases and seeds64/65/72/75. `--phase quality`
+uses six language-isolated processes, with a longer primer before and after
+the16 short cases in each process. Baseline, full-source prefix9 and forced-MMQ
+prefix9 share the same frozen Q8_0 talker/comparator-codec hashes and fusion-OFF
+setting. All108 requests, PCM/WAV, final logits, logs and failures are retained.
+Natural EOS or a long WAV does not establish correct words or absence of cough.
+
+`--phase timing --quality-reference QUALITY_DIRECTORY` requires the matching
+complete mechanical reference, not a human-quality pass. It runs first-use
+plus eight warm repeats of one Russian text/seed64 in each of six processes,
+reversing variant order for the second block. These54 requests have profiling,
+tensor taps, route traces and decision observations OFF. The frozen engine
+still emits an operational prefix-hit line for prefix requests; its residual
+host-log overhead is included. This is not a zero-logging or GPU-event benchmark.
+Exclude incomplete/failed blocks entirely; distinguish first-use, paired block
+drift and warm-request jitter from a broader text/seed latency distribution.
+
+Both phases accept `--repo`, retained `--probe`/`--manifest`, a new `--output`
+under the repository's `.tmp/base-acceptance/`, optional CUDA
+`--dependency-directory`, and bounded `--seconds` (at most1800). Use one shared
+GPU budget across both invocations. The runner freezes and hashes executable,
+DLLs, model/codec, inputs and harness scripts. Its source HEAD identifies the
+harness checkout, not necessarily the source used to build a retained probe;
+preserve that probe's original build/patch receipt separately. This statically
+linked research probe is not Bridge/native-worker or packaged-DLL acceptance.

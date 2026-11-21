@@ -306,6 +306,9 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME prefill_differential_analysis_python
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_analyze_prefill_differential.py)
+    add_test(NAME prefill_short_python
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_prefill_short.py)
     add_test(NAME speech_comparison_python
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_speech_comparison.py)

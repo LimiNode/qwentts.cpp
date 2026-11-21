@@ -52,16 +52,19 @@
 #include <cstring>
 #include <vector>
 #ifdef QWEN_RESEARCH_PREFILL
-#    include "research_prefill.h"
 #    include "research_nvtx.h"
+#    include "research_prefill.h"
+#    include "research_prefill_diagnostics.h"
 
 #    include <chrono>
 
 struct ResearchPrefixKV {
-    struct ggml_context * ctx     = nullptr;
-    ggml_backend_buffer_t buffer  = nullptr;
-    struct ggml_cgraph *  save    = nullptr;
-    struct ggml_cgraph *  restore = nullptr;
+    struct ggml_context *             ctx     = nullptr;
+    ggml_backend_buffer_t             buffer  = nullptr;
+    struct ggml_cgraph *              save    = nullptr;
+    struct ggml_cgraph *              restore = nullptr;
+    std::vector<struct ggml_tensor *> saved_k;
+    std::vector<struct ggml_tensor *> saved_v;
 };
 
 static void research_prefix_kv_free(ResearchPrefixKV * prefix) {
@@ -87,6 +90,8 @@ static bool research_prefix_kv_init(ResearchPrefixKV * prefix, KVCache * kv, int
     }
     prefix->save    = ggml_new_graph_custom(prefix->ctx, nodes, false);
     prefix->restore = ggml_new_graph_custom(prefix->ctx, nodes, false);
+    prefix->saved_k.resize(static_cast<size_t>(kv->n_layers));
+    prefix->saved_v.resize(static_cast<size_t>(kv->n_layers));
     for (int layer = 0; layer < kv->n_layers; ++layer) {
         for (int part = 0; part < 2; ++part) {
             struct ggml_tensor * live = part == 0 ? kv_cache_k(kv, 0, layer) : kv_cache_v(kv, 0, layer);
@@ -94,6 +99,7 @@ static bool research_prefix_kv_init(ResearchPrefixKV * prefix, KVCache * kv, int
                 ggml_view_3d(prefix->ctx, live, kv->head_dim, rows, kv->n_kv_heads, live->nb[1], live->nb[2], 0);
             struct ggml_tensor * saved =
                 ggml_new_tensor_3d(prefix->ctx, live->type, kv->head_dim, rows, kv->n_kv_heads);
+            (part == 0 ? prefix->saved_k : prefix->saved_v)[static_cast<size_t>(layer)] = saved;
             ggml_build_forward_expand(prefix->save, ggml_cpy(prefix->ctx, live_prefix, saved));
             ggml_build_forward_expand(prefix->restore, ggml_cpy(prefix->ctx, saved, live_prefix));
         }
@@ -130,6 +136,8 @@ struct ResearchPrefillState {
     std::vector<float>         prefix_input;
     std::vector<float>         first_prompt;
     int                        first_prompt_rows = 0;
+    int                        diagnostic_serial = 0;
+    std::string                diagnostic_path;
 };
 
 static void research_prefill_free(ResearchPrefillState * state) {
@@ -270,22 +278,38 @@ static struct ggml_tensor * talker_layer_forward(struct ggml_context * ctx,
                                                  int                   n_kv_pad,
                                                  bool                  use_flash_attn,
                                                  bool                  clamp_fp16,
-                                                 struct ggml_cgraph *  gf) {
+                                                 struct ggml_cgraph *  gf
+#ifdef QWEN_RESEARCH_PREFILL
+                                                 ,
+                                                 ResearchPrefillLayerCapture * capture = nullptr
+#endif
+) {
     const int   n_q_heads = tw->num_attention_heads;
     const int   n_kv      = tw->num_key_value_heads;
     const int   hd        = tw->head_dim;
     const float eps       = tw->rms_norm_eps;
+#ifdef QWEN_RESEARCH_PREFILL
+    research_prefill_tap(capture, "input", x);
+#endif
 
     // Pre-norm
     struct ggml_tensor * h = ggml_rms_norm(ctx, x, eps);
     h                      = ggml_mul(ctx, h, layer.input_norm_w);
+#ifdef QWEN_RESEARCH_PREFILL
+    research_prefill_tap(capture, "attn-norm", h);
+#endif
 
     // Q/K/V projections
     struct ggml_tensor * q = ggml_mul_mat(ctx, layer.attn.q_proj_w, h);  // [n_q_heads*hd, T]
     struct ggml_tensor * k = ggml_mul_mat(ctx, layer.attn.k_proj_w, h);  // [n_kv*hd, T]
     struct ggml_tensor * v = ggml_mul_mat(ctx, layer.attn.v_proj_w, h);  // [n_kv*hd, T]
+#ifdef QWEN_RESEARCH_PREFILL
+    research_prefill_tap(capture, "q-proj", q);
+    research_prefill_tap(capture, "k-proj", k);
+    research_prefill_tap(capture, "v-proj", v);
+#endif
 
-    q = ggml_reshape_3d(ctx, q, hd, n_q_heads, T);                       // [hd, n_q_heads, T]
+    q = ggml_reshape_3d(ctx, q, hd, n_q_heads, T);  // [hd, n_q_heads, T]
     k = ggml_reshape_3d(ctx, k, hd, n_kv, T);
     v = ggml_reshape_3d(ctx, v, hd, n_kv, T);
 
@@ -304,6 +328,10 @@ static struct ggml_tensor * talker_layer_forward(struct ggml_context * ctx,
                       0.0f);
     k = ggml_rope_ext(ctx, k, positions, NULL, hd, GGML_ROPE_TYPE_NEOX, 0, tw->rope_theta, 1.0f, 0.0f, 1.0f, 0.0f,
                       0.0f);
+#ifdef QWEN_RESEARCH_PREFILL
+    research_prefill_tap(capture, "q-rope", q);
+    research_prefill_tap(capture, "k-rope", k);
+#endif
 
     // Write the T fresh positions of K and V into the cache via
     // set_rows: kv_rows carries the destination positions as data, so
@@ -363,17 +391,29 @@ static struct ggml_tensor * talker_layer_forward(struct ggml_context * ctx,
 
     // Flash attention output is [hd, n_q_heads, T], flatten heads for o_proj.
     attn = ggml_reshape_2d(ctx, attn, n_q_heads * hd, T);
+#ifdef QWEN_RESEARCH_PREFILL
+    research_prefill_tap(capture, "attn-output", attn);
+#endif
 
     struct ggml_tensor * o = ggml_mul_mat(ctx, layer.attn.o_proj_w, attn);
+#ifdef QWEN_RESEARCH_PREFILL
+    research_prefill_tap(capture, "o-proj", o);
+#endif
 
     x = ggml_add(ctx, x, o);
     if (clamp_fp16) {
         x = ggml_clamp(ctx, x, -65504.0f, 65504.0f);
     }
+#ifdef QWEN_RESEARCH_PREFILL
+    research_prefill_tap(capture, "attn-residual", x);
+#endif
 
     // MLP block: pre-norm + SwiGLU + residual
     struct ggml_tensor * h2 = ggml_rms_norm(ctx, x, eps);
     h2                      = ggml_mul(ctx, h2, layer.post_attn_norm_w);
+#ifdef QWEN_RESEARCH_PREFILL
+    research_prefill_tap(capture, "mlp-norm", h2);
+#endif
 
     // gate and up mul_mats adjacent to the GLU node: the CUDA backend
     // fuses the three into one kernel (ggml_cuda_should_fuse_mul_mat).
@@ -386,6 +426,9 @@ static struct ggml_tensor * talker_layer_forward(struct ggml_context * ctx,
     if (clamp_fp16) {
         x = ggml_clamp(ctx, x, -65504.0f, 65504.0f);
     }
+#ifdef QWEN_RESEARCH_PREFILL
+    research_prefill_tap(capture, "mlp-residual", x);
+#endif
     return x;
 }
 
@@ -433,6 +476,36 @@ static bool talker_forward_core(const TalkerWeights * tw,
     const int n_layers = tw->num_hidden_layers;
     const int vocab    = tw->vocab_size;
     const int T_full   = n_past + T;
+#ifdef QWEN_RESEARCH_PREFILL
+    use_flash_attn = use_flash_attn && !(research && research->settings.manual_attention);
+    const bool                      layer_diagnostic = research && !research->settings.diagnostic_dir.empty();
+    std::vector<ResearchPrefillTap> layer_taps;
+    std::string                     diagnostic_path;
+    if (layer_diagnostic) {
+        diagnostic_path =
+            research_prefill_diag_begin(research->settings, T_full, n_layers, &research->diagnostic_serial);
+        research->diagnostic_path = diagnostic_path;
+        const int input_shape[]   = { T, hidden };
+        research_prefill_diag_dump(diagnostic_path, "input-embed", input_embed, input_shape, 2);
+        if (n_past > 0) {
+            for (int layer = 0; layer < n_layers; ++layer) {
+                if (!research_prefill_diag_layer(research->settings, layer)) {
+                    continue;
+                }
+                research_prefill_diag_kv(diagnostic_path, "live-prefix-before", layer, "k",
+                                         kv_cache_k(kv, kv_set, layer), n_past);
+                research_prefill_diag_kv(diagnostic_path, "live-prefix-before", layer, "v",
+                                         kv_cache_v(kv, kv_set, layer), n_past);
+                if (research->prefix_valid) {
+                    research_prefill_diag_kv(diagnostic_path, "saved-prefix-before", layer, "k",
+                                             research->prefix_kv.saved_k[static_cast<size_t>(layer)], n_past);
+                    research_prefill_diag_kv(diagnostic_path, "saved-prefix-before", layer, "v",
+                                             research->prefix_kv.saved_v[static_cast<size_t>(layer)], n_past);
+                }
+            }
+        }
+    }
+#endif
 
     // Attention window rounded up to its configured alignment (normally 256)
     // and clamped to the cache size. Fixed shapes let the CUDA graph
@@ -516,9 +589,19 @@ static bool talker_forward_core(const TalkerWeights * tw,
         // Build the layer stack. Bisect taps fire on prefill only.
         struct ggml_tensor * h = x_in;
         for (int l = 0; l < n_layers; l++) {
+#ifdef QWEN_RESEARCH_PREFILL
+            ResearchPrefillLayerCapture   capture{ l, &layer_taps };
+            ResearchPrefillLayerCapture * selected_capture =
+                layer_diagnostic && research_prefill_diag_layer(research->settings, l) ? &capture : nullptr;
+#endif
             h = talker_layer_forward(gctx, tw, tw->layers[(size_t) l], h, pos_in, mask_in, rows_in,
                                      kv_cache_k(kv, kv_set, l), kv_cache_v(kv, kv_set, l), T, n_kv_pad, use_flash_attn,
-                                     clamp_fp16, gf);
+                                     clamp_fp16, gf
+#ifdef QWEN_RESEARCH_PREFILL
+                                     ,
+                                     selected_capture
+#endif
+            );
             if (record_taps && talker_is_bisect_layer(l)) {
                 for (int i = 0; i < TALKER_N_BISECT_LAYERS; i++) {
                     if (TALKER_BISECT_LAYERS[i] == l) {
@@ -660,6 +743,29 @@ static bool talker_forward_core(const TalkerWeights * tw,
 #ifdef QWEN_RESEARCH_PREFILL
     const double compute_ms = clock.lap();
     phase_range.next("prefill/readback");
+    if (layer_diagnostic) {
+        research_prefill_diag_taps(diagnostic_path, T, layer_taps);
+        for (int layer = 0; layer < n_layers; ++layer) {
+            if (!research_prefill_diag_layer(research->settings, layer)) {
+                continue;
+            }
+            research_prefill_diag_kv(diagnostic_path, "live-after", layer, "k", kv_cache_k(kv, kv_set, layer), T_full);
+            research_prefill_diag_kv(diagnostic_path, "live-after", layer, "v", kv_cache_v(kv, kv_set, layer), T_full);
+        }
+        std::ofstream metadata(std::filesystem::u8path(diagnostic_path) / "graph-info.json", std::ios::binary);
+        metadata << "{\"serial\":" << research->diagnostic_serial << ",\"T\":" << T << ",\"n_past\":" << n_past
+                 << ",\"total_rows\":" << T_full << ",\"layer\":" << research->settings.diagnostic_layer
+                 << ",\"use_flash_attn\":" << (use_flash_attn ? "true" : "false")
+                 << ",\"graph_nodes\":" << ggml_graph_n_nodes(gf) << ",\"prefix_source\":\""
+                 << research_prefix_source_name(research->settings.prefix_source)
+                 << "\",\"timing_eligible\":false,\"output_flags_may_change_allocation_and_fusion\":true,"
+                    "\"kernel_dispatch_observed\":false}\n";
+        metadata.flush();
+        if (!metadata) {
+            throw std::runtime_error("prefill diagnostic graph metadata write failed");
+        }
+        std::fprintf(stderr, "[ResearchPrefillDiagnostic] timing-ineligible directory=%s\n", diagnostic_path.c_str());
+    }
 #endif
 
     // Bisect dumps: pull each tap [hidden, T] back to host as [T, hidden].
@@ -718,7 +824,11 @@ static bool talker_forward_core(const TalkerWeights * tw,
         observation.available                    = true;
         observation.last_only                    = last_only;
         observation.retained_hit                 = retained_hit;
-        observation.diagnostic                   = dump_dir != nullptr;
+        observation.diagnostic                   = dump_dir != nullptr || layer_diagnostic;
+        observation.prefill_use_flash_attn       = use_flash_attn;
+        observation.diagnostic_serial            = layer_diagnostic ? research->diagnostic_serial : 0;
+        observation.diagnostic_layer             = research->settings.diagnostic_layer;
+        observation.diagnostic_path              = diagnostic_path;
         observation.T                            = T;
         observation.n_past                       = n_past;
         observation.slot                         = kv_set;
@@ -741,8 +851,8 @@ static bool talker_forward_core(const TalkerWeights * tw,
                 "\"upload_ms\":%.6f,\"compute_wait_ms\":%.6f,\"readback_ms\":%.6f,\"total_ms\":%.6f}\n",
                 T, n_past, kv_set, n_kv_pad, kv->attention_alignment, research->settings.kv_f16 ? "true" : "false",
                 last_only ? "true" : "false", retain ? "true" : "false", retained_hit ? "true" : "false",
-                dump_dir ? "true" : "false", observation.graph_nodes, observation.scheduler_splits, setup_ms, build_ms,
-                allocation_ms, upload_ms, compute_ms, readback_ms, observation.total_ms);
+                observation.diagnostic ? "true" : "false", observation.graph_nodes, observation.scheduler_splits,
+                setup_ms, build_ms, allocation_ms, upload_ms, compute_ms, readback_ms, observation.total_ms);
     }
 #endif
     return true;
@@ -840,6 +950,17 @@ static bool research_prefill_run(const TalkerWeights *  tw,
             prefix_snapshot_ms = snapshot_clock.total();
             research->prefix_input.assign(input_embed, input_embed + prefix_values);
             research->prefix_valid = true;
+            if (!research->settings.diagnostic_dir.empty()) {
+                for (int layer = 0; layer < tw->num_hidden_layers; ++layer) {
+                    if (!research_prefill_diag_layer(research->settings, layer)) {
+                        continue;
+                    }
+                    research_prefill_diag_kv(research->diagnostic_path, "saved-after-snapshot", layer, "k",
+                                             research->prefix_kv.saved_k[static_cast<size_t>(layer)], prefix_rows);
+                    research_prefill_diag_kv(research->diagnostic_path, "saved-after-snapshot", layer, "v",
+                                             research->prefix_kv.saved_v[static_cast<size_t>(layer)], prefix_rows);
+                }
+            }
         }
     }
     if (!full_result_ready) {

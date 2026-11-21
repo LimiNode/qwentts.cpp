@@ -12,6 +12,9 @@ static inline const char * research_prefix_source_name(ResearchPrefixSource sour
     return source == ResearchPrefixSource::Full ? "full" : "split";
 }
 
+constexpr int RESEARCH_PREFILL_DIAG_MAX_ROWS  = 512;
+constexpr int RESEARCH_PREFILL_DIAG_MAX_CALLS = 8;
+
 struct ResearchPrefillSettings {
     bool                 profile       = false;
     bool                 last_only     = false;
@@ -20,6 +23,9 @@ struct ResearchPrefillSettings {
     bool                 retain        = false;
     int                  prefix_rows   = 0;
     ResearchPrefixSource prefix_source = ResearchPrefixSource::Split;
+    std::string          diagnostic_dir;
+    int                  diagnostic_layer = 0;  // -1 selects every layer.
+    bool                 manual_attention = false;
 };
 
 // Private snapshot made from the normal final-logits readback. It must only be
@@ -51,8 +57,21 @@ struct ResearchPrefillObservation {
     double               prefix_snapshot_ms     = 0.0;
     double               prefix_restore_ms      = 0.0;
     double               prefix_total_ms        = 0.0;
+    bool                 prefill_use_flash_attn = false;
+    int                  diagnostic_serial      = 0;
+    int                  diagnostic_layer       = 0;
+    std::string          diagnostic_path;
     std::vector<float>   logits_last;
 };
+
+static inline bool research_prefill_diag_shape_valid(const ResearchPrefillSettings & settings,
+                                                     int                             rows,
+                                                     int                             layers,
+                                                     int                             serial) {
+    return rows > 0 && rows <= RESEARCH_PREFILL_DIAG_MAX_ROWS && serial >= 0 &&
+           serial < RESEARCH_PREFILL_DIAG_MAX_CALLS && layers > 0 && settings.diagnostic_layer >= -1 &&
+           settings.diagnostic_layer < layers;
+}
 
 static inline bool research_prefill_parse_bool(const char * value, bool & out) {
     if (!value || !*value || std::strcmp(value, "0") == 0) {
@@ -93,8 +112,11 @@ static inline bool research_prefill_parse(const char *              profile,
                                           const char *              retain,
                                           ResearchPrefillSettings & out,
                                           std::string &             error,
-                                          const char *              prefix_rows   = nullptr,
-                                          const char *              prefix_source = nullptr) {
+                                          const char *              prefix_rows      = nullptr,
+                                          const char *              prefix_source    = nullptr,
+                                          const char *              diagnostic_dir   = nullptr,
+                                          const char *              diagnostic_layer = nullptr,
+                                          const char *              attention        = nullptr) {
     ResearchPrefillSettings candidate;
     if (!research_prefill_parse_bool(profile, candidate.profile)) {
         error = "QWEN_PREFILL_PROFILE must be 0 or 1";
@@ -149,14 +171,53 @@ static inline bool research_prefill_parse(const char *              profile,
             return false;
         }
     }
+    if (attention && *attention) {
+        if (std::strcmp(attention, "manual") == 0) {
+            candidate.manual_attention = true;
+        } else if (std::strcmp(attention, "default") != 0) {
+            error = "QWEN_PREFILL_ATTN must be default or manual";
+            return false;
+        }
+    }
+    if (diagnostic_dir && *diagnostic_dir) {
+        if (std::strlen(diagnostic_dir) > 350 || !candidate.profile || candidate.last_only || candidate.retain) {
+            error = "QWEN_PREFILL_DIAG_DIR needs PROFILE=1, LAST_ONLY=0, RETAIN=0 and a path <=350 bytes";
+            return false;
+        }
+        candidate.diagnostic_dir = diagnostic_dir;
+    }
+    if (diagnostic_layer && *diagnostic_layer) {
+        if (candidate.diagnostic_dir.empty()) {
+            error = "QWEN_PREFILL_DIAG_LAYER requires QWEN_PREFILL_DIAG_DIR";
+            return false;
+        }
+        if (std::strcmp(diagnostic_layer, "all") == 0) {
+            candidate.diagnostic_layer = -1;
+        } else {
+            int layer = 0;
+            for (const char * digit = diagnostic_layer; *digit; ++digit) {
+                if (*digit < '0' || *digit > '9' || layer > 127 / 10) {
+                    error = "QWEN_PREFILL_DIAG_LAYER must be all or an integer in 0..127";
+                    return false;
+                }
+                layer = layer * 10 + (*digit - '0');
+            }
+            if (layer > 127) {
+                error = "QWEN_PREFILL_DIAG_LAYER must be all or an integer in 0..127";
+                return false;
+            }
+            candidate.diagnostic_layer = layer;
+        }
+    }
     out = candidate;
     error.clear();
     return true;
 }
 
 static inline bool research_prefill_from_env(ResearchPrefillSettings & out, std::string & error) {
-    return research_prefill_parse(std::getenv("QWEN_PREFILL_PROFILE"), std::getenv("QWEN_PREFILL_LAST_ONLY"),
-                                  std::getenv("QWEN_PREFILL_KV"), std::getenv("QWEN_PREFILL_WINDOW"),
-                                  std::getenv("QWEN_PREFILL_RETAIN"), out, error,
-                                  std::getenv("QWEN_PREFILL_PREFIX_ROWS"), std::getenv("QWEN_PREFILL_PREFIX_SOURCE"));
+    return research_prefill_parse(
+        std::getenv("QWEN_PREFILL_PROFILE"), std::getenv("QWEN_PREFILL_LAST_ONLY"), std::getenv("QWEN_PREFILL_KV"),
+        std::getenv("QWEN_PREFILL_WINDOW"), std::getenv("QWEN_PREFILL_RETAIN"), out, error,
+        std::getenv("QWEN_PREFILL_PREFIX_ROWS"), std::getenv("QWEN_PREFILL_PREFIX_SOURCE"),
+        std::getenv("QWEN_PREFILL_DIAG_DIR"), std::getenv("QWEN_PREFILL_DIAG_LAYER"), std::getenv("QWEN_PREFILL_ATTN"));
 }

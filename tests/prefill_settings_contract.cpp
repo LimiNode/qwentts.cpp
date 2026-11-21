@@ -77,6 +77,43 @@ int main() {
     failures += check(std::strcmp(research_prefix_source_name(ResearchPrefixSource::Full), "full") == 0 &&
                           std::strcmp(research_prefix_source_name(ResearchPrefixSource::Split), "split") == 0,
                       "source observation names stable");
+    const auto parse_diagnostic = [&](const char * profile, const char * last, const char * retain, const char * dir,
+                                      const char * layer, const char * attention) {
+        return research_prefill_parse(profile, last, "f32", "256", retain, settings, error, nullptr, nullptr, dir,
+                                      layer, attention);
+    };
+    failures +=
+        check(parse_diagnostic("1", "0", "0", ".tmp/diagnostic", "all", "manual") && settings.diagnostic_layer == -1 &&
+                  settings.diagnostic_dir == ".tmp/diagnostic" && settings.manual_attention,
+              "bounded diagnostic selection");
+    const char * invalid_diagnostic[][6] = {
+        { "0", "0", "0", ".tmp/diagnostic", "0",   "default" },
+        { "1", "1", "0", ".tmp/diagnostic", "0",   "default" },
+        { "1", "0", "1", ".tmp/diagnostic", "0",   "default" },
+        { "1", "0", "0", nullptr,           "0",   "default" },
+        { "1", "0", "0", ".tmp/diagnostic", "-1",  "default" },
+        { "1", "0", "0", ".tmp/diagnostic", "128", "default" },
+        { "1", "0", "0", ".tmp/diagnostic", "ALL", "default" },
+        { "1", "0", "0", ".tmp/diagnostic", "0",   "f32"     },
+    };
+    for (const auto & values : invalid_diagnostic) {
+        failures += check(!parse_diagnostic(values[0], values[1], values[2], values[3], values[4], values[5]) &&
+                              settings.diagnostic_layer == -1 && settings.manual_attention,
+                          "invalid diagnostic rejected atomically");
+    }
+    const std::string long_dir(351, 'x');
+    failures += check(!parse_diagnostic("1", "0", "0", long_dir.c_str(), "0", "default"), "diagnostic path bounded");
+    failures += check(research_prefill_diag_shape_valid(settings, 512, 28, 7) &&
+                          !research_prefill_diag_shape_valid(settings, 513, 28, 7) &&
+                          !research_prefill_diag_shape_valid(settings, 512, 28, 8) &&
+                          !research_prefill_diag_shape_valid(settings, 0, 28, 0),
+                      "diagnostic rows/calls bounded");
+    failures += check(parse_diagnostic("1", "0", "0", ".tmp/diagnostic", "28", "default") &&
+                          !research_prefill_diag_shape_valid(settings, 236, 28, 0),
+                      "loaded layer count checked");
+    failures += check(research_prefill_parse(nullptr, nullptr, nullptr, nullptr, nullptr, settings, error) &&
+                          settings.diagnostic_dir.empty() && !settings.manual_attention,
+                      "ordinary defaults do not enable diagnostics or manual attention");
     const float first[]        = { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f };
     const float different[]    = { 1.0f, 2.0f, 3.0f, 4.0f, 9.0f, 6.0f };
     const float changed_head[] = { 1.0f, 0.0f, 3.0f, 4.0f, 5.0f, 6.0f };

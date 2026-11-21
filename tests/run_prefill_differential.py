@@ -43,7 +43,9 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--prefix-rows", type=int, required=True)
     parser.add_argument("--layer", default="0")
-    parser.add_argument("--control", choices=("default", "no-fusion", "manual-attention"), default="default")
+    parser.add_argument("--control", choices=("default", "no-fusion", "manual-attention", "forced-cublas", "forced-mmq"), default="default")
+    parser.add_argument("--trace-matmul", action="store_true",
+                        help="Requires the isolated tests/patches/prefill-matmul-dispatch.patch")
     parser.add_argument("--seconds", type=int, default=600)
     parser.add_argument("--dependency-directory", type=Path, action="append", default=[])
     args = parser.parse_args()
@@ -65,6 +67,12 @@ def main() -> int:
     if any(g["seeds"] != [64] for g in manifest["groups"]):
         raise ValueError("diagnostic requires explicit seed 64 in every group")
     args.output.mkdir(parents=True, exist_ok=False)
+    runtime = args.output / "runtime"
+    runtime.mkdir()
+    source_probe = identity(args.probe)
+    for payload in (args.probe, *sorted(args.probe.parent.glob("*.dll"))):
+        shutil.copy2(payload, runtime / payload.name)
+    args.probe = runtime / args.probe.name
     gpu = gpu_identity(GPU)
     payload_paths = {manifest["talker"], manifest["codec"],
                      *(g["text_file"] for g in manifest["groups"])}
@@ -74,10 +82,14 @@ def main() -> int:
     write_json(args.output / "plan.json", {
         "kind": "prefill_differential_not_latency_or_speech_qualification",
         "gpu": gpu, "source": source_identity(), "source_manifest": identity(args.manifest),
-        "probe": identity(args.probe), "runtime": [identity(p) for p in sorted(args.probe.parent.glob("*.dll"))],
+        "source_probe": source_probe, "probe": identity(args.probe),
+        "runtime": [identity(p) for p in sorted(args.probe.parent.glob("*.dll"))],
         "inputs": [identity(Path(p)) for p in sorted(payload_paths)],
         "cases": planned, "control": args.control, "layer": args.layer,
         "prefix_rows": args.prefix_rows, "seconds": args.seconds,
+        "trace_matmul": args.trace_matmul,
+        "dispatch_patch": identity(Path(__file__).parent / "patches" / "prefill-matmul-dispatch.patch")
+                          if args.trace_matmul or args.control.startswith("forced-") else None,
         "diagnostic_perturbation": "Tensor outputs/readbacks may change allocation/fusion. Compare ON/OFF controls.",
         "expected_end": "max_tokens=4; not natural-EOS or text-coverage evidence",
     })
@@ -102,6 +114,13 @@ def main() -> int:
             env["GGML_CUDA_DISABLE_FUSION"] = "1"
         elif args.control == "manual-attention":
             env["QWEN_PREFILL_ATTN"] = "manual"
+        elif args.control == "forced-cublas":
+            env.update(GGML_CUDA_DISABLE_FUSION="1", GGML_RESEARCH_FORCE_CUBLAS_Q8="1",
+                       GGML_CUDA_CUBLAS_COMPUTE_TYPE="f32")
+        elif args.control == "forced-mmq":
+            env.update(GGML_CUDA_DISABLE_FUSION="1", GGML_RESEARCH_FORCE_MMQ_Q8="1")
+        if args.trace_matmul:
+            env.update(GGML_CUDA_DISABLE_FUSION="1", GGML_RESEARCH_MATMUL_TRACE="1")
         write_json(directory / "environment.json", {
             k: v for k, v in env.items() if k.startswith(("QWEN_", "GGML_", "CUDA_"))
         })
@@ -115,6 +134,12 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 state = "timeout"
         rows, issues = collect(directory, planned, False)
+        dispatch = [line for line in (directory / "stderr.log").read_text(encoding="utf-8", errors="replace").splitlines()
+                    if "RESEARCH_MATMUL" in line]
+        if args.trace_matmul and not dispatch:
+            issues.append("requested matmul route trace was not effective")
+        if args.control.startswith("forced-") and args.trace_matmul and any(f"route={args.control}" not in line for line in dispatch):
+            issues.append("requested forced matmul route was not effective")
         issues.extend(effective_issues(rows, prefix, diagnostic, args.control == "manual-attention", args.prefix_rows))
         if diagnostic and not (directory / "taps").is_dir():
             issues.append("requested diagnostics produced no tap directory")
@@ -123,7 +148,8 @@ def main() -> int:
             issues.append("output exceeds four-frame diagnostic bound")
         if code != 0 or len(rows) != len(planned) or issues:
             state = "incomplete" if state == "completed" else state
-        results[name] = {"state": state, "returncode": code, "rows": rows, "issues": issues}
+        results[name] = {"state": state, "returncode": code, "rows": rows, "issues": issues,
+                         "matmul_dispatch": dispatch}
         if name == "prefix-off" and "baseline-off" in results:
             results[name]["comparison"] = compare(rows, results["baseline-off"]["rows"])
         elif name.endswith("-taps"):

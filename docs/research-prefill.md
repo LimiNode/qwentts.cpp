@@ -35,6 +35,9 @@ existing NVTX headers, not a new runtime or SDK dependency.
 | `QWEN_PREFILL_PREFIX_ROWS` | absent (default) or integer `1..4095`, also strictly smaller than the actual prompt |
 | `QWEN_PREFILL_PREFIX_SOURCE` | `split` (default) or `full`; an explicit value requires prefix rows |
 | `QWEN_PREFILL_NVTX` | `1` enables labels only in an NVTX-enabled build; use in separate profiler runs |
+| `QWEN_PREFILL_DIAG_DIR` | Separate unique capture root; requires PROFILE=1, LAST_ONLY=0, RETAIN=0 |
+| `QWEN_PREFILL_DIAG_LAYER` | `0` (default), one existing layer, or `all`; <=8 calls, full prompt <=512 rows |
+| `QWEN_PREFILL_ATTN` | `default` or `manual`; prefill only, does not change decode attention |
 
 Invalid settings fail atomically. Set the environment before loading the
 pipeline; do not mutate it concurrently. Retained graphs are bypassed for
@@ -102,3 +105,32 @@ inspect error, max-token, PCM, EOS, coverage and numerical comparisons separatel
 successful process exit is not a qualification result. Twelve identical warm
 repeats measure jitter, not a distribution across twelve independent texts.
 New artifacts remain unlistened until exact-file human observations are recorded.
+
+## Differential follow-up
+
+`tests/run_prefill_differential.py` accepts a retained same-model manifest,
+explicit prefix rows and one control: default, no-fusion, manual-attention,
+forced-cublas or forced-mmq. Each run executes baseline/prefix with taps OFF/ON,
+four requests per process (original, original, short Russian, original), seed64,
+intentionally limited to four frames. It freezes the executable/DLLs in the
+new run directory. Earlier runs only recorded binary hashes; do not imply that
+the initial executable is retained. No diagnostic timing is benchmark evidence.
+
+Layer captures include input/norm, projections, RoPE, attention and residuals;
+KV captures retain native packed bytes to compare snapshot, restore and suffix
+preservation independently. Corrected taps retain each view's backing owner
+chain. `tests/analyze_prefill_differential.py` excludes legacy unpinned view
+captures and requires complete, paired results. Offline tensor analysis uses an
+existing NumPy install; model-free validation runs without it. No package is
+installed by these tools.
+
+For host-selected CUDA matmul route logs or forcing, explicitly apply
+`tests/patches/prefill-matmul-dispatch.patch` to the pinned GGML checkout in an
+isolated research build. This patch is not a submodule pin update. Rebuild
+ggml-cuda, preserve its SHA-256 and patch hash, and use `--trace-matmul`.
+Forced controls also disable fusion; cuBLAS uses f32 compute. The patch only
+forces Q8_0 Talker matrices with more than one column; single-slot decode is
+unchanged. Route logs are bounded by the four-request experiment and identify
+host dispatch, not complete CUDA kernel traces or timings. The runner rejects
+missing/ignored route controls. Remove only the applied patch after the run;
+never promote it to an engine default from this experiment.

@@ -11,6 +11,13 @@ builds do not read the prefill experiment environment. The internal observation
 accessor is not a public DLL export. Internal tools inherit the research layout
 through qwen-core's compile definition.
 
+Use a clean build after internal-header changes. On the measurement machine,
+localized MSVC/Ninja include scanning recorded zero pipeline header dependencies;
+an incremental rebuild mixed a new probe layout with a stale static object.
+The failed controls were retained as invalid, and explicitly rebuilding both
+pipeline/qwen objects repaired them. Do not treat a changed version string as
+proof that all affected objects were rebuilt.
+
 For the GPU probe, configure the standalone engine with `GGML_CUDA=ON`,
 `QWEN_RESEARCH_FRAME_SEEDS=ON`, and `QWEN_RESEARCH_PREFILL=ON`; use an explicit
 GPU architecture and initialized host compiler environment. Build
@@ -38,6 +45,9 @@ it is not pure GPU execution. Phase observation does not add synchronization
 or full-tensor readbacks. The probe copies the existing last-logit readback
 and records its overhead in matched Observer OFF/ON controls. Full dumps,
 frame tracing and Nsight are separate from latency measurements.
+Nsight Systems 2026.4.1 explicitly refuses CUDA tracing on CMP hardware
+(`ERR_NVCMPGPU`). The retained attempt provides NVTX host spans, not CUDA
+kernel timings. Profiler temporary files are routed into its task directory.
 
 ## Prefix controls
 

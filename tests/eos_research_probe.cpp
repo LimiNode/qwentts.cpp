@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 
 namespace {
@@ -49,6 +50,121 @@ bool optional_boolean(yyjson_val * object, const char * key, bool fallback) {
     yyjson_val * value = yyjson_obj_get(object, key);
     if (value && !yyjson_is_bool(value)) throw std::runtime_error(std::string(key) + " must be boolean");
     return value ? yyjson_get_bool(value) : fallback;
+}
+
+enum class SamplerControl { Default, TalkerTop1, PredictorGreedy };
+
+SamplerControl sampler_control(yyjson_val * group) {
+    if (!yyjson_is_obj(group)) throw std::runtime_error("group must be an object");
+    if (!yyjson_obj_get(group, "sampler_control")) return SamplerControl::Default;
+    const auto name = string_field(group, "sampler_control");
+    if (name == "default") return SamplerControl::Default;
+    if (name == "talker-top1") return SamplerControl::TalkerTop1;
+    if (name == "predictor-greedy") return SamplerControl::PredictorGreedy;
+    throw std::runtime_error("sampler_control must be default, talker-top1 or predictor-greedy");
+}
+
+const char * sampler_control_name(SamplerControl control) {
+    switch (control) {
+        case SamplerControl::Default: return "default";
+        case SamplerControl::TalkerTop1: return "talker-top1";
+        case SamplerControl::PredictorGreedy: return "predictor-greedy";
+    }
+    throw std::runtime_error("invalid internal sampler control");
+}
+
+std::vector<SamplerControl> group_sampler_controls(yyjson_val * groups) {
+    if (!yyjson_is_arr(groups) || yyjson_arr_size(groups) == 0 || yyjson_arr_size(groups) > 256) {
+        throw std::runtime_error("expected 1..256 groups");
+    }
+    std::vector<SamplerControl> result;
+    for (size_t index = 0; index < yyjson_arr_size(groups); ++index) {
+        result.push_back(sampler_control(yyjson_arr_get(groups, index)));
+    }
+    return result;
+}
+
+void apply_sampler_control(qt_tts_params & params, SamplerControl control) {
+    if (control == SamplerControl::TalkerTop1) {
+        // Keep the stochastic path's repetition processing, unlike native greedy.
+        params.do_sample = true;
+        params.top_k = 1;
+    } else if (control == SamplerControl::PredictorGreedy) {
+        params.subtalker_do_sample = false;
+    }
+}
+
+void write_effective_sampler(std::ostream & output, const qt_tts_params & params, int predictor_top_k) {
+    output << "{\"do_sample\":" << (params.do_sample ? "true" : "false")
+        << ",\"temperature\":" << (params.do_sample ? params.temperature : 0.0f)
+        << ",\"top_k\":" << params.top_k << ",\"top_p\":" << params.top_p
+        << ",\"repetition_penalty\":" << params.repetition_penalty
+        << ",\"subtalker_do_sample\":" << (params.subtalker_do_sample ? "true" : "false")
+        << ",\"subtalker_temperature\":" << (params.subtalker_do_sample ? params.subtalker_temperature : 0.0f)
+        // The graph bakes model top-k; it has no per-request nucleus filter.
+        << ",\"subtalker_top_k\":" << predictor_top_k << ",\"subtalker_top_p\":1.0"
+        << ",\"subtalker_top_k_source\":\"model_default\",\"subtalker_repetition_penalty\":1.0"
+        << ",\"min_new_tokens\":2,\"eos_guard_enabled\":" << (params.eos_guard_enabled ? "true" : "false")
+        << ",\"eos_guard_start_ratio\":" << params.eos_guard_start_ratio
+        << ",\"eos_guard_max_ratio\":" << params.eos_guard_max_ratio
+        << ",\"eos_guard_force_ratio\":" << params.eos_guard_force_ratio
+        << ",\"eos_guard_max_boost\":" << params.eos_guard_max_boost
+        << ",\"eos_guard_voice_multiplier\":" << params.eos_guard_voice_multiplier
+        << ",\"eos_guard_min_expected_frames\":" << params.eos_guard_min_expected_frames
+        << ",\"eos_guard_frames_per_text_token\":" << params.eos_guard_frames_per_text_token << '}';
+}
+
+void sampler_self_test() {
+    const auto parse = [](const char * json) {
+        JsonDoc doc(yyjson_read(json, std::strlen(json), 0), yyjson_doc_free);
+        if (!doc) throw std::runtime_error("invalid sampler self-test JSON");
+        return group_sampler_controls(yyjson_doc_get_root(doc.get()));
+    };
+    const auto controls = parse("[{},{\"sampler_control\":\"default\"},{\"sampler_control\":\"talker-top1\"},"
+                                "{\"sampler_control\":\"predictor-greedy\"}]");
+    if (controls != std::vector<SamplerControl>{SamplerControl::Default, SamplerControl::Default,
+                                               SamplerControl::TalkerTop1, SamplerControl::PredictorGreedy}) {
+        throw std::runtime_error("sampler control parsing failed");
+    }
+    const char * invalid[] = {"[]", "{}", "[null]", "[false]", "[{\"sampler_control\":null}]",
+        "[{\"sampler_control\":false}]", "[{\"sampler_control\":1}]", "[{\"sampler_control\":\"\"}]",
+        "[{\"sampler_control\":\"DEFAULT\"}]", "[{\"sampler_control\":\"talker_top1\"}]",
+        "[{\"sampler_control\":\"default\\u0000\"}]", "[{}, {\"sampler_control\":\"greedy\"}]"};
+    for (const char * json : invalid) {
+        bool rejected = false;
+        try { (void) parse(json); } catch (const std::runtime_error &) { rejected = true; }
+        if (!rejected) throw std::runtime_error("invalid sampler control was accepted");
+    }
+    for (SamplerControl control : controls) {
+        qt_tts_params params;
+        if (qt_tts_default_params_ex(&params, sizeof(params)) != QT_STATUS_OK) {
+            throw std::runtime_error("sampler defaults unavailable");
+        }
+        apply_sampler_control(params, control);
+        if (!params.do_sample || params.top_k != (control == SamplerControl::TalkerTop1 ? 1 : 50)
+                || params.subtalker_do_sample != (control != SamplerControl::PredictorGreedy)
+                || std::fabs(params.repetition_penalty - 1.05f) > 1e-6f || params.eos_guard_enabled) {
+            throw std::runtime_error("sampler control changed an unrelated default");
+        }
+        std::ostringstream output;
+        write_effective_sampler(output, params, 37);
+        const auto json = output.str();
+        JsonDoc doc(yyjson_read(json.data(), json.size(), 0), yyjson_doc_free);
+        if (!doc) throw std::runtime_error("invalid effective sampler JSON");
+        auto * root = yyjson_doc_get_root(doc.get());
+        if (integer_field(root, "top_k", 1, 50) != params.top_k
+                || integer_field(root, "subtalker_top_k", 1, 50) != 37
+                || integer_field(root, "min_new_tokens", 1, 2) != 2
+                || optional_boolean(root, "subtalker_do_sample", true) != params.subtalker_do_sample
+                || optional_boolean(root, "eos_guard_enabled", true)
+                || std::fabs(yyjson_get_num(yyjson_obj_get(root, "subtalker_temperature"))
+                             - (params.subtalker_do_sample ? 0.9 : 0.0)) > 1e-6) {
+            throw std::runtime_error("effective sampler echo differs from applied settings");
+        }
+        if (control == SamplerControl::TalkerTop1 && std::strcmp(sampler_control_name(control), "talker-top1")) {
+            throw std::runtime_error("sampler control name differs");
+        }
+    }
 }
 
 // Existing manifests omit speaker and keep their Base ICL contract. A preset
@@ -120,6 +236,7 @@ void on_decision(const TtsResearchDecision & decision, void * pointer) noexcept 
 }
 
 void observer_self_test() {
+    sampler_self_test();
     const auto parse_mode = [](const char * json) {
         JsonDoc doc(yyjson_read(json, std::strlen(json), 0), yyjson_doc_free);
         if (!doc) throw std::runtime_error("invalid self-test JSON");
@@ -173,7 +290,7 @@ void observer_self_test() {
         observations[1].decision_count != TTS_RESEARCH_MAX_DECISIONS) {
         throw std::runtime_error("observer overflow/unknown-job detection failed");
     }
-    std::fprintf(stderr, "research observer contract passed (no model/backend loaded)\n");
+    std::fprintf(stderr, "research observer/sampler contracts passed (no model/backend loaded)\n");
 }
 double elapsed(Clock::time_point start) {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
@@ -289,9 +406,9 @@ int main(int argc, char ** argv) {
 #endif
         }
         yyjson_val * groups = yyjson_obj_get(root, "groups");
-        if (!yyjson_is_arr(groups) || yyjson_arr_size(groups) == 0 || yyjson_arr_size(groups) > 256) {
-            throw std::runtime_error("expected 1..256 groups");
-        }
+        if (yyjson_obj_get(root, "sampler_control")) throw std::runtime_error("sampler_control belongs to each group");
+        // Parse every group's control before any backend/model initialization.
+        const auto sampler_controls = group_sampler_controls(groups);
         // Exclusive destination: preserve failed or partial experiments.
         const std::filesystem::path destination(argv[2]);
         if (!std::filesystem::create_directory(destination)) throw std::runtime_error("destination exists");
@@ -348,6 +465,7 @@ int main(int argc, char ** argv) {
                 observations[lane].pcm.reserve(static_cast<size_t>(max_tokens) * 1920);
                 auto & p = params[lane];
                 qt_tts_default_params_ex(&p, sizeof(p));
+                apply_sampler_control(p, sampler_controls[group_index]);
                 p.text = text.c_str(); p.lang = language.c_str();
                 if (custom_voice) {
                     p.speaker = speaker_name.c_str();
@@ -421,6 +539,9 @@ int main(int argc, char ** argv) {
                 {
                     results << "null";
                 }
+                results << ",\"sampler_control\":\"" << sampler_control_name(sampler_controls[group_index])
+                        << "\",\"effective_sampler\":";
+                write_effective_sampler(results, params[lane], owner.pt.gen_defaults.subtalker_top_k);
                 results << ",\"decisions\":[";
                 for (size_t index = 0; index < observation.decision_count; ++index) {
                     if (index) results << ',';

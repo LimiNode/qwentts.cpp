@@ -158,6 +158,7 @@ def main() -> int:
     parser.add_argument("--variants", nargs="+", choices=VARIANTS,
                         default=[name for name in VARIANTS if not name.startswith("prefix")])
     parser.add_argument("--prefix-rows", type=int)
+    parser.add_argument("--russian-only", action="store_true")
     parser.add_argument("--dependency-directory", type=Path, action="append", default=[])
     parser.add_argument("--seconds", type=int, default=1800)
     parser.add_argument("--causal", action="store_true")
@@ -193,6 +194,8 @@ def main() -> int:
     for name in (*INPUT_HASHES, "ru-yes.txt", "ru-two-sentences.txt", "en-unseen.txt"):
         shutil.copyfile(args.inputs / name, inputs / name)
     planned = cases(args.causal)
+    if args.russian_only:
+        planned = [row for row in planned if not row["text_label"].startswith("en-")]
     runtime = [identity(p) for p in sorted(args.probe.parent.glob("*.dll"))]
     runtime += [identity(p) for directory in args.dependency_directory for p in sorted(directory.glob("cublas*.dll"))]
     runtime += [identity(p) for directory in args.dependency_directory for p in sorted(directory.glob("cudart*.dll"))]

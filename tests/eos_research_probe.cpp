@@ -248,6 +248,8 @@ int main(int argc, char ** argv) {
         const auto talker = string_field(root, "talker");
         const auto codec = string_field(root, "codec");
         const bool custom_voice = custom_voice_conditioning(root);
+        const bool icl_reference = optional_boolean(root, "icl_reference", true);
+        if (custom_voice && !icl_reference) throw std::runtime_error("icl_reference applies only to Base conditioning");
         const auto speaker_name = custom_voice ? string_field(root, "speaker") : std::string{};
         std::string reference_text;
         std::vector<float> speaker;
@@ -313,6 +315,12 @@ int main(int argc, char ** argv) {
         if (!owner.engine) throw std::runtime_error("cannot create engine");
         for (size_t group_index = 0; group_index < yyjson_arr_size(groups); ++group_index) {
             yyjson_val * group = yyjson_arr_get(groups, group_index);
+            const bool diagnostic_dump = optional_boolean(group, "diagnostic_dump", false);
+            const auto diagnostic_path = diagnostic_dump ?
+                (destination / ("group-" + std::to_string(group_index) + "-dump")).u8string() : std::string{};
+            if (diagnostic_dump && !std::filesystem::create_directory(std::filesystem::u8path(diagnostic_path))) {
+                throw std::runtime_error("diagnostic destination exists");
+            }
             const auto text = read_bytes(string_field(group, "text_file"), 65536);
             const auto language = string_field(group, "language");
             if (text.empty() || text.find('\0') != std::string::npos) throw std::runtime_error("invalid spoken text");
@@ -340,10 +348,13 @@ int main(int argc, char ** argv) {
                 if (custom_voice) {
                     p.speaker = speaker_name.c_str();
                 } else {
-                    p.ref_text = reference_text.c_str();
                     p.ref_spk_emb = speaker.data(); p.ref_spk_dim = static_cast<int>(speaker.size());
-                    p.ref_codes = codes.data(); p.ref_T = ref_frames;
+                    if (icl_reference) {
+                        p.ref_text = reference_text.c_str();
+                        p.ref_codes = codes.data(); p.ref_T = ref_frames;
+                    }
                 }
+                if (diagnostic_dump) p.dump_dir = diagnostic_path.c_str();
                 p.seed = yyjson_get_sint(seed); p.max_new_tokens = max_tokens;
                 p.on_chunk = on_audio; p.on_chunk_user_data = &observations[lane];
                 p.cancel = cancelled; p.cancel_user_data = &observations[lane];

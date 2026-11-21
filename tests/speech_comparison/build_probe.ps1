@@ -19,15 +19,14 @@ if ((Test-Path -LiteralPath $probeObject) -or (Test-Path -LiteralPath $probeExec
     throw 'Use a fresh output directory; retained probes are not overwritten.'
 }
 $probeSource = Join-Path $PSScriptRoot 'speech_direct_probe.cpp'
-$includeArgs = @('/I' + (Join-Path $speechSource 'src/common'),
-                 '/I' + (Join-Path $speechSource 'src/families'),
-                 '/I' + (Join-Path $speechSource 'ggml/include'))
-& cl.exe /nologo /std:c++17 /MD /O2 /DNDEBUG /utf-8 /EHsc /c @includeArgs "/Fo$probeObject" $probeSource
+$includeArgs = @('src/common', 'src/families', 'ggml/include') |
+    ForEach-Object { '/I' + (Join-Path $speechSource $_) }
+& cl.exe /nologo /std:c++17 /MD /O2 /DNDEBUG /DGGML_USE_CPU /DGGML_USE_CUDA /utf-8 /EHsc /c @includeArgs "/Fo$probeObject" $probeSource
 if ($LASTEXITCODE -ne 0) { throw 'Probe compilation failed.' }
 $libraries = @('qwen3tts.lib', 'speechcommon.lib', 'ggml/src/ggml.lib',
                'ggml/src/ggml-cpu.lib', 'ggml/src/ggml-cuda/ggml-cuda.lib', 'ggml/src/ggml-base.lib') |
     ForEach-Object { Join-Path $speechBinary $_ }
 $libraries += @('cudart.lib', 'cublas.lib', 'cublasLt.lib', 'cuda.lib') |
     ForEach-Object { Join-Path $cudaRoot ('lib/x64/' + $_) }
-& link.exe /NOLOGO "/OUT:$probeExecutable" $probeObject @libraries shell32.lib
+& link.exe /NOLOGO "/OUT:$probeExecutable" $probeObject @libraries shell32.lib advapi32.lib
 if ($LASTEXITCODE -ne 0) { throw 'Probe linking failed.' }

@@ -159,6 +159,8 @@ def main() -> int:
                         default=[name for name in VARIANTS if not name.startswith("prefix")])
     parser.add_argument("--prefix-rows", type=int)
     parser.add_argument("--russian-only", action="store_true")
+    parser.add_argument("--speaker-only", action="store_true",
+                        help="Base clone mode A cost control; not a voice-quality equivalence claim")
     parser.add_argument("--dependency-directory", type=Path, action="append", default=[])
     parser.add_argument("--seconds", type=int, default=1800)
     parser.add_argument("--causal", action="store_true")
@@ -171,6 +173,8 @@ def main() -> int:
         parser.error("bounded budget and unique variants with baseline before candidates required")
     if any(v.startswith("prefix") for v in args.variants) and not (args.prefix_rows and 1 <= args.prefix_rows <= 4095):
         parser.error("prefix variants require --prefix-rows 1..4095 after byte-level discovery")
+    if args.speaker_only and "customvoice" in args.models:
+        parser.error("speaker-only is a Base checkpoint conditioning control")
     model_paths = {
         "ru-stress": args.repo / "models/ru-stress/qwen-talker-1.7b-ru-stress-Q8_0.gguf",
         "base": args.repo / "models/qwen-talker-1.7b-base-Q8_0.gguf",
@@ -206,6 +210,7 @@ def main() -> int:
                "runtime_files": runtime, "cmake_cache": identity(cache) if cache.exists() else None,
                "gpu": gpu, "seconds": args.seconds, "trace": args.causal,
                "prefix_rows": args.prefix_rows,
+               "speaker_only": args.speaker_only,
                "inputs": {p.name: identity(p) for p in inputs.iterdir()},
                "timing_scope": "host wall; CUDA kernel/event time requires independent profiler"})
     deadline = time.monotonic() + args.seconds
@@ -232,6 +237,7 @@ def main() -> int:
             else:
                 manifest.update(speaker_f32=str(inputs / "speaker.f32"), reference_i32=str(inputs / "reference.i32"),
                                 reference_text_file=str(inputs / "reference.txt"), reference_frames=226)
+                manifest["icl_reference"] = not args.speaker_only
             write_json(directory / "manifest.json", manifest)
             env = environment(GPU, [args.probe.parent, *args.dependency_directory], args.causal)
             env = {k: v for k, v in env.items() if not k.startswith("QWEN_PREFILL_")}

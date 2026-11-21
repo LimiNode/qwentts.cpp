@@ -102,6 +102,28 @@ class ShortPrefillContract(unittest.TestCase):
         rows[1]["prefill_observation_enabled"] = True
         self.assertTrue(study.evidence_issues(rows, "timing", "prefix-mmq", logs))
 
+    def test_ordinary_job_seed_and_first_two_sample_logs_are_validated(self):
+        rows = [self.row(i, prefix=True) for i in range(2)]
+        rows[1]["seed"] = 65
+        logs = ("RESEARCH_MATMUL route=forced-mmq\n"
+                "[ResearchJob] serial=0 seed=64\n[Sample] step=0 c0=99 u=0.12 subseq=0\n"
+                "[Sample] step=1 c0=88 u=0.34 subseq=16\n[ResearchJob] serial=1 seed=65")
+        self.assertEqual(study.evidence_issues(rows, "quality", "prefix-mmq", logs), [])
+        self.assertTrue(study.evidence_issues(rows, "quality", "prefix-mmq", logs.replace("seed=65", "seed=72")))
+        self.assertTrue(study.evidence_issues(rows, "quality", "prefix-mmq", logs + "\n[Sample] step=2 c0=1 u=0.1 subseq=32"))
+        self.assertTrue(study.evidence_issues(rows, "quality", "prefix-mmq", logs + "\n[ResearchFrame] codes=1"))
+
+    def test_quality_failure_is_observed_but_never_promoted_to_timing(self):
+        row = {**self.row(), "finish_reason": 2, "frames": 256}
+        result = {"state": "completed_with_failures", "returncode": 0, "issues": [], "rows": [row],
+                  "outcome_issues": study.outcome_issues([row])}
+        self.assertEqual(study.evidence_issues([row], "quality", "baseline", "RESEARCH_MATMUL route=mmq"), [])
+        self.assertEqual(len(result["outcome_issues"]), 1)
+        comparison = study.complete_comparison(result, result, 1)
+        self.assertTrue(comparison["complete"])
+        self.assertFalse(comparison["outcomes_successful"])
+        self.assertFalse(study.timing_summary(result, 1)["eligible"])
+
     def test_incomplete_and_failed_blocks_do_not_enter_timing(self):
         result = {"state": "completed", "returncode": 0, "issues": [], "rows": [self.row(phase="timing")]}
         valid = study.timing_summary(result, 1)
@@ -181,6 +203,16 @@ class ShortPrefillContract(unittest.TestCase):
             (root / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
             (root / "results.json").write_text(json.dumps(results), encoding="utf-8")
             self.assertIn("plan", study.validate_reference(root, runtime, models))
+            failed = results["r0-english-baseline"]
+            failed_row = failed["rows"][11]
+            self.assertEqual((failed_row["text_label"], failed_row["seed"]), ("en-hi", 72))
+            failed_row["finish_reason"], failed_row["frames"] = 2, 256
+            failed.update(state="completed_with_failures", outcome_issues=study.outcome_issues(failed["rows"]))
+            (root / "results.json").write_text(json.dumps(results), encoding="utf-8")
+            self.assertEqual(study.validate_reference(root, runtime, models)["outcome_failures"], 1)
+            failed_row["finish_reason"], failed_row["frames"] = 1, 3
+            failed.update(state="completed", outcome_issues=[])
+            (root / "results.json").write_text(json.dumps(results), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "identity differs"):
                 study.validate_reference(root, [{**runtime[0], "sha256": "changed"}], models)
             first = next(iter(results))

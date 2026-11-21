@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import shutil
 import subprocess
 import time
@@ -98,12 +99,29 @@ def outcome_valid(row: dict) -> bool:
             and "raw" in row and bool(row.get("chunks")))
 
 
+def outcome_issues(rows: list[dict]) -> list[str]:
+    return [f"group {index}: unsuccessful or non-natural terminal/audio; status={row.get('status')}, "
+            f"finish_reason={row.get('finish_reason')}, samples={row.get('samples')}"
+            for index, row in enumerate(rows) if not outcome_valid(row)]
+
+
 def evidence_issues(rows: list[dict], phase: str, variant: str, stderr: str) -> list[str]:
     issues = []
     prefix = variant != "baseline"
-    forbidden = ("ResearchPrefillDiagnostic", "ResearchDecision", "ResearchFrame", "ResearchJob")
+    forbidden = ("ResearchPrefillDiagnostic", "ResearchDecision", "ResearchFrame", "ARTrace", "[FrameSeed]")
     if any(token in stderr for token in forbidden):
         issues.append("unexpected tensor/decision/frame diagnostic log")
+    jobs = [line for line in stderr.splitlines() if "[ResearchJob]" in line]
+    parsed_jobs = [re.search(r"\[ResearchJob\] serial=(\d+) seed=(\d+)", line) for line in jobs]
+    if jobs and (len(jobs) != len(rows) or any(match is None for match in parsed_jobs)
+                 or [(int(match[1]), int(match[2])) for match in parsed_jobs if match]
+                 != [(index, row["seed"]) for index, row in enumerate(rows)]):
+        issues.append("operational job serial/seed log does not match retained rows")
+    samples = [line for line in stderr.splitlines() if "[Sample]" in line]
+    parsed_samples = [re.search(r"\[Sample\] step=(\d+) c0=\d+ u=[\d.]+ subseq=(\d+)", line) for line in samples]
+    if (len(samples) > 2 * len(rows) or any(match is None or int(match[1]) > 1 or int(match[2]) >= 32
+                                           for match in parsed_samples)):
+        issues.append("sampler log exceeds the frozen runtime's ordinary first-two-step logging")
     routes = [line for line in stderr.splitlines() if "RESEARCH_MATMUL" in line]
     prefix_logs = [json.loads(line.split("[ResearchPrefix] ", 1)[1]) for line in stderr.splitlines()
                    if "[ResearchPrefix] " in line]
@@ -138,17 +156,18 @@ def evidence_issues(rows: list[dict], phase: str, variant: str, stderr: str) -> 
                             or observation.get("prefix_hit") != (prefix and index > 0)
                             or (prefix and observation.get("prefix_source") != "full")):
             issues.append(f"group {index}: prefix rows/hit/source not effective")
-        if not outcome_valid(row):
-            issues.append(f"group {index}: unsuccessful or non-natural terminal/audio")
     return issues
 
 
 def complete_comparison(candidate: dict, baseline: dict, planned: int) -> dict:
     result = compare(candidate["rows"], baseline["rows"])
-    result.update(planned=planned, complete=(candidate["state"] == baseline["state"] == "completed"
+    result.update(planned=planned, complete=(all(value["state"] in ("completed", "completed_with_failures")
+                                               for value in (candidate, baseline))
                   and candidate.get("returncode") == baseline.get("returncode") == 0
                   and not candidate.get("issues") and not baseline.get("issues")
-                  and result["paired"] == planned and result["same_observed_denominator"]))
+                  and result["paired"] == planned and result["same_observed_denominator"]),
+                  outcomes_successful=bool(candidate["rows"] and baseline["rows"])
+                  and all(outcome_valid(row) for value in (candidate, baseline) for row in value["rows"]))
     return result
 
 
@@ -170,7 +189,7 @@ def validate_reference(path: Path, runtime: list[dict], model_inputs: list[dict]
     results = json.loads((path / "results.json").read_text(encoding="utf-8"))
     expected = {f"r0-{language}-{variant}" for _, language, variant in blocks("quality")}
     if (plan.get("phase") != "quality" or set(results) != expected
-            or any(r["state"] != "completed" or r.get("returncode") != 0 or r["issues"]
+            or any(r["state"] not in ("completed", "completed_with_failures") or r.get("returncode") != 0 or r["issues"]
                    or len(r["rows"]) != 18 for r in results.values())
             or runtime_signature(runtime) != runtime_signature(plan["runtime"])
             or runtime_signature(model_inputs) != runtime_signature(plan["model_inputs"])):
@@ -202,6 +221,10 @@ def validate_reference(path: Path, runtime: list[dict], model_inputs: list[dict]
         rows = results[name]["rows"]
         planned = cases("quality", language)
         result = results[name]
+        failures = outcome_issues(rows)
+        if (result.get("outcome_issues", []) != failures
+                or result["state"] != ("completed_with_failures" if failures else "completed")):
+            raise ValueError("quality reference outcome failures are missing or mislabeled")
         for key in ("manifest", "environment", "stderr"):
             if verify(result[key]).resolve() != (path / name / (key + (".log" if key == "stderr" else ".json"))).resolve():
                 raise ValueError("quality reference block artifact path differs")
@@ -222,8 +245,10 @@ def validate_reference(path: Path, runtime: list[dict], model_inputs: list[dict]
                 for row, control in zip(rows, planned))
                 or evidence_issues(rows, "quality", variant,
                                    (path / name / "stderr.log").read_text(encoding="utf-8", errors="replace"))):
-            raise ValueError("quality reference has invalid effective settings or outcomes")
-    return {"plan": identity(path / "plan.json"), "results": identity(path / "results.json")}
+            raise ValueError("quality reference has invalid effective settings")
+    return {"plan": identity(path / "plan.json"), "results": identity(path / "results.json"),
+            "scope": "complete mechanical reference, not successful speech quality",
+            "outcome_failures": sum(len(outcome_issues(r["rows"])) for r in results.values())}
 
 
 def script_paths() -> list[Path]:
@@ -279,7 +304,7 @@ def main() -> int:
                "schedule": schedule, "warm": args.warm, "quality_reference": reference,
                "planned_requests": sum(len(cases(args.phase, language, args.warm)) for _, language, _ in schedule),
                "quality_scope": "complete outputs retained; word coverage and cough/voice quality unassessed",
-               "timing_caveat": "PROFILE=0; prefix-hit operational log remains in this frozen engine; no kernel-event claims"})
+               "timing_caveat": "PROFILE=0; ordinary job/seed, first-two-step Sample, and prefix-hit logs remain in the frozen engine; no kernel-event claims"})
     results = {}
     for repeat, language, variant in schedule:
         name = f"r{repeat}-{language}-{variant}"
@@ -317,7 +342,11 @@ def main() -> int:
             issues.append(f"malformed effective evidence: {error}")
         if code != 0 or len(rows) != len(planned) or issues:
             state = "incomplete" if state == "completed" else state
+        failures = outcome_issues(rows)
+        if state == "completed" and failures:
+            state = "completed_with_failures" if args.phase == "quality" else "incomplete"
         result = {"state": state, "returncode": code, "rows": rows, "issues": issues, "planned": len(planned),
+                  "outcome_issues": failures,
                   "human_listening": "not_run", "word_coverage": "unassessed", "voice_quality": "unassessed",
                   "manifest": identity(directory / "manifest.json"), "environment": identity(directory / "environment.json"),
                   "stderr": identity(directory / "stderr.log")}

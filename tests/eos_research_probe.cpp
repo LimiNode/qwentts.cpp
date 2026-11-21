@@ -405,7 +405,8 @@ int main(int argc, char ** argv) {
                     << ",\"decision_capture_invalid\":" << (capture.unknown_job || observation.decision_overflow ? "true" : "false")
                     << ",\"invalid_pcm\":" << (observation.invalid_pcm ? "true" : "false")
                     << ",\"capacity_exceeded\":" << (observation.capacity_exceeded ? "true" : "false")
-                    << ",\"conditioning\":\"" << (custom_voice ? "custom_voice" : "base_icl") << '"'
+                    << ",\"conditioning\":\""
+                    << (custom_voice ? "custom_voice" : icl_reference ? "base_icl" : "base_speaker_only") << '"'
                     << ",\"prefill_observation_enabled\":" << (observe_prefill ? "true" : "false")
                     << ",\"prefill_observation\":";
 #ifdef QWEN_RESEARCH_PREFILL

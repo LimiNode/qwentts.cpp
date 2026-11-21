@@ -67,7 +67,8 @@ def logits_difference(left: Path, right: Path) -> dict:
                             == max(range(len(bv)), key=bv.__getitem__)}
 
 
-def collect(directory: Path, planned: list[dict], trace: bool) -> tuple[list[dict], list[str]]:
+def collect(directory: Path, planned: list[dict], trace: bool,
+            expected_conditioning: str | None = None) -> tuple[list[dict], list[str]]:
     path = directory / "probe" / "results.jsonl"
     issues = []
     if not path.exists():
@@ -90,6 +91,9 @@ def collect(directory: Path, planned: list[dict], trace: bool) -> tuple[list[dic
             break
         raw = directory / "probe" / f"group-{index}-lane-0.f32"
         row.update(planned[index], coverage="unassessed")
+        if expected_conditioning and row.get("conditioning") != expected_conditioning:
+            issues.append(f"group {index}: conditioning mismatch; expected {expected_conditioning}, "
+                          f"got {row.get('conditioning')}")
         try:
             if raw.stat().st_size != row["samples"] * 4:
                 raise ValueError("PCM size mismatch")
@@ -263,7 +267,9 @@ def main() -> int:
                     status = "timeout"
             if returncode not in (None, 0):
                 status = "failed"
-            rows, issues = collect(directory, planned, args.causal)
+            conditioning = ("custom_voice" if label == "customvoice" else
+                            "base_speaker_only" if args.speaker_only else "base_icl")
+            rows, issues = collect(directory, planned, args.causal, conditioning)
             if issues or len(rows) != len(planned):
                 status = "incomplete" if status == "completed" else status
             variants[variant] = {"state": status, "returncode": returncode, "rows": rows,

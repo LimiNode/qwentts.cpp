@@ -163,3 +163,13 @@ DLLs, model/codec, inputs and harness scripts. Its source HEAD identifies the
 harness checkout, not necessarily the source used to build a retained probe;
 preserve that probe's original build/patch receipt separately. This statically
 linked research probe is not Bridge/native-worker or packaged-DLL acceptance.
+
+`completed_with_failures` means all planned quality observations were retained,
+but at least one synthesis had a non-natural or invalid outcome; inspect
+`outcome_issues` and every row. A complete quality observation reference may
+include those explicit failures and is never a human-quality pass. Timing
+eligibility still requires successful natural-EOS audio for the entire block.
+The frozen runtime's unconditional job/seed and first-two-step sampler logs
+also remain; the runner checks their bounds instead of confusing them with
+opt-in full-frame/decision/tensor traces. Their cost is included alongside
+ordinary engine and prefix-hit logs.

@@ -53,6 +53,7 @@
 #include <vector>
 #ifdef QWEN_RESEARCH_PREFILL
 #    include "research_prefill.h"
+#    include "research_nvtx.h"
 
 #    include <chrono>
 
@@ -420,6 +421,8 @@ static bool talker_forward_core(const TalkerWeights * tw,
 ) {
 #ifdef QWEN_RESEARCH_PREFILL
     ResearchPrefillClock clock(research && research->settings.profile);
+    ResearchPrefillNvtx all_range("prefill/all");
+    ResearchPrefillNvtx phase_range("prefill/setup");
     if (research) {
         research->observation.available = false;
     }
@@ -483,6 +486,7 @@ static bool talker_forward_core(const TalkerWeights * tw,
         }
     }
     const double setup_ms = clock.lap();
+    phase_range.next("prefill/build");
 #endif
     if (!graph_ready) {
         struct ggml_context * gctx = graph_arena_begin(arena);
@@ -567,6 +571,7 @@ static bool talker_forward_core(const TalkerWeights * tw,
         ggml_build_forward_expand(gf, bridge_cpy);
 #ifdef QWEN_RESEARCH_PREFILL
         build_ms = clock.lap();
+        phase_range.next("prefill/schedule_alloc");
 #endif
 
         ggml_backend_sched_reset(sched);
@@ -597,6 +602,9 @@ static bool talker_forward_core(const TalkerWeights * tw,
 #endif
     }
 
+#ifdef QWEN_RESEARCH_PREFILL
+    phase_range.next("prefill/upload");
+#endif
     // Upload input embedding (host [T, hidden] -> ggml [hidden, T]).
     ggml_backend_tensor_set(x_in, input_embed, 0, (size_t) T * (size_t) hidden * sizeof(float));
 
@@ -636,6 +644,7 @@ static bool talker_forward_core(const TalkerWeights * tw,
     }
 #ifdef QWEN_RESEARCH_PREFILL
     const double upload_ms = clock.lap();
+    phase_range.next("prefill/compute_wait");
 #endif
 
     if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
@@ -650,6 +659,7 @@ static bool talker_forward_core(const TalkerWeights * tw,
     }
 #ifdef QWEN_RESEARCH_PREFILL
     const double compute_ms = clock.lap();
+    phase_range.next("prefill/readback");
 #endif
 
     // Bisect dumps: pull each tap [hidden, T] back to host as [T, hidden].
@@ -701,6 +711,8 @@ static bool talker_forward_core(const TalkerWeights * tw,
     kv->cur_len[(size_t) kv_set] = T_full;
 #ifdef QWEN_RESEARCH_PREFILL
     const double readback_ms = clock.lap();
+    phase_range.end();
+    all_range.end();
     if (clock.active && read_logits_host) {
         ResearchPrefillObservation & observation = research->observation;
         observation.available                    = true;

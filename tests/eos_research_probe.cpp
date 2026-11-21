@@ -222,7 +222,14 @@ void write_prefill_observation(std::ostream & results, const ResearchPrefillObse
         << ",\"schedule_alloc_ms\":" << observation.schedule_alloc_ms << ",\"upload_ms\":" << observation.upload_ms
         << ",\"compute_wait_ms\":" << observation.compute_wait_ms << ",\"readback_ms\":" << observation.readback_ms
         << ",\"total_ms\":" << observation.total_ms << ",\"logits_f32\":\"" << filename
-        << "\",\"logits_count\":" << observation.logits_last.size() << ",\"nonfinite_logits\":" << nonfinite << '}';
+        << "\",\"logits_count\":" << observation.logits_last.size() << ",\"nonfinite_logits\":" << nonfinite
+        << ",\"prefix_rows\":" << observation.prefix_rows << ",\"prompt_rows\":" << observation.prompt_rows
+        << ",\"common_rows_with_first\":" << observation.common_rows_with_first
+        << ",\"prefix_hit\":" << (observation.prefix_hit ? "true" : "false")
+        << ",\"prefix_setup_ms\":" << observation.prefix_setup_ms
+        << ",\"prefix_snapshot_ms\":" << observation.prefix_snapshot_ms
+        << ",\"prefix_restore_ms\":" << observation.prefix_restore_ms
+        << ",\"prefix_total_ms\":" << observation.prefix_total_ms << '}';
 }
 #endif
 }

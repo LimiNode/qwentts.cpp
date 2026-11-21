@@ -153,9 +153,17 @@ if(QWEN_RESEARCH_FRAME_SEEDS)
 endif()
 
 option(QWEN_RESEARCH_PREFILL "Enable private prefill profiling and optimization experiments" OFF)
+option(QWEN_RESEARCH_NVTX "Label research prefill phases for separate Nsight runs" OFF)
+if(QWEN_RESEARCH_NVTX AND (NOT QWEN_RESEARCH_PREFILL OR NOT GGML_CUDA))
+    message(FATAL_ERROR "QWEN_RESEARCH_NVTX requires QWEN_RESEARCH_PREFILL and GGML_CUDA")
+endif()
 if(QWEN_RESEARCH_PREFILL)
     # Internal tools include PipelineTTS, so they must see its research layout.
     target_compile_definitions(qwen-core PUBLIC QWEN_RESEARCH_PREFILL=1)
+endif()
+if(QWEN_RESEARCH_NVTX)
+    target_compile_definitions(qwen-core PRIVATE QWEN_RESEARCH_NVTX=1)
+    target_include_directories(qwen-core PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 endif()
 
 # Public shared library for ABI consumers (Python ctypes, Rust bindgen,
@@ -182,6 +190,10 @@ if(QWEN_SHARED)
     endif()
     if(QWEN_RESEARCH_PREFILL)
         target_compile_definitions(qwen PRIVATE QWEN_RESEARCH_PREFILL=1)
+    endif()
+    if(QWEN_RESEARCH_NVTX)
+        target_compile_definitions(qwen PRIVATE QWEN_RESEARCH_NVTX=1)
+        target_include_directories(qwen PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
     endif()
 endif()
 
@@ -284,6 +296,9 @@ add_test(NAME sampling_graph_contract COMMAND test-sampling-graph-contract)
 # reference implementation over fixed edge-case vectors.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
+    add_test(NAME prefill_research_python
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_prefill_research.py)
     add_test(NAME eos_research_corpus_python
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_eos_corpus.py)

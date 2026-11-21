@@ -217,6 +217,9 @@ void write_prefill_observation(std::ostream & results, const ResearchPrefillObse
         << ",\"retain\":" << (settings.retain ? "true" : "false")
         << ",\"retained_hit\":" << (observation.retained_hit ? "true" : "false")
         << ",\"diagnostic\":" << (observation.diagnostic ? "true" : "false")
+        << ",\"diagnostic_serial\":" << observation.diagnostic_serial
+        << ",\"diagnostic_layer\":" << observation.diagnostic_layer
+        << ",\"prefill_use_flash_attn\":" << (observation.prefill_use_flash_attn ? "true" : "false")
         << ",\"graph_nodes\":" << observation.graph_nodes << ",\"scheduler_splits\":" << observation.scheduler_splits
         << ",\"setup_ms\":" << observation.setup_ms << ",\"graph_build_ms\":" << observation.graph_build_ms
         << ",\"schedule_alloc_ms\":" << observation.schedule_alloc_ms << ",\"upload_ms\":" << observation.upload_ms

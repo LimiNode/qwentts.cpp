@@ -145,20 +145,19 @@ class PrefillResearchContract(unittest.TestCase):
             self.assertIn("artifact_error", rows[0])
 
     def test_collect_retains_but_rejects_an_ignored_conditioning_switch(self):
-        with tempfile.TemporaryDirectory(dir=self.temp_root) as folder:
-            root = Path(folder)
-            terminal, planned = self.fixture(root)
-            terminal["conditioning"] = "base_icl"
-            path = root / "probe/results.jsonl"
-            path.write_text(json.dumps(terminal) + "\n", encoding="utf-8")
-            rows, issues = research.collect(root, planned, False, "base_speaker_only")
-            self.assertEqual(len(rows), 1)
-            self.assertTrue(any("conditioning mismatch" in issue for issue in issues))
-            terminal["conditioning"] = "base_speaker_only"
-            path.write_text(json.dumps(terminal) + "\n", encoding="utf-8")
-            rows, issues = research.collect(root, planned, False, "base_speaker_only")
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(issues, [])
+        for conditioning in ("base_icl", "base_speaker_only"):
+            with tempfile.TemporaryDirectory(dir=self.temp_root) as folder:
+                root = Path(folder)
+                terminal, planned = self.fixture(root)
+                terminal["conditioning"] = conditioning
+                path = root / "probe/results.jsonl"
+                path.write_text(json.dumps(terminal) + "\n", encoding="utf-8")
+                rows, issues = research.collect(root, planned, False, "base_speaker_only")
+                self.assertEqual(len(rows), 1)
+                if conditioning == "base_icl":
+                    self.assertTrue(any("conditioning mismatch" in issue for issue in issues))
+                else:
+                    self.assertEqual(issues, [])
 
     def test_compare_reports_outcome_differences_and_rejects_mispair(self):
         row = {"group": 0, "text_label": "original", "seed": 64,

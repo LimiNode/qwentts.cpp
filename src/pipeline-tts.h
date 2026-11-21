@@ -23,6 +23,10 @@
 #include "speaker-encoder-weights.h"
 #include "talker-decode-graph.h"
 #include "talker-weights.h"
+#ifdef QWEN_RESEARCH_PREFILL
+#include "research_prefill.h"
+struct ResearchPrefillState;
+#endif
 
 #include <cstdint>
 #ifdef QWEN_RESEARCH_FRAME_SEEDS
@@ -176,6 +180,10 @@ struct PipelineTTS {
     // on sub Ampere CUDA targets.
     bool use_flash_attn;
     bool clamp_fp16;
+#ifdef QWEN_RESEARCH_PREFILL
+    ResearchPrefillSettings research_prefill_settings;
+    ResearchPrefillState * research_prefill = nullptr;
+#endif
 
     // Persistent KV caches, one set per slot: the talker holds the LM
     // contexts, the predictor holds one frame's 16 sub-steps per slot,
@@ -203,6 +211,11 @@ struct PipelineTTS {
     std::vector<TalkerDecodeGraph> talker_decode_graphs;  // one per 256 step window class, lazy
     std::vector<CodePredGraphSet>  cp_graphs;             // index N - 1, lazy per batch width
 };
+
+#ifdef QWEN_RESEARCH_PREFILL
+// Private research seam, not part of qwen.h or the shared-library ABI.
+bool pipeline_tts_research_prefill_observe(const PipelineTTS * pt, ResearchPrefillObservation * out);
+#endif
 
 // Open the talker GGUF and the codec GGUF, load every module on the
 // shared backend. Aborts with a logged error on any missing tensor or

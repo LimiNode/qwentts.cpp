@@ -22,9 +22,9 @@ jobs:
           ctest --test-dir build --output-on-failure -R '^(sampling(_graph)?_contract(_python_parity)?|sampler_diagnostic_python|first_mismatch_python|eos_guard_contract)$'
       - name: Build and test opt-in research seam
         run: |
-          cmake -S . -B build -DQWEN_RESEARCH_FRAME_SEEDS=ON
-          cmake --build build --target eos-research-probe test-frame-seed-contract --parallel 2
-          ctest --test-dir build --output-on-failure -R '^(frame_seed_contract|eos_research_observer_contract|eos_research_(runner|analysis|corpus)_python)$'
+          cmake -S . -B build -DQWEN_RESEARCH_FRAME_SEEDS=ON -DQWEN_RESEARCH_PREFILL=ON
+          cmake --build build --target eos-research-probe test-frame-seed-contract test-prefill-settings-contract --parallel 2
+          ctest --test-dir build --output-on-failure -R '^(frame_seed_contract|prefill_settings_contract|prefill_research_python|speech_comparison_python|eos_research_observer_contract|eos_research_(runner|analysis|corpus)_python)$'
 
   windows-msvc-shared:
     runs-on: windows-latest
@@ -46,8 +46,8 @@ jobs:
       - name: Build and test opt-in research seam
         shell: pwsh
         run: |
-          cmake -S . -B build -DQWEN_RESEARCH_FRAME_SEEDS=ON
+          cmake -S . -B build -DQWEN_RESEARCH_FRAME_SEEDS=ON -DQWEN_RESEARCH_PREFILL=ON
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cmake --build build --config Release --target eos-research-probe test-frame-seed-contract --parallel 2
+          cmake --build build --config Release --target eos-research-probe test-frame-seed-contract test-prefill-settings-contract --parallel 2
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ctest --test-dir build -C Release --output-on-failure -R '^(frame_seed_contract|eos_research_observer_contract|eos_research_(runner|analysis|corpus)_python)$'
+          ctest --test-dir build -C Release --output-on-failure -R '^(frame_seed_contract|prefill_settings_contract|prefill_research_python|speech_comparison_python|eos_research_observer_contract|eos_research_(runner|analysis|corpus)_python)$'

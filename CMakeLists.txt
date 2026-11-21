@@ -152,6 +152,21 @@ if(QWEN_RESEARCH_FRAME_SEEDS)
     target_compile_definitions(qwen-core PRIVATE QWEN_RESEARCH_FRAME_SEEDS=1)
 endif()
 
+option(QWEN_RESEARCH_PREFILL "Enable private prefill profiling and optimization experiments" OFF)
+option(QWEN_RESEARCH_NVTX "Label research prefill phases for separate Nsight runs" OFF)
+if(QWEN_RESEARCH_NVTX AND (NOT QWEN_RESEARCH_PREFILL OR NOT GGML_CUDA))
+    message(FATAL_ERROR "QWEN_RESEARCH_NVTX requires QWEN_RESEARCH_PREFILL and GGML_CUDA")
+endif()
+if(QWEN_RESEARCH_PREFILL)
+    # Internal tools include PipelineTTS, so they must see its research layout.
+    target_compile_definitions(qwen-core PUBLIC QWEN_RESEARCH_PREFILL=1)
+endif()
+if(QWEN_RESEARCH_NVTX)
+    find_package(CUDAToolkit REQUIRED)
+    target_compile_definitions(qwen-core PRIVATE QWEN_RESEARCH_NVTX=1)
+    target_include_directories(qwen-core PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+endif()
+
 # Public shared library for ABI consumers (Python ctypes, Rust bindgen,
 # Go cgo). Opt-in : -DQWEN_SHARED=ON at configure time. Exports only
 # the QT_API-marked symbols ; every internal pipeline_* / backend_*
@@ -173,6 +188,13 @@ if(QWEN_SHARED)
     link_ggml_backends(qwen)
     if(QWEN_RESEARCH_FRAME_SEEDS)
         target_compile_definitions(qwen PRIVATE QWEN_RESEARCH_FRAME_SEEDS=1)
+    endif()
+    if(QWEN_RESEARCH_PREFILL)
+        target_compile_definitions(qwen PRIVATE QWEN_RESEARCH_PREFILL=1)
+    endif()
+    if(QWEN_RESEARCH_NVTX)
+        target_compile_definitions(qwen PRIVATE QWEN_RESEARCH_NVTX=1)
+        target_include_directories(qwen PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
     endif()
 endif()
 
@@ -223,6 +245,14 @@ link_ggml_backends(test-abi-c)
 # Model-free sampling contract regression: EOS is masked only for the first
 # codec frame and remains eligible on subsequent generation steps.
 enable_testing()
+add_executable(test-prefill-settings-contract tests/prefill_settings_contract.cpp)
+target_include_directories(test-prefill-settings-contract PRIVATE ${CMAKE_SOURCE_DIR}/src)
+if(MSVC)
+    target_compile_options(test-prefill-settings-contract PRIVATE /W4 /WX)
+else()
+    target_compile_options(test-prefill-settings-contract PRIVATE -Wall -Wextra -Werror -pedantic)
+endif()
+add_test(NAME prefill_settings_contract COMMAND test-prefill-settings-contract)
 if(QWEN_RESEARCH_FRAME_SEEDS)
     add_executable(eos-research-probe tests/eos_research_probe.cpp)
     target_compile_definitions(eos-research-probe PRIVATE QWEN_RESEARCH_FRAME_SEEDS=1)
@@ -267,6 +297,24 @@ add_test(NAME sampling_graph_contract COMMAND test-sampling-graph-contract)
 # reference implementation over fixed edge-case vectors.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
+    add_test(NAME prefill_research_python
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_prefill_research.py)
+    add_test(NAME prefill_differential_python
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_prefill_differential.py)
+    add_test(NAME prefill_differential_analysis_python
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_analyze_prefill_differential.py)
+    add_test(NAME prefill_short_python
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_prefill_short.py)
+    add_test(NAME prefill_quality_causal_python
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_prefill_quality_causal.py)
+    add_test(NAME speech_comparison_python
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_speech_comparison.py)
     add_test(NAME eos_research_corpus_python
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_eos_corpus.py)

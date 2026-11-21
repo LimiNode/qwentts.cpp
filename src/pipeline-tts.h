@@ -310,6 +310,28 @@ using TtsResearchDecisionObserver = void (*)(const TtsResearchDecision &, void *
 // A null observer costs no clock read; at most eight early selections plus
 // one later EOS are emitted for each job. This installs no live selector.
 void tts_engine_set_research_observer(TtsEngine * e, TtsResearchDecisionObserver observer, void * user);
+
+// Stage-1 AR checkpoint experiment. This deliberately accepts only one
+// buffered slot: there is no mutable codec lane and no PCM has been committed.
+// It is not a streaming codec snapshot or a public engine ABI.
+struct TtsResearchSnapshot;
+struct TtsResearchSnapshotInfo {
+    int frame = 0;
+    int talker_rows = 0;
+    size_t bytes = 0;
+    double capture_ms = 0.0;
+};
+
+bool tts_engine_research_capture_codes(TtsEngine * e, bool enabled);
+TtsResearchSnapshot * tts_engine_research_snapshot(TtsEngine * e);
+void tts_engine_research_snapshot_free(TtsResearchSnapshot * snapshot);
+TtsResearchSnapshotInfo tts_engine_research_snapshot_info(const TtsResearchSnapshot * snapshot);
+// The caller must free any retired buffered qt_audio before restoration.
+// Same engine/job/model only, no concurrent slots; -1 restores the captured
+// RNG key and seed >=0 explicitly selects a continuation key.
+bool tts_engine_research_restore(TtsEngine * e, const TtsResearchSnapshot * snapshot,
+                                int64_t continuation_seed, double * restore_ms);
+const std::vector<int32_t> * tts_engine_research_codes(const TtsEngine * e, const TtsJob * job);
 #endif
 
 TtsEngine * tts_engine_new(PipelineTTS * pt, BPETokenizer * tok);

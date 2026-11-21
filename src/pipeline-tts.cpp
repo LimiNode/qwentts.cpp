@@ -28,6 +28,9 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#ifdef QWEN_RESEARCH_FRAME_SEEDS
+#include <memory>
+#endif
 #ifdef QWEN_RESEARCH_PREFILL
 #include <new>
 #endif
@@ -832,6 +835,9 @@ struct TtsEngine {
 #ifdef QWEN_RESEARCH_FRAME_SEEDS
     TtsResearchDecisionObserver research_observer = nullptr;
     void * research_observer_user = nullptr;
+    bool research_capture_codes = false;
+    const TtsJob * research_codes_job = nullptr;
+    std::vector<int32_t> research_codes;
 #endif
 
     // Shared codec streaming ramp, lockstep over the compacted lanes
@@ -855,6 +861,142 @@ struct TtsEngine {
 void tts_engine_set_research_observer(TtsEngine * e, TtsResearchDecisionObserver observer, void * user) {
     e->research_observer = observer;
     e->research_observer_user = user;
+}
+
+bool tts_engine_research_capture_codes(TtsEngine * e, bool enabled) {
+    if (!e || !e->slots.empty()) return false;
+    e->research_capture_codes = enabled;
+    e->research_codes_job = nullptr;
+    e->research_codes.clear();
+    return true;
+}
+
+struct TtsResearchKV {
+    int cur_len = 0;
+    size_t head_bytes = 0;
+    std::vector<std::vector<uint8_t>> parts;
+};
+
+struct TtsResearchSnapshot {
+    TtsEngine * owner = nullptr;
+    TtsSlot slot;
+    int64_t seed = 0;
+    TtsResearchKV talker;
+    TtsResearchKV predictor;
+    std::vector<float> bridge;
+    TtsResearchSnapshotInfo info;
+};
+
+// Copy only the padded attention window. Rows beyond it are masked until
+// overwritten by a future decode; preserve the masked finite tail in-window
+// as well so unchanged replay does not inherit intervening trajectory data.
+static bool tts_research_kv_capture(KVCache * kv, int rows, TtsResearchKV * saved) {
+    if (kv->n_sets != 1 || rows <= 0 || rows > kv->max_seq_len) return false;
+    saved->cur_len = kv->cur_len[0];
+    saved->head_bytes = (size_t) rows * kv_cache_k(kv, 0, 0)->nb[1];
+    saved->parts.resize((size_t) kv->n_layers * 2);
+    for (int layer = 0; layer < kv->n_layers; ++layer) {
+        for (int part = 0; part < 2; ++part) {
+            auto * tensor = part == 0 ? kv_cache_k(kv, 0, layer) : kv_cache_v(kv, 0, layer);
+            auto & bytes = saved->parts[(size_t) layer * 2 + (size_t) part];
+            bytes.resize(saved->head_bytes * (size_t) kv->n_kv_heads);
+            for (int head = 0; head < kv->n_kv_heads; ++head) {
+                ggml_backend_tensor_get(tensor, bytes.data() + (size_t) head * saved->head_bytes,
+                                        (size_t) head * tensor->nb[2], saved->head_bytes);
+            }
+        }
+    }
+    return true;
+}
+
+static void tts_research_kv_restore(KVCache * kv, const TtsResearchKV & saved) {
+    for (int layer = 0; layer < kv->n_layers; ++layer) {
+        for (int part = 0; part < 2; ++part) {
+            auto * tensor = part == 0 ? kv_cache_k(kv, 0, layer) : kv_cache_v(kv, 0, layer);
+            const auto & bytes = saved.parts[(size_t) layer * 2 + (size_t) part];
+            for (int head = 0; head < kv->n_kv_heads; ++head) {
+                ggml_backend_tensor_set(tensor, bytes.data() + (size_t) head * saved.head_bytes,
+                                        (size_t) head * tensor->nb[2], saved.head_bytes);
+            }
+        }
+    }
+    kv->cur_len[0] = saved.cur_len;
+}
+
+TtsResearchSnapshot * tts_engine_research_snapshot(TtsEngine * e) {
+    if (!e || e->pt->max_batch != 1 || e->slots.size() != 1 || !e->research_capture_codes) return nullptr;
+    const auto & slot = e->slots[0];
+#ifdef QWEN_RESEARCH_PREFILL
+    if (e->pt->research_prefill_settings.prefix_rows) return nullptr;
+#endif
+    if (slot.streaming || slot.codec_set != -1 || e->codec_M || e->codec_pending_n ||
+        slot.finished || slot.step < 0 || slot.step > 8 || slot.job->params->dump_dir ||
+        slot.all_codes.size() != (size_t) slot.step || slot.talker_history.size() != (size_t) slot.step ||
+        slot.subseq_counter != (int64_t) slot.step * e->pt->num_code_groups ||
+        slot.frame_seed_schedule.mode != ResearchFrameSeedMode::Baseline ||
+        !slot.forced_talker_frames.empty() || !slot.forced_talker_history.empty() ||
+        !slot.forced_predictor_frames.empty()) return nullptr;
+    Timer clock;
+    const int alignment = e->pt->talker_kv.attention_alignment;
+    const int rows = ((e->pt->talker_kv.cur_len[0] + 1 + alignment - 1) / alignment) * alignment;
+    // Bounded discovery scope, not an unbounded utterance-state API.
+    if (rows > 512 || rows > e->pt->talker_kv.max_seq_len) return nullptr;
+    auto saved = std::make_unique<TtsResearchSnapshot>();
+    saved->owner = e;
+    saved->slot = slot;
+    saved->seed = slot.job->resolved_seed;
+    if (!tts_research_kv_capture(&e->pt->talker_kv, rows, &saved->talker) ||
+        !tts_research_kv_capture(&e->pt->code_predictor_kv, e->pt->num_code_groups, &saved->predictor)) return nullptr;
+    saved->bridge.resize((size_t) e->pt->talker.hidden_size);
+    ggml_backend_tensor_get(e->pt->hidden_bridge, saved->bridge.data(), 0,
+                            saved->bridge.size() * sizeof(float));
+    saved->info.frame = slot.step;
+    saved->info.talker_rows = rows;
+    saved->info.bytes = saved->bridge.size() * sizeof(float);
+    for (const auto & part : saved->talker.parts) saved->info.bytes += part.size();
+    for (const auto & part : saved->predictor.parts) saved->info.bytes += part.size();
+    saved->info.capture_ms = clock.ms();
+    return saved.release();
+}
+
+void tts_engine_research_snapshot_free(TtsResearchSnapshot * snapshot) { delete snapshot; }
+
+TtsResearchSnapshotInfo tts_engine_research_snapshot_info(const TtsResearchSnapshot * snapshot) {
+    return snapshot ? snapshot->info : TtsResearchSnapshotInfo{};
+}
+
+bool tts_engine_research_restore(TtsEngine * e, const TtsResearchSnapshot * saved,
+                                int64_t continuation_seed, double * restore_ms) {
+    if (!e || !saved || saved->owner != e || !e->research_capture_codes || e->pt->max_batch != 1 ||
+        e->slots.size() > 1 || (!e->slots.empty() && e->slots[0].job != saved->slot.job) ||
+        e->codec_M || e->codec_pending_n || saved->slot.job->out->samples || continuation_seed < -1) return false;
+    Timer clock;
+    // Construct host state first: allocation failure must not leave partially
+    // restored device state, and copied pointers are rebound to their owners.
+    TtsSlot slot = saved->slot;
+    slot.ref_codes_ptr = slot.ref_codes_store.empty() ? saved->slot.ref_codes_ptr : slot.ref_codes_store.data();
+    slot.prev_overlay = slot.step == 0 ? nullptr :
+        slot.step - 1 < slot.prompt.T_trailing ?
+            slot.prompt.trailing_text_hidden.data() + (size_t) (slot.step - 1) * (size_t) slot.prompt.hidden :
+            slot.prompt.tts_pad_embed.data();
+    tts_research_kv_restore(&e->pt->talker_kv, saved->talker);
+    tts_research_kv_restore(&e->pt->code_predictor_kv, saved->predictor);
+    ggml_backend_tensor_set(e->pt->hidden_bridge, saved->bridge.data(), 0,
+                            saved->bridge.size() * sizeof(float));
+    e->slots.clear();
+    e->slots.push_back(std::move(slot));
+    e->slots[0].job->resolved_seed = continuation_seed == -1 ? saved->seed : continuation_seed;
+    e->slots[0].job->status = QT_STATUS_OK;
+    e->slots[0].job->finish_reason = QT_FINISH_UNKNOWN;
+    e->slots[0].job->error.clear();
+    e->research_codes_job = nullptr;
+    e->research_codes.clear();
+    if (restore_ms) *restore_ms = clock.ms();
+    return true;
+}
+
+const std::vector<int32_t> * tts_engine_research_codes(const TtsEngine * e, const TtsJob * job) {
+    return e && e->research_codes_job == job ? &e->research_codes : nullptr;
 }
 #endif
 
@@ -1414,6 +1556,16 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
 // perf accounting, job status and worker side error capture. The codec
 // stream mirror releases here.
 static void tts_slot_complete(TtsEngine * e, TtsSlot & s) {
+#ifdef QWEN_RESEARCH_FRAME_SEEDS
+    if (e->research_capture_codes) {
+        e->research_codes_job = s.job;
+        e->research_codes.clear();
+        e->research_codes.reserve(s.all_codes.size() * (size_t) e->pt->num_code_groups);
+        for (const auto & frame : s.all_codes) {
+            e->research_codes.insert(e->research_codes.end(), frame.begin(), frame.end());
+        }
+    }
+#endif
     PipelineTTS *                pt     = e->pt;
     TtsJob *                     job    = s.job;
     const struct qt_tts_params * params = job->params;

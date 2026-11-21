@@ -6,6 +6,8 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -52,7 +54,110 @@ bool optional_boolean(yyjson_val * object, const char * key, bool fallback) {
     return value ? yyjson_get_bool(value) : fallback;
 }
 
-enum class SamplerControl { Default, TalkerTop1, PredictorGreedy };
+enum class RecoveryPolicy { None, Replay, EosResample, Rollback1, Rollback2 };
+struct RecoveryConfig {
+    RecoveryPolicy policy = RecoveryPolicy::None;
+    std::string name = "none";
+    int trigger_max_frames = 8;
+    int snapshot_frame = 1;
+    int64_t continuation_seed = 0;
+};
+
+RecoveryConfig recovery_config(yyjson_val * group) {
+    RecoveryConfig result;
+    auto * value = yyjson_obj_get(group, "recovery");
+    if (!value) return result;
+    if (!yyjson_is_obj(value)) throw std::runtime_error("recovery must be an object");
+    size_t index, count;
+    yyjson_val * key;
+    yyjson_val * field;
+    yyjson_obj_foreach(value, index, count, key, field) {
+        const std::string name(yyjson_get_str(key), yyjson_get_len(key));
+        if (name != "policy" && name != "trigger_max_frames" && name != "snapshot_frame" &&
+            name != "continuation_seed") throw std::runtime_error("unknown recovery field: " + name);
+    }
+    result.name = string_field(value, "policy");
+    if (result.name == "replay") result.policy = RecoveryPolicy::Replay;
+    else if (result.name == "eos-resample") result.policy = RecoveryPolicy::EosResample;
+    else if (result.name == "rollback-1") result.policy = RecoveryPolicy::Rollback1;
+    else if (result.name == "rollback-2") result.policy = RecoveryPolicy::Rollback2;
+    else throw std::runtime_error("unknown recovery policy");
+    if (yyjson_obj_get(value, "trigger_max_frames")) {
+        result.trigger_max_frames = integer_field(value, "trigger_max_frames", 1, 8);
+    }
+    if (result.policy == RecoveryPolicy::Replay) {
+        if (yyjson_obj_get(value, "continuation_seed")) throw std::runtime_error("replay preserves original seed");
+        result.snapshot_frame = integer_field(value, "snapshot_frame", 0, 8);
+    } else {
+        if (yyjson_obj_get(value, "snapshot_frame")) throw std::runtime_error("intervention chooses rollback boundary");
+        auto * seed = yyjson_obj_get(value, "continuation_seed");
+        if (!yyjson_is_int(seed) || yyjson_get_sint(seed) < 0) {
+            throw std::runtime_error("recovery requires explicit nonnegative continuation_seed");
+        }
+        result.continuation_seed = yyjson_get_sint(seed);
+    }
+    return result;
+}
+
+std::vector<RecoveryConfig> group_recovery_configs(yyjson_val * groups, int max_batch) {
+    std::vector<RecoveryConfig> result;
+    for (size_t index = 0; index < yyjson_arr_size(groups); ++index) {
+        auto * group = yyjson_arr_get(groups, index);
+        auto config = recovery_config(group);
+        if (config.policy != RecoveryPolicy::None) {
+            if (max_batch != 1 || yyjson_arr_size(yyjson_obj_get(group, "seeds")) != 1 ||
+                optional_boolean(group, "diagnostic_dump", false)) {
+                throw std::runtime_error("recovery stage requires one buffered lane and no dumps");
+            }
+            const char * prefix = std::getenv("QWEN_RESEARCH_PREFIX_FILE");
+            const char * prefix_rows = std::getenv("QWEN_PREFILL_PREFIX_ROWS");
+            const char * schedule = std::getenv("QWEN_RESEARCH_FRAME_SEED_POLICY");
+            if ((prefix && *prefix) || (prefix_rows && *prefix_rows) ||
+                (schedule && *schedule && std::strcmp(schedule, "baseline"))) {
+                throw std::runtime_error("recovery stage requires prefix OFF and baseline seed schedule");
+            }
+        }
+        result.push_back(std::move(config));
+    }
+    return result;
+}
+
+void recovery_self_test() {
+    const auto parse = [](const char * json) {
+        JsonDoc doc(yyjson_read(json, std::strlen(json), 0), yyjson_doc_free);
+        if (!doc) throw std::runtime_error("invalid recovery self-test JSON");
+        return recovery_config(yyjson_doc_get_root(doc.get()));
+    };
+    if (parse("{}").policy != RecoveryPolicy::None ||
+        parse("{\"recovery\":{\"policy\":\"replay\",\"snapshot_frame\":0}}").snapshot_frame != 0 ||
+        parse("{\"recovery\":{\"policy\":\"rollback-2\",\"continuation_seed\":64}}").policy != RecoveryPolicy::Rollback2 ||
+        parse("{\"recovery\":{\"policy\":\"eos-resample\",\"continuation_seed\":0}}").continuation_seed != 0) {
+        throw std::runtime_error("recovery policy parsing failed");
+    }
+    const char * invalid[] = {
+        "{\"recovery\":null}", "{\"recovery\":{}}", "{\"recovery\":{\"policy\":\"none\"}}",
+        "{\"recovery\":{\"policy\":\"rollback-1\"}}",
+        "{\"recovery\":{\"policy\":\"rollback-1\",\"continuation_seed\":-1}}",
+        "{\"recovery\":{\"policy\":\"rollback-1\",\"continuation_seed\":1,\"snapshot_frame\":0}}",
+        "{\"recovery\":{\"policy\":\"replay\",\"snapshot_frame\":9}}",
+        "{\"recovery\":{\"policy\":\"replay\",\"snapshot_frame\":1,\"continuation_seed\":1}}",
+        "{\"recovery\":{\"policy\":\"replay\",\"snapshot_frame\":1,\"trigger_max_frames\":0}}",
+        "{\"recovery\":{\"policy\":\"replay\",\"snapshot_frame\":1,\"trigger_max_frames\":9}}",
+        "{\"recovery\":{\"policy\":\"replay\",\"snapshot_frame\":1,\"force\":true}}"};
+    for (const char * json : invalid) {
+        bool rejected = false;
+        try { (void) parse(json); } catch (const std::runtime_error &) { rejected = true; }
+        if (!rejected) throw std::runtime_error("invalid recovery policy accepted");
+    }
+    if (tts_engine_research_snapshot(nullptr) ||
+        tts_engine_research_restore(nullptr, nullptr, 0, nullptr) ||
+        tts_engine_research_capture_codes(nullptr, true) ||
+        tts_engine_research_codes(nullptr, nullptr)) {
+        throw std::runtime_error("null recovery guard failed");
+    }
+}
+
+enum class SamplerControl { Default, TalkerTop1, TalkerTop2, TalkerTop4, PredictorGreedy };
 
 SamplerControl sampler_control(yyjson_val * group) {
     if (!yyjson_is_obj(group)) throw std::runtime_error("group must be an object");
@@ -60,14 +165,18 @@ SamplerControl sampler_control(yyjson_val * group) {
     const auto name = string_field(group, "sampler_control");
     if (name == "default") return SamplerControl::Default;
     if (name == "talker-top1") return SamplerControl::TalkerTop1;
+    if (name == "talker-top2") return SamplerControl::TalkerTop2;
+    if (name == "talker-top4") return SamplerControl::TalkerTop4;
     if (name == "predictor-greedy") return SamplerControl::PredictorGreedy;
-    throw std::runtime_error("sampler_control must be default, talker-top1 or predictor-greedy");
+    throw std::runtime_error("sampler_control must be default, talker-top1/top2/top4 or predictor-greedy");
 }
 
 const char * sampler_control_name(SamplerControl control) {
     switch (control) {
         case SamplerControl::Default: return "default";
         case SamplerControl::TalkerTop1: return "talker-top1";
+        case SamplerControl::TalkerTop2: return "talker-top2";
+        case SamplerControl::TalkerTop4: return "talker-top4";
         case SamplerControl::PredictorGreedy: return "predictor-greedy";
     }
     throw std::runtime_error("invalid internal sampler control");
@@ -85,10 +194,12 @@ std::vector<SamplerControl> group_sampler_controls(yyjson_val * groups) {
 }
 
 void apply_sampler_control(qt_tts_params & params, SamplerControl control) {
-    if (control == SamplerControl::TalkerTop1) {
+    if (control == SamplerControl::TalkerTop1 || control == SamplerControl::TalkerTop2 ||
+        control == SamplerControl::TalkerTop4) {
         // Keep the stochastic path's repetition processing, unlike native greedy.
         params.do_sample = true;
-        params.top_k = 1;
+        params.top_k = control == SamplerControl::TalkerTop1 ? 1 :
+                       control == SamplerControl::TalkerTop2 ? 2 : 4;
     } else if (control == SamplerControl::PredictorGreedy) {
         params.subtalker_do_sample = false;
     }
@@ -121,9 +232,11 @@ void sampler_self_test() {
         return group_sampler_controls(yyjson_doc_get_root(doc.get()));
     };
     const auto controls = parse("[{},{\"sampler_control\":\"default\"},{\"sampler_control\":\"talker-top1\"},"
-                                "{\"sampler_control\":\"predictor-greedy\"}]");
+                                "{\"sampler_control\":\"predictor-greedy\"},"
+                                "{\"sampler_control\":\"talker-top2\"},{\"sampler_control\":\"talker-top4\"}]");
     if (controls != std::vector<SamplerControl>{SamplerControl::Default, SamplerControl::Default,
-                                               SamplerControl::TalkerTop1, SamplerControl::PredictorGreedy}) {
+                                               SamplerControl::TalkerTop1, SamplerControl::PredictorGreedy,
+                                               SamplerControl::TalkerTop2, SamplerControl::TalkerTop4}) {
         throw std::runtime_error("sampler control parsing failed");
     }
     const char * invalid[] = {"[]", "{}", "[null]", "[false]", "[{\"sampler_control\":null}]",
@@ -141,7 +254,10 @@ void sampler_self_test() {
             throw std::runtime_error("sampler defaults unavailable");
         }
         apply_sampler_control(params, control);
-        if (!params.do_sample || params.top_k != (control == SamplerControl::TalkerTop1 ? 1 : 50)
+        const int expected_top_k = control == SamplerControl::TalkerTop1 ? 1 :
+                                   control == SamplerControl::TalkerTop2 ? 2 :
+                                   control == SamplerControl::TalkerTop4 ? 4 : 50;
+        if (!params.do_sample || params.top_k != expected_top_k
                 || params.subtalker_do_sample != (control != SamplerControl::PredictorGreedy)
                 || std::fabs(params.repetition_penalty - 1.05f) > 1e-6f || params.eos_guard_enabled) {
             throw std::runtime_error("sampler control changed an unrelated default");
@@ -197,7 +313,104 @@ struct Owner {
     }
 };
 struct Chunk { double ms; size_t samples; };
-struct Step { double ms; int active; size_t retired; };
+struct Step { double ms; int active; size_t retired; int attempt = 0; };
+struct RecoveryObservation {
+    bool enabled = false;
+    bool triggered = false;
+    bool replay_codes_equal = false;
+    bool replay_pcm_equal = false;
+    int original_frames = 0;
+    int original_status = 0;
+    int original_finish_reason = 0;
+    int restore_frame = -1;
+    int64_t continuation_seed = 0;
+    double snapshot_ms = 0.0;
+    double restore_ms = 0.0;
+    double original_completed_ms = 0.0;
+    size_t peak_snapshot_bytes = 0;
+    std::vector<TtsResearchDecision> original_decisions;
+};
+using SnapshotOwner = std::unique_ptr<TtsResearchSnapshot, decltype(&tts_engine_research_snapshot_free)>;
+
+template<class T>
+void write_raw(const std::filesystem::path & path, const std::vector<T> & values) {
+    std::ofstream file(path, std::ios::binary);
+    file.write(reinterpret_cast<const char *>(values.data()),
+               static_cast<std::streamsize>(values.size() * sizeof(T)));
+    if (!file) throw std::runtime_error("bounded recovery artifact write failed");
+}
+
+std::vector<float> buffered_pcm(const qt_audio & audio) {
+    if (audio.n_samples < 0 || static_cast<size_t>(audio.n_samples) > kMaxSamples ||
+        (audio.n_samples && !audio.samples)) throw std::runtime_error("invalid buffered PCM size");
+    std::vector<float> pcm;
+    if (audio.n_samples) pcm.assign(audio.samples, audio.samples + audio.n_samples);
+    for (float sample : pcm) {
+        if (!std::isfinite(sample)) throw std::runtime_error("nonfinite buffered PCM");
+    }
+    return pcm;
+}
+
+void buffered_self_test() {
+    qt_audio audio{};
+    if (!buffered_pcm(audio).empty()) throw std::runtime_error("empty buffered PCM changed");
+    float sample = 0.25f;
+    audio.samples = &sample;
+    audio.n_samples = 1;
+    if (buffered_pcm(audio) != std::vector<float>{sample}) throw std::runtime_error("buffered PCM copy changed");
+    const auto must_reject = [](const qt_audio & value) {
+        bool rejected = false;
+        try { (void) buffered_pcm(value); } catch (const std::runtime_error &) { rejected = true; }
+        if (!rejected) throw std::runtime_error("invalid buffered PCM accepted");
+    };
+    audio.n_samples = -1;
+    must_reject(audio);
+    audio.n_samples = static_cast<int>(kMaxSamples + 1);
+    must_reject(audio);
+    audio.n_samples = 1;
+    audio.samples = nullptr;
+    must_reject(audio);
+    audio.samples = &sample;
+    sample = INFINITY;
+    must_reject(audio);
+}
+
+void write_recovery_observation(std::ostream & results, const RecoveryConfig & config,
+                                 const RecoveryObservation & observation, Clock::time_point start) {
+    if (!observation.enabled) { results << "null"; return; }
+    results << "{\"policy\":\"" << config.name << "\",\"buffered_uncommitted\":true"
+        << ",\"committed_samples\":0,\"prefill_count\":1,\"streaming_qualified\":false"
+        << ",\"trigger_max_frames\":" << config.trigger_max_frames
+        << ",\"triggered\":" << (observation.triggered ? "true" : "false")
+        << ",\"attempt_count\":" << (observation.triggered ? 2 : 1)
+        << ",\"original_frames\":" << observation.original_frames
+        << ",\"original_status\":" << observation.original_status
+        << ",\"original_finish_reason\":" << observation.original_finish_reason
+        << ",\"original_completed_ms\":" << observation.original_completed_ms
+        << ",\"restore_frame\":" << observation.restore_frame
+        << ",\"continuation_seed\":" << observation.continuation_seed
+        << ",\"snapshot_ms\":" << observation.snapshot_ms
+        << ",\"restore_ms\":" << observation.restore_ms
+        << ",\"peak_snapshot_bytes\":" << observation.peak_snapshot_bytes
+        << ",\"snapshot_byte_scope\":\"host_copies_of_device_payload_only\""
+        << ",\"replay_codes_equal\":";
+    if (config.policy == RecoveryPolicy::Replay && observation.triggered) {
+        results << (observation.replay_codes_equal ? "true" : "false");
+    } else results << "null";
+    results << ",\"replay_pcm_equal\":";
+    if (config.policy == RecoveryPolicy::Replay && observation.triggered) {
+        results << (observation.replay_pcm_equal ? "true" : "false");
+    } else results << "null";
+    results << ",\"original_decisions\":[";
+    for (size_t index = 0; index < observation.original_decisions.size(); ++index) {
+        if (index) results << ',';
+        const auto & decision = observation.original_decisions[index];
+        const double ms = std::chrono::duration<double, std::milli>(decision.selected_at - start).count();
+        results << "{\"ms\":" << ms << ",\"frame\":" << decision.frame << ",\"token\":" << decision.token
+            << ",\"sampled_token\":" << decision.sampled_token << ",\"eos\":" << (decision.eos ? "true" : "false") << '}';
+    }
+    results << "]}";
+}
 struct Lane {
     Clock::time_point start, deadline;
     double admission_started_ms = 0.0;
@@ -237,6 +450,8 @@ void on_decision(const TtsResearchDecision & decision, void * pointer) noexcept 
 
 void observer_self_test() {
     sampler_self_test();
+    recovery_self_test();
+    buffered_self_test();
     const auto parse_mode = [](const char * json) {
         JsonDoc doc(yyjson_read(json, std::strlen(json), 0), yyjson_doc_free);
         if (!doc) throw std::runtime_error("invalid self-test JSON");
@@ -409,6 +624,7 @@ int main(int argc, char ** argv) {
         if (yyjson_obj_get(root, "sampler_control")) throw std::runtime_error("sampler_control belongs to each group");
         // Parse every group's control before any backend/model initialization.
         const auto sampler_controls = group_sampler_controls(groups);
+        const auto recovery_configs = group_recovery_configs(groups, max_batch);
         // Exclusive destination: preserve failed or partial experiments.
         const std::filesystem::path destination(argv[2]);
         if (!std::filesystem::create_directory(destination)) throw std::runtime_error("destination exists");
@@ -434,8 +650,15 @@ int main(int argc, char ** argv) {
         }
         owner.engine = tts_engine_new(&owner.pt, &owner.tokenizer);
         if (!owner.engine) throw std::runtime_error("cannot create engine");
+        bool failed_replay = false;
         for (size_t group_index = 0; group_index < yyjson_arr_size(groups); ++group_index) {
             yyjson_val * group = yyjson_arr_get(groups, group_index);
+            const auto & recovery = recovery_configs[group_index];
+            RecoveryObservation recovery_observation;
+            recovery_observation.enabled = recovery.policy != RecoveryPolicy::None;
+            if (!tts_engine_research_capture_codes(owner.engine, recovery_observation.enabled)) {
+                throw std::runtime_error("cannot configure research code capture while active");
+            }
             const bool diagnostic_dump = optional_boolean(group, "diagnostic_dump", false);
             const auto diagnostic_path = diagnostic_dump ?
                 (destination / ("group-" + std::to_string(group_index) + "-dump")).u8string() : std::string{};
@@ -478,7 +701,8 @@ int main(int argc, char ** argv) {
                 }
                 if (diagnostic_dump) p.dump_dir = diagnostic_path.c_str();
                 p.seed = yyjson_get_sint(seed); p.max_new_tokens = max_tokens;
-                p.on_chunk = on_audio; p.on_chunk_user_data = &observations[lane];
+                p.on_chunk = recovery_observation.enabled ? nullptr : on_audio;
+                p.on_chunk_user_data = &observations[lane];
                 p.cancel = cancelled; p.cancel_user_data = &observations[lane];
                 jobs[lane].params = &p; jobs[lane].resolved_seed = p.seed; jobs[lane].out = &audio[lane];
                 observations[lane].admission_started_ms = elapsed(start);
@@ -494,9 +718,83 @@ int main(int argc, char ** argv) {
             const double admitted_ms = elapsed(start);
             std::vector<TtsJob *> retired;
             std::vector<Step> steps;
+            std::vector<SnapshotOwner> snapshots;
+            if (recovery_observation.enabled) {
+                for (int frame = 0; frame <= 8; ++frame) {
+                    snapshots.emplace_back(nullptr, tts_engine_research_snapshot_free);
+                }
+            }
             while (tts_engine_active(owner.engine)) {
+                if (recovery_observation.enabled && steps.size() <= 8) {
+                    SnapshotOwner snapshot(tts_engine_research_snapshot(owner.engine), tts_engine_research_snapshot_free);
+                    if (!snapshot) throw std::runtime_error("bounded AR snapshot unavailable");
+                    const auto info = tts_engine_research_snapshot_info(snapshot.get());
+                    if (info.frame != static_cast<int>(steps.size())) throw std::runtime_error("snapshot frame mismatch");
+                    recovery_observation.snapshot_ms += info.capture_ms;
+                    recovery_observation.peak_snapshot_bytes += info.bytes;
+                    snapshots[static_cast<size_t>(info.frame)] = std::move(snapshot);
+                }
                 tts_engine_step(owner.engine, &retired);
                 steps.push_back({elapsed(start), tts_engine_active(owner.engine), retired.size()});
+            }
+            if (recovery_observation.enabled) {
+                if (retired.size() != 1) throw std::runtime_error("original buffered terminal mismatch");
+                const auto stem = "group-" + std::to_string(group_index) + "-lane-0";
+                auto original_pcm = buffered_pcm(audio[0]);
+                auto * captured_codes = tts_engine_research_codes(owner.engine, &jobs[0]);
+                if (!captured_codes) throw std::runtime_error("missing original complete codes");
+                const auto original_codes = *captured_codes;
+                write_raw(destination / (stem + "-original.f32"), original_pcm);
+                write_raw(destination / (stem + "-original.i32"), original_codes);
+                recovery_observation.original_status = jobs[0].status;
+                recovery_observation.original_frames = jobs[0].n_frames;
+                recovery_observation.original_finish_reason = jobs[0].finish_reason;
+                recovery_observation.original_completed_ms = elapsed(start);
+                recovery_observation.original_decisions.assign(observations[0].decisions.begin(),
+                    observations[0].decisions.begin() + observations[0].decision_count);
+                if (jobs[0].status == QT_STATUS_OK &&
+                    (recovery.policy == RecoveryPolicy::Replay ||
+                     (jobs[0].finish_reason == QT_FINISH_EOS && jobs[0].n_frames <= recovery.trigger_max_frames))) {
+                    const int rewind = recovery.policy == RecoveryPolicy::Rollback1 ? 1 :
+                                       recovery.policy == RecoveryPolicy::Rollback2 ? 2 : 0;
+                    const int target = recovery.policy == RecoveryPolicy::Replay ? recovery.snapshot_frame :
+                                       jobs[0].n_frames - rewind;
+                    if (target < 0 || target > 8 || !snapshots[static_cast<size_t>(target)]) {
+                        throw std::runtime_error("requested rollback/replay boundary unavailable");
+                    }
+                    const int64_t seed = recovery.policy == RecoveryPolicy::Replay ? params[0].seed : recovery.continuation_seed;
+                    qt_audio_free(&audio[0]);
+                    if (!tts_engine_research_restore(owner.engine, snapshots[static_cast<size_t>(target)].get(),
+                                                      seed, &recovery_observation.restore_ms)) {
+                        throw std::runtime_error("bounded AR restoration failed");
+                    }
+                    recovery_observation.triggered = true;
+                    recovery_observation.restore_frame = target;
+                    recovery_observation.continuation_seed = seed;
+                    observations[0].decision_count = 0;
+                    observations[0].decision_overflow = false;
+                    retired.clear();
+                    while (tts_engine_active(owner.engine)) {
+                        tts_engine_step(owner.engine, &retired);
+                        steps.push_back({elapsed(start), tts_engine_active(owner.engine), retired.size(), 1});
+                    }
+                    auto * final_codes = tts_engine_research_codes(owner.engine, &jobs[0]);
+                    if (!final_codes) throw std::runtime_error("missing restored complete codes");
+                    const auto final_pcm = buffered_pcm(audio[0]);
+                    recovery_observation.replay_codes_equal = *final_codes == original_codes;
+                    recovery_observation.replay_pcm_equal = final_pcm.size() == original_pcm.size() &&
+                        (final_pcm.empty() || std::memcmp(final_pcm.data(), original_pcm.data(), final_pcm.size() * sizeof(float)) == 0);
+                    if (recovery.policy == RecoveryPolicy::Replay &&
+                        (!recovery_observation.replay_codes_equal || !recovery_observation.replay_pcm_equal)) {
+                        errors << "group=" << group_index << " unchanged replay diverged\n";
+                        errors.flush();
+                        failed_replay = true;
+                    }
+                }
+                observations[0].pcm = buffered_pcm(audio[0]);
+                const auto * final_codes = tts_engine_research_codes(owner.engine, &jobs[0]);
+                if (!final_codes) throw std::runtime_error("missing final complete codes");
+                write_raw(destination / (stem + "-codes.i32"), *final_codes);
             }
             const double group_total_ms = elapsed(start);
             tts_engine_set_research_observer(owner.engine, nullptr, nullptr);
@@ -528,7 +826,10 @@ int main(int argc, char ** argv) {
                     << ",\"capacity_exceeded\":" << (observation.capacity_exceeded ? "true" : "false")
                     << ",\"conditioning\":\""
                     << (custom_voice ? "custom_voice" : icl_reference ? "base_icl" : "base_speaker_only") << '"'
-                    << ",\"prefill_observation_enabled\":" << (observe_prefill ? "true" : "false")
+                    << ",\"execution_mode\":\"" << (recovery_observation.enabled ? "buffered-uncommitted" : "streaming") << '"'
+                    << ",\"research_recovery\":";
+                write_recovery_observation(results, recovery, recovery_observation, start);
+                results << ",\"prefill_observation_enabled\":" << (observe_prefill ? "true" : "false")
                     << ",\"prefill_observation\":";
 #ifdef QWEN_RESEARCH_PREFILL
                 if (observe_prefill) {
@@ -563,7 +864,7 @@ int main(int argc, char ** argv) {
                 for (size_t index = 0; index < steps.size(); ++index) {
                     if (index) results << ',';
                     results << "{\"ms\":" << steps[index].ms << ",\"active\":" << steps[index].active
-                            << ",\"retired\":" << steps[index].retired << '}';
+                            << ",\"retired\":" << steps[index].retired << ",\"attempt\":" << steps[index].attempt << '}';
                 }
                 results << "]}\n";
                 results.flush();
@@ -571,7 +872,7 @@ int main(int argc, char ** argv) {
                 qt_audio_free(&audio[lane]);
             }
         }
-        return 0;
+        return failed_replay ? 2 : 0;
     } catch (const std::exception & error) {
         std::fprintf(stderr, "research probe: %s\n", error.what());
         return 1;

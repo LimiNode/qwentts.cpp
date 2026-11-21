@@ -318,6 +318,9 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME eos_research_corpus_python
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_eos_corpus.py)
+    add_test(NAME eos_recovery_python
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_eos_recovery.py)
     add_test(NAME eos_research_runner_python
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_eos_research_runner.py)

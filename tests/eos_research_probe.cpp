@@ -8,6 +8,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <memory>
 #include <stdexcept>
 
@@ -44,6 +45,23 @@ int integer_field(yyjson_val * object, const char * key, int low, int high) {
     if (number < low || number > high) throw std::runtime_error("integer out of bounds");
     return static_cast<int>(number);
 }
+bool optional_boolean(yyjson_val * object, const char * key, bool fallback) {
+    yyjson_val * value = yyjson_obj_get(object, key);
+    if (value && !yyjson_is_bool(value)) throw std::runtime_error(std::string(key) + " must be boolean");
+    return value ? yyjson_get_bool(value) : fallback;
+}
+
+// Existing manifests omit speaker and keep their Base ICL contract. A preset
+// speaker explicitly selects CustomVoice and cannot silently consume ICL files.
+bool custom_voice_conditioning(yyjson_val * object) {
+    if (!yyjson_obj_get(object, "speaker")) return false;
+    (void) string_field(object, "speaker");
+    const char * reference_keys[] = {"reference_text_file", "speaker_f32", "reference_i32", "reference_frames"};
+    for (const char * key : reference_keys) {
+        if (yyjson_obj_get(object, key)) throw std::runtime_error("speaker and ICL reference fields are mutually exclusive");
+    }
+    return true;
+}
 template<class T> std::vector<T> raw_values(const std::string & path, size_t max_count) {
     const auto bytes = read_bytes(path, max_count * sizeof(T));
     if (bytes.empty() || bytes.size() % sizeof(T)) throw std::runtime_error("invalid raw tensor");
@@ -75,6 +93,9 @@ struct Lane {
     bool decision_overflow = false;
     bool invalid_pcm = false;
     bool capacity_exceeded = false;
+#ifdef QWEN_RESEARCH_PREFILL
+    ResearchPrefillObservation prefill;
+#endif
 };
 struct DecisionCapture {
     std::array<Lane, 2> * observations;
@@ -99,6 +120,23 @@ void on_decision(const TtsResearchDecision & decision, void * pointer) noexcept 
 }
 
 void observer_self_test() {
+    const auto parse_mode = [](const char * json) {
+        JsonDoc doc(yyjson_read(json, std::strlen(json), 0), yyjson_doc_free);
+        if (!doc) throw std::runtime_error("invalid self-test JSON");
+        return custom_voice_conditioning(yyjson_doc_get_root(doc.get()));
+    };
+    if (parse_mode("{\"reference_text_file\":\"r.txt\",\"speaker_f32\":\"s.f32\",\"reference_i32\":\"r.i32\",\"reference_frames\":1}") ||
+        !parse_mode("{\"speaker\":\"ryan\"}")) {
+        throw std::runtime_error("conditioning mode compatibility failed");
+    }
+    const char * invalid_modes[] = {"{\"speaker\":\"\"}", "{\"speaker\":null}", "{\"speaker\":\"ryan\",\"speaker_f32\":\"s.f32\"}",
+        "{\"speaker\":\"ryan\",\"reference_text_file\":\"r.txt\"}", "{\"speaker\":\"ryan\",\"reference_i32\":\"r.i32\"}",
+        "{\"speaker\":\"ryan\",\"reference_frames\":1}"};
+    for (const char * json : invalid_modes) {
+        bool rejected = false;
+        try { (void) parse_mode(json); } catch (const std::runtime_error &) { rejected = true; }
+        if (!rejected) throw std::runtime_error("mixed/invalid conditioning was accepted");
+    }
     std::array<Lane, 2> observations;
     std::array<TtsJob, 2> jobs{};
     DecisionCapture capture{&observations, &jobs, 2};
@@ -160,6 +198,33 @@ bool on_audio(const float * samples, int count, void * pointer) {
     lane.pcm.insert(lane.pcm.end(), samples, samples + count);
     return !cancelled(pointer);
 }
+
+#ifdef QWEN_RESEARCH_PREFILL
+void write_prefill_observation(std::ostream & results, const ResearchPrefillObservation & observation,
+                               const ResearchPrefillSettings & settings, const std::filesystem::path & destination,
+                               const std::string & stem) {
+    const auto filename = stem + "-prefill-logits.f32";
+    std::ofstream logits(destination / filename, std::ios::binary);
+    logits.write(reinterpret_cast<const char *>(observation.logits_last.data()),
+                 static_cast<std::streamsize>(observation.logits_last.size() * sizeof(float)));
+    if (!logits) throw std::runtime_error("prefill logits write failure");
+    size_t nonfinite = 0;
+    for (float value : observation.logits_last) if (!std::isfinite(value)) ++nonfinite;
+    results << "{\"T\":" << observation.T << ",\"n_past\":" << observation.n_past
+        << ",\"slot\":" << observation.slot << ",\"window\":" << observation.n_kv_pad
+        << ",\"alignment\":" << settings.window << ",\"kv_f16\":" << (settings.kv_f16 ? "true" : "false")
+        << ",\"last_only\":" << (observation.last_only ? "true" : "false")
+        << ",\"retain\":" << (settings.retain ? "true" : "false")
+        << ",\"retained_hit\":" << (observation.retained_hit ? "true" : "false")
+        << ",\"diagnostic\":" << (observation.diagnostic ? "true" : "false")
+        << ",\"graph_nodes\":" << observation.graph_nodes << ",\"scheduler_splits\":" << observation.scheduler_splits
+        << ",\"setup_ms\":" << observation.setup_ms << ",\"graph_build_ms\":" << observation.graph_build_ms
+        << ",\"schedule_alloc_ms\":" << observation.schedule_alloc_ms << ",\"upload_ms\":" << observation.upload_ms
+        << ",\"compute_wait_ms\":" << observation.compute_wait_ms << ",\"readback_ms\":" << observation.readback_ms
+        << ",\"total_ms\":" << observation.total_ms << ",\"logits_f32\":\"" << filename
+        << "\",\"logits_count\":" << observation.logits_last.size() << ",\"nonfinite_logits\":" << nonfinite << '}';
+}
+#endif
 }
 
 int main(int argc, char ** argv) {
@@ -175,24 +240,41 @@ int main(int argc, char ** argv) {
         yyjson_val * root = yyjson_doc_get_root(doc.get());
         const auto talker = string_field(root, "talker");
         const auto codec = string_field(root, "codec");
-        const auto reference_text = read_bytes(string_field(root, "reference_text_file"), 65536);
-        if (reference_text.empty() || reference_text.find('\0') != std::string::npos) {
-            throw std::runtime_error("empty/invalid reference text");
+        const bool custom_voice = custom_voice_conditioning(root);
+        const auto speaker_name = custom_voice ? string_field(root, "speaker") : std::string{};
+        std::string reference_text;
+        std::vector<float> speaker;
+        std::vector<int32_t> codes;
+        int ref_frames = 0;
+        if (!custom_voice) {
+            reference_text = read_bytes(string_field(root, "reference_text_file"), 65536);
+            if (reference_text.empty() || reference_text.find('\0') != std::string::npos) {
+                throw std::runtime_error("empty/invalid reference text");
+            }
+            speaker = raw_values<float>(string_field(root, "speaker_f32"), 4096);
+            codes = raw_values<int32_t>(string_field(root, "reference_i32"), 16 * 4096);
+            for (float value : speaker) if (!std::isfinite(value)) throw std::runtime_error("nonfinite reference");
+            for (int32_t value : codes) if (value < 0 || value >= 2048) throw std::runtime_error("invalid reference code");
+            ref_frames = integer_field(root, "reference_frames", 1, 4096);
+            if (codes.size() != static_cast<size_t>(ref_frames) * 16) throw std::runtime_error("reference shape mismatch");
         }
-        const auto speaker = raw_values<float>(string_field(root, "speaker_f32"), 4096);
-        const auto codes = raw_values<int32_t>(string_field(root, "reference_i32"), 16 * 4096);
-        for (float value : speaker) if (!std::isfinite(value)) throw std::runtime_error("nonfinite reference");
-        for (int32_t value : codes) if (value < 0 || value >= 2048) throw std::runtime_error("invalid reference code");
-        const int ref_frames = integer_field(root, "reference_frames", 1, 4096);
-        if (codes.size() != static_cast<size_t>(ref_frames) * 16) throw std::runtime_error("reference shape mismatch");
         const int max_batch = integer_field(root, "max_batch", 1, 2);
         const int max_tokens = integer_field(root, "max_tokens", 4, 2048);
         const int deadline_ms = integer_field(root, "deadline_ms", 1, 120000);
         const int max_chunk = integer_field(root, "stream_max_chunk_frames", 1, 8);
         if (max_chunk != 1 && max_chunk != 2 && max_chunk != 4 && max_chunk != 8) throw std::runtime_error("invalid chunk cap");
-        yyjson_val * observe_value = yyjson_obj_get(root, "observe_decisions");
-        if (observe_value && !yyjson_is_bool(observe_value)) throw std::runtime_error("observe_decisions must be boolean");
-        const bool observe_decisions = !observe_value || yyjson_get_bool(observe_value);
+        const bool observe_decisions = optional_boolean(root, "observe_decisions", true);
+        const bool observe_prefill = optional_boolean(root, "observe_prefill", false);
+        if (observe_prefill) {
+#ifdef QWEN_RESEARCH_PREFILL
+            ResearchPrefillSettings settings;
+            std::string settings_error;
+            if (!research_prefill_from_env(settings, settings_error)) throw std::runtime_error(settings_error);
+            if (!settings.profile) throw std::runtime_error("observe_prefill requires QWEN_PREFILL_PROFILE=1");
+#else
+            throw std::runtime_error("observe_prefill requires QWEN_RESEARCH_PREFILL build");
+#endif
+        }
         yyjson_val * groups = yyjson_obj_get(root, "groups");
         if (!yyjson_is_arr(groups) || yyjson_arr_size(groups) == 0 || yyjson_arr_size(groups) > 256) {
             throw std::runtime_error("expected 1..256 groups");
@@ -203,6 +285,7 @@ int main(int argc, char ** argv) {
         std::ofstream results(destination / "results.jsonl", std::ios::binary);
         std::ofstream errors(destination / "errors.log", std::ios::binary);
         if (!results || !errors) throw std::runtime_error("cannot open results/errors");
+        results << std::setprecision(12);
         Owner owner;
         owner.bp = backend_init("Research");
         if (!owner.bp.backend || !owner.bp.has_gpu) throw std::runtime_error("research run requires selected GPU");
@@ -214,7 +297,9 @@ int main(int argc, char ** argv) {
         const char * specials[] = {"qwen3-tts.text.im_start_id", "qwen3-tts.text.im_end_id",
             "qwen3-tts.text.tts_pad_id", "qwen3-tts.text.tts_bos_id", "qwen3-tts.text.tts_eos_id"};
         bpe_load_specials_from_keys(&owner.tokenizer, talker.c_str(), specials, 5);
-        if (speaker.size() != static_cast<size_t>(owner.pt.talker.hidden_size) || owner.pt.num_code_groups != 16) {
+        if (owner.pt.num_code_groups != 16 ||
+            (custom_voice ? owner.pt.model_type != "custom_voice" :
+             owner.pt.model_type != "base" || speaker.size() != static_cast<size_t>(owner.pt.talker.hidden_size))) {
             throw std::runtime_error("conditioning/model mismatch");
         }
         owner.engine = tts_engine_new(&owner.pt, &owner.tokenizer);
@@ -244,9 +329,14 @@ int main(int argc, char ** argv) {
                 observations[lane].pcm.reserve(static_cast<size_t>(max_tokens) * 1920);
                 auto & p = params[lane];
                 qt_tts_default_params_ex(&p, sizeof(p));
-                p.text = text.c_str(); p.lang = language.c_str(); p.ref_text = reference_text.c_str();
-                p.ref_spk_emb = speaker.data(); p.ref_spk_dim = static_cast<int>(speaker.size());
-                p.ref_codes = codes.data(); p.ref_T = ref_frames;
+                p.text = text.c_str(); p.lang = language.c_str();
+                if (custom_voice) {
+                    p.speaker = speaker_name.c_str();
+                } else {
+                    p.ref_text = reference_text.c_str();
+                    p.ref_spk_emb = speaker.data(); p.ref_spk_dim = static_cast<int>(speaker.size());
+                    p.ref_codes = codes.data(); p.ref_T = ref_frames;
+                }
                 p.seed = yyjson_get_sint(seed); p.max_new_tokens = max_tokens;
                 p.on_chunk = on_audio; p.on_chunk_user_data = &observations[lane];
                 p.cancel = cancelled; p.cancel_user_data = &observations[lane];
@@ -254,6 +344,11 @@ int main(int argc, char ** argv) {
                 observations[lane].admission_started_ms = elapsed(start);
                 if (!tts_engine_admit(owner.engine, &jobs[lane])) throw std::runtime_error("admission failed: " + jobs[lane].error);
                 observations[lane].admission_completed_ms = elapsed(start);
+#ifdef QWEN_RESEARCH_PREFILL
+                if (observe_prefill && !pipeline_tts_research_prefill_observe(&owner.pt, &observations[lane].prefill)) {
+                    throw std::runtime_error("requested prefill observation is unavailable");
+                }
+#endif
             }
             if (tts_engine_active(owner.engine) != static_cast<int>(lanes)) throw std::runtime_error("not co-admitted");
             const double admitted_ms = elapsed(start);
@@ -273,7 +368,8 @@ int main(int argc, char ** argv) {
                     errors << "group=" << group_index << " lane=" << lane << " error=" << job.error << '\n';
                     errors.flush();
                 }
-                const auto filename = "group-" + std::to_string(group_index) + "-lane-" + std::to_string(lane) + ".f32";
+                const auto stem = "group-" + std::to_string(group_index) + "-lane-" + std::to_string(lane);
+                const auto filename = stem + ".f32";
                 std::ofstream pcm(destination / filename, std::ios::binary);
                 pcm.write(reinterpret_cast<const char *>(observation.pcm.data()),
                           static_cast<std::streamsize>(observation.pcm.size() * sizeof(float)));
@@ -290,7 +386,19 @@ int main(int argc, char ** argv) {
                     << ",\"decision_capture_invalid\":" << (capture.unknown_job || observation.decision_overflow ? "true" : "false")
                     << ",\"invalid_pcm\":" << (observation.invalid_pcm ? "true" : "false")
                     << ",\"capacity_exceeded\":" << (observation.capacity_exceeded ? "true" : "false")
-                    << ",\"decisions\":[";
+                    << ",\"conditioning\":\"" << (custom_voice ? "custom_voice" : "base_icl") << '"'
+                    << ",\"prefill_observation_enabled\":" << (observe_prefill ? "true" : "false")
+                    << ",\"prefill_observation\":";
+#ifdef QWEN_RESEARCH_PREFILL
+                if (observe_prefill) {
+                    write_prefill_observation(results, observation.prefill, owner.pt.research_prefill_settings,
+                                              destination, stem);
+                } else
+#endif
+                {
+                    results << "null";
+                }
+                results << ",\"decisions\":[";
                 for (size_t index = 0; index < observation.decision_count; ++index) {
                     if (index) results << ',';
                     const auto & decision = observation.decisions[index];

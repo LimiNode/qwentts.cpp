@@ -38,7 +38,7 @@ index a0e6de78..ac679c8a 100644
          ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
          return;
      }
-@@ -1841,13 +1863,16 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+@@ -1841,12 +1863,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
          return;
      }
      if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {

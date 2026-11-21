@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import shutil
 import struct
 import subprocess
@@ -26,6 +25,9 @@ VARIANTS = {
     "combined": {"QWEN_PREFILL_LAST_ONLY": "1", "QWEN_PREFILL_KV": "f16",
                  "QWEN_PREFILL_WINDOW": "64", "QWEN_PREFILL_RETAIN": "1"},
     "baseline-end": {},
+    "prefix": {},
+    "prefix-combined": {"QWEN_PREFILL_LAST_ONLY": "1", "QWEN_PREFILL_KV": "f16",
+                        "QWEN_PREFILL_WINDOW": "64", "QWEN_PREFILL_RETAIN": "1"},
 }
 INPUT_HASHES = {
     "speaker.f32": "4119368fc3a673c29187bbef0c48d3c789e6f05390bae61f3303c4f10ea38698",
@@ -153,7 +155,9 @@ def main() -> int:
     parser.add_argument("--codec", type=Path, required=True)
     parser.add_argument("--customvoice-codec", type=Path)
     parser.add_argument("--models", nargs="+", choices=("ru-stress", "base", "customvoice"), default=["ru-stress", "base", "customvoice"])
-    parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=list(VARIANTS))
+    parser.add_argument("--variants", nargs="+", choices=VARIANTS,
+                        default=[name for name in VARIANTS if not name.startswith("prefix")])
+    parser.add_argument("--prefix-rows", type=int)
     parser.add_argument("--dependency-directory", type=Path, action="append", default=[])
     parser.add_argument("--seconds", type=int, default=1800)
     parser.add_argument("--causal", action="store_true")
@@ -164,6 +168,8 @@ def main() -> int:
             or args.variants.index("baseline") != int(args.variants[0] == "unobserved")
             or len(args.variants) != len(set(args.variants))):
         parser.error("bounded budget and unique variants with baseline before candidates required")
+    if any(v.startswith("prefix") for v in args.variants) and not (args.prefix_rows and 1 <= args.prefix_rows <= 4095):
+        parser.error("prefix variants require --prefix-rows 1..4095 after byte-level discovery")
     model_paths = {
         "ru-stress": args.repo / "models/ru-stress/qwen-talker-1.7b-ru-stress-Q8_0.gguf",
         "base": args.repo / "models/qwen-talker-1.7b-base-Q8_0.gguf",
@@ -196,6 +202,7 @@ def main() -> int:
                "customvoice_codec": identity(args.customvoice_codec) if args.customvoice_codec else None,
                "runtime_files": runtime, "cmake_cache": identity(cache) if cache.exists() else None,
                "gpu": gpu, "seconds": args.seconds, "trace": args.causal,
+               "prefix_rows": args.prefix_rows,
                "inputs": {p.name: identity(p) for p in inputs.iterdir()},
                "timing_scope": "host wall; CUDA kernel/event time requires independent profiler"})
     deadline = time.monotonic() + args.seconds
@@ -226,6 +233,8 @@ def main() -> int:
             env = environment(GPU, [args.probe.parent, *args.dependency_directory], args.causal)
             env = {k: v for k, v in env.items() if not k.startswith("QWEN_PREFILL_")}
             env.update(QWEN_PREFILL_PROFILE="1" if observed else "0", **VARIANTS[variant])
+            if variant.startswith("prefix"):
+                env["QWEN_PREFILL_PREFIX_ROWS"] = str(args.prefix_rows)
             write_json(directory / "environment.json", {k: v for k, v in env.items() if k.startswith(("GGML_", "CUDA_", "QWEN_"))})
             status = "completed"
             returncode = None

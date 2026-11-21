@@ -3,7 +3,7 @@
 import copy
 import unittest
 
-from run_prefill_differential import effective_issues
+from run_prefill_differential import dispatch_issues, effective_issues
 
 
 class EffectiveDifferentialSettings(unittest.TestCase):
@@ -30,6 +30,13 @@ class EffectiveDifferentialSettings(unittest.TestCase):
     def test_manual_nonprefix_control(self):
         rows = [{"prefill_observation": {"diagnostic": False, "prefill_use_flash_attn": False}}]
         self.assertEqual(effective_issues(rows, False, False, True, 0), [])
+
+    def test_requested_dispatch_must_be_observed(self):
+        self.assertTrue(dispatch_issues([], "default", True))
+        self.assertTrue(dispatch_issues(["RESEARCH_MATMUL route=mmvq"], "forced-mmq", True))
+        self.assertTrue(dispatch_issues([], "forced-cublas", True))
+        self.assertEqual(dispatch_issues(["RESEARCH_MATMUL route=forced-mmq"], "forced-mmq", True), [])
+        self.assertEqual(dispatch_issues([], "default", False), [])
 
 
 if __name__ == "__main__":

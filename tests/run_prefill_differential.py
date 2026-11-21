@@ -14,6 +14,14 @@ from run_eos_research import wait_for_probe, write_json
 from run_prefill_research import GPU, collect, compare
 
 
+def dispatch_issues(dispatch: list[str], control: str, trace: bool) -> list[str]:
+    if trace and not dispatch:
+        return ["requested matmul route trace was not effective"]
+    if control.startswith("forced-") and any(f"route={control}" not in line for line in dispatch):
+        return ["requested forced matmul route was not effective"]
+    return []
+
+
 def effective_issues(rows: list[dict], prefix: bool, diagnostic: bool,
                      manual: bool, prefix_rows: int) -> list[str]:
     """Reject ignored diagnostic options rather than mislabel a run."""
@@ -49,6 +57,7 @@ def main() -> int:
     parser.add_argument("--seconds", type=int, default=600)
     parser.add_argument("--dependency-directory", type=Path, action="append", default=[])
     args = parser.parse_args()
+    args.trace_matmul = args.trace_matmul or args.control.startswith("forced-")
     args.repo, args.output, args.probe = args.repo.resolve(), args.output.resolve(), args.probe.resolve()
     args.output.relative_to(args.repo / ".tmp" / "base-acceptance")
     if not 1 <= args.prefix_rows <= 4095 or not 1 <= args.seconds <= 1800:
@@ -136,10 +145,7 @@ def main() -> int:
         rows, issues = collect(directory, planned, False)
         dispatch = [line for line in (directory / "stderr.log").read_text(encoding="utf-8", errors="replace").splitlines()
                     if "RESEARCH_MATMUL" in line]
-        if args.trace_matmul and not dispatch:
-            issues.append("requested matmul route trace was not effective")
-        if args.control.startswith("forced-") and args.trace_matmul and any(f"route={args.control}" not in line for line in dispatch):
-            issues.append("requested forced matmul route was not effective")
+        issues.extend(dispatch_issues(dispatch, args.control, args.trace_matmul))
         issues.extend(effective_issues(rows, prefix, diagnostic, args.control == "manual-attention", args.prefix_rows))
         if diagnostic and not (directory / "taps").is_dir():
             issues.append("requested diagnostics produced no tap directory")

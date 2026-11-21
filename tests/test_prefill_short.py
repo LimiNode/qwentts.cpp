@@ -83,6 +83,8 @@ class ShortPrefillContract(unittest.TestCase):
         self.assertEqual(study.evidence_issues(rows, "quality", "prefix-mmq", route), [])
         self.assertTrue(study.evidence_issues(rows, "quality", "prefix-mmq", ""))
         self.assertTrue(study.evidence_issues(rows, "quality", "prefix-mmq", "RESEARCH_MATMUL route=mmvq"))
+        self.assertTrue(study.evidence_issues([self.row()], "quality", "baseline", route))
+        self.assertTrue(study.evidence_issues(rows, "quality", "prefix-default", route))
         for field, value in (("prefix_hit", False), ("prefix_rows", 86), ("prefix_source", "split"),
                              ("diagnostic", True), ("kv_f16", True), ("alignment", 64)):
             changed = copy.deepcopy(rows)
@@ -101,11 +103,11 @@ class ShortPrefillContract(unittest.TestCase):
         self.assertTrue(study.evidence_issues(rows, "timing", "prefix-mmq", logs))
 
     def test_incomplete_and_failed_blocks_do_not_enter_timing(self):
-        result = {"state": "completed", "issues": [], "rows": [self.row(phase="timing")]}
+        result = {"state": "completed", "returncode": 0, "issues": [], "rows": [self.row(phase="timing")]}
         valid = study.timing_summary(result, 1)
         self.assertTrue(valid["eligible"])
         self.assertEqual(valid["warm"]["first_pcm_ms"]["n"], 1)
-        for change in ({"state": "timeout"}, {"issues": ["missing route proof"]}, {"rows": []}):
+        for change in ({"state": "timeout"}, {"returncode": 1}, {"issues": ["missing route proof"]}, {"rows": []}):
             summary = study.timing_summary({**result, **change}, 1)
             self.assertFalse(summary["eligible"])
             self.assertEqual(summary["warm"]["first_pcm_ms"]["n"], 0)
@@ -114,7 +116,7 @@ class ShortPrefillContract(unittest.TestCase):
             self.assertFalse(study.timing_summary({**result, "rows": [row]}, 1)["eligible"])
 
     def test_complete_comparison_does_not_hide_equal_partial_denominators(self):
-        result = {"state": "completed", "rows": [self.row()]}
+        result = {"state": "completed", "returncode": 0, "issues": [], "rows": [self.row()]}
         self.assertTrue(study.complete_comparison(result, result, 1)["complete"])
         self.assertFalse(study.complete_comparison(result, result, 2)["complete"])
         self.assertFalse(study.complete_comparison({**result, "state": "incomplete"}, result, 1)["complete"])
@@ -141,25 +143,67 @@ class ShortPrefillContract(unittest.TestCase):
     def test_timing_reference_requires_complete_quality_and_identical_payloads(self):
         with tempfile.TemporaryDirectory(dir=self.temporary) as folder:
             root = Path(folder)
-            runtime = [{"path": "probe.exe", "bytes": 3, "sha256": "a"}]
-            models = [{"path": "model.gguf", "bytes": 5, "sha256": "b"}]
-            plan = {"phase": "quality", "runtime": runtime, "model_inputs": models}
+            def payload(name, data):
+                (root / name).write_bytes(data)
+                return study.identity(root / name)
+            runtime = [payload("probe.exe", b"exe")]
+            models = [payload("model.gguf", b"model"), payload("codec.gguf", b"codec")]
+            source_original = payload("source-original.txt", b"retained original")
+            source_manifest = payload("source-manifest.json", b"{}")
+            (root / "inputs").mkdir()
+            texts = {"original": "retained original", "en-primer": study.EN_PRIMER,
+                     **study.SHORT["russian"], **study.SHORT["english"]}
+            for name, text in texts.items():
+                (root / "inputs" / (name + ".txt")).write_text(text, encoding="utf-8")
+            plan = {"phase": "quality", "runtime": runtime, "model_inputs": models,
+                    "source_original": source_original, "source_manifest": source_manifest,
+                    "inputs": [study.identity(p) for p in (root / "inputs").iterdir()],
+                    "scripts": [study.identity(p) for p in study.script_paths()]}
+            audio = {"raw": payload("audio.raw", b"\0" * (5760 * 4)), "wav": payload("audio.wav", b"wav"),
+                     "logits": payload("logits.f32", b"logits")}
             results = {}
             for _, language, variant in study.blocks("quality"):
                 name = f"r0-{language}-{variant}"
-                rows = [{**self.row(i, prefix=variant != "baseline"), **case}
+                rows = [{**self.row(i, prefix=variant != "baseline"), **case, **audio}
                         for i, case in enumerate(study.cases("quality", language))]
-                results[name] = {"state": "completed", "issues": [], "rows": rows}
+                results[name] = {"state": "completed", "returncode": 0, "issues": [], "rows": rows}
                 (root / name).mkdir()
                 (root / name / "stderr.log").write_text(
                     "RESEARCH_MATMUL route=" + ("forced-mmq" if variant == "prefix-mmq" else "mmq"),
                     encoding="utf-8")
+                manifest = study.manifest_for({"talker": models[0]["path"], "codec": models[1]["path"]},
+                                              root / "inputs", study.cases("quality", language), language, "quality")
+                (root / name / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+                (root / name / "environment.json").write_text(
+                    json.dumps(study.configured_environment("quality", variant, [])), encoding="utf-8")
+                for key in ("manifest", "environment", "stderr"):
+                    results[name][key] = study.identity(root / name / (key + (".log" if key == "stderr" else ".json")))
             (root / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
             (root / "results.json").write_text(json.dumps(results), encoding="utf-8")
             self.assertIn("plan", study.validate_reference(root, runtime, models))
             with self.assertRaisesRegex(ValueError, "identity differs"):
                 study.validate_reference(root, [{**runtime[0], "sha256": "changed"}], models)
             first = next(iter(results))
+            results[first]["returncode"] = 1
+            (root / "results.json").write_text(json.dumps(results), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                study.validate_reference(root, runtime, models)
+            results[first]["returncode"] = 0
+            (root / "results.json").write_text(json.dumps(results), encoding="utf-8")
+            for changed in (root / "audio.raw", root / "audio.wav", root / "logits.f32",
+                            root / "inputs" / "ru-yes.txt", root / first / "manifest.json",
+                            root / first / "environment.json", root / first / "stderr.log"):
+                retained = changed.read_bytes()
+                changed.write_bytes(retained + b"changed")
+                with self.assertRaisesRegex(ValueError, "identity changed"):
+                    study.validate_reference(root, runtime, models)
+                changed.write_bytes(retained)
+            plan["scripts"][0]["sha256"] = "changed"
+            (root / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "identity changed"):
+                study.validate_reference(root, runtime, models)
+            plan["scripts"][0] = study.identity(study.script_paths()[0])
+            (root / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
             results[first]["rows"] = results[first]["rows"][:-1]
             (root / "results.json").write_text(json.dumps(results), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "incomplete"):

@@ -114,6 +114,8 @@ def evidence_issues(rows: list[dict], phase: str, variant: str, stderr: str) -> 
             issues.append("missing effective prefix-hit telemetry")
     else:
         issues.extend(dispatch_issues(routes, "forced-mmq" if variant == "prefix-mmq" else "default", True))
+        if variant != "prefix-mmq" and any("route=forced-" in line for line in routes):
+            issues.append("default control unexpectedly used a forced matmul route")
     for index, row in enumerate(rows):
         if row.get("decision_observation_enabled") is not False or row.get("decisions"):
             issues.append(f"group {index}: decision observer unexpectedly enabled")
@@ -144,12 +146,14 @@ def evidence_issues(rows: list[dict], phase: str, variant: str, stderr: str) -> 
 def complete_comparison(candidate: dict, baseline: dict, planned: int) -> dict:
     result = compare(candidate["rows"], baseline["rows"])
     result.update(planned=planned, complete=(candidate["state"] == baseline["state"] == "completed"
+                  and candidate.get("returncode") == baseline.get("returncode") == 0
+                  and not candidate.get("issues") and not baseline.get("issues")
                   and result["paired"] == planned and result["same_observed_denominator"]))
     return result
 
 
 def timing_summary(result: dict, planned: int) -> dict:
-    eligible = (result["state"] == "completed" and not result["issues"]
+    eligible = (result["state"] == "completed" and result.get("returncode") == 0 and not result["issues"]
                 and len(result["rows"]) == planned and all(outcome_valid(r) for r in result["rows"]))
     warm = [r for r in result["rows"] if r["kind"] == "warm_pair"] if eligible else []
     values = {"first_pcm_ms": [r["chunks"][0]["ms"] for r in warm],
@@ -166,20 +170,66 @@ def validate_reference(path: Path, runtime: list[dict], model_inputs: list[dict]
     results = json.loads((path / "results.json").read_text(encoding="utf-8"))
     expected = {f"r0-{language}-{variant}" for _, language, variant in blocks("quality")}
     if (plan.get("phase") != "quality" or set(results) != expected
-            or any(r["state"] != "completed" or r["issues"] or len(r["rows"]) != 18 for r in results.values())
+            or any(r["state"] != "completed" or r.get("returncode") != 0 or r["issues"]
+                   or len(r["rows"]) != 18 for r in results.values())
             or runtime_signature(runtime) != runtime_signature(plan["runtime"])
             or runtime_signature(model_inputs) != runtime_signature(plan["model_inputs"])):
         raise ValueError("quality reference is incomplete or runtime/model/codec identity differs")
+    def verify(item: dict) -> Path:
+        actual = identity(Path(item["path"]))
+        if any(actual[key] != item[key] for key in ("bytes", "sha256")):
+            raise ValueError(f"quality reference identity changed: {item['path']}")
+        return Path(item["path"])
+
+    for key in ("source_manifest", "source_original"):
+        verify(plan[key])
+    for key in ("runtime", "inputs", "scripts"):
+        if not plan[key]:
+            raise ValueError(f"quality reference missing {key}")
+        for item in plan[key]:
+            verify(item)
+    if runtime_signature(plan["scripts"]) != runtime_signature([identity(p) for p in script_paths()]):
+        raise ValueError("quality reference scripts differ from this runner")
+    source = {name: item["path"] for name, item in zip(("talker", "codec"), model_inputs)}
+    expected_texts = {"original": Path(plan["source_original"]["path"]).read_text(encoding="utf-8"),
+                      "en-primer": EN_PRIMER, **SHORT["russian"], **SHORT["english"]}
+    if ({Path(item["path"]).name for item in plan["inputs"]} != {name + ".txt" for name in expected_texts}
+            or any((path / "inputs" / (name + ".txt")).read_text(encoding="utf-8") != text
+                   for name, text in expected_texts.items())):
+        raise ValueError("quality reference input corpus differs")
     for _, language, variant in blocks("quality"):
         name = f"r0-{language}-{variant}"
         rows = results[name]["rows"]
         planned = cases("quality", language)
+        result = results[name]
+        for key in ("manifest", "environment", "stderr"):
+            if verify(result[key]).resolve() != (path / name / (key + (".log" if key == "stderr" else ".json"))).resolve():
+                raise ValueError("quality reference block artifact path differs")
+        manifest = json.loads((path / name / "manifest.json").read_text(encoding="utf-8"))
+        env = json.loads((path / name / "environment.json").read_text(encoding="utf-8"))
+        def controls(values: dict) -> dict:
+            return {k: v for k, v in values.items()
+                    if k.startswith(("QWEN_PREFILL_", "QWEN_RESEARCH_", "QWEN_TTS_", "GGML_")) or k == "CUDA_VISIBLE_DEVICES"}
+        if (manifest != manifest_for(source, path / "inputs", planned, language, "quality")
+                or controls(env) != controls(configured_environment("quality", variant, []))):
+            raise ValueError("quality reference manifest/environment settings differ")
+        for row in rows:
+            for key in ("raw", "wav", "logits"):
+                verify(row[key])
+            if row["raw"]["bytes"] != row["samples"] * 4:
+                raise ValueError("quality reference PCM byte count differs")
         if (any(any(row.get(key) != control[key] for key in ("text_label", "seed", "kind"))
                 for row, control in zip(rows, planned))
                 or evidence_issues(rows, "quality", variant,
                                    (path / name / "stderr.log").read_text(encoding="utf-8", errors="replace"))):
             raise ValueError("quality reference has invalid effective settings or outcomes")
     return {"plan": identity(path / "plan.json"), "results": identity(path / "results.json")}
+
+
+def script_paths() -> list[Path]:
+    return [Path(__file__), Path(__file__).with_name("test_prefill_short.py"),
+            *[Path(__file__).with_name(name) for name in ("run_eos_corpus.py", "run_eos_research.py",
+                                                         "run_prefill_research.py", "run_prefill_differential.py")]]
 
 
 def main() -> int:
@@ -220,9 +270,7 @@ def main() -> int:
         with (inputs / (label + ".txt")).open("xb") as stream:
             stream.write(text.encode("utf-8"))
     reference = validate_reference(args.quality_reference, runtime, model_inputs) if args.phase == "timing" else None
-    scripts = [Path(__file__), Path(__file__).with_name("test_prefill_short.py"),
-               *[Path(__file__).with_name(name) for name in ("run_eos_corpus.py", "run_eos_research.py",
-                                                             "run_prefill_research.py", "run_prefill_differential.py")]]
+    scripts = script_paths()
     schedule = blocks(args.phase)
     write_json(args.output / "plan.json", {"phase": args.phase, "source": source_identity(), "gpu": gpu,
                "source_manifest": identity(args.manifest), "source_probe": identity(args.probe), "runtime": runtime,
@@ -259,6 +307,9 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 state = "timeout"
         rows, issues = collect(directory, planned, False, "custom_voice")
+        for row in rows:
+            if "wav" in row:
+                row["wav"].update(identity(directory / "probe" / row["wav"]["wav"]))
         stderr = (directory / "stderr.log").read_text(encoding="utf-8", errors="replace")
         try:
             issues.extend(evidence_issues(rows, args.phase, variant, stderr))
@@ -267,7 +318,9 @@ def main() -> int:
         if code != 0 or len(rows) != len(planned) or issues:
             state = "incomplete" if state == "completed" else state
         result = {"state": state, "returncode": code, "rows": rows, "issues": issues, "planned": len(planned),
-                  "human_listening": "not_run", "word_coverage": "unassessed", "voice_quality": "unassessed"}
+                  "human_listening": "not_run", "word_coverage": "unassessed", "voice_quality": "unassessed",
+                  "manifest": identity(directory / "manifest.json"), "environment": identity(directory / "environment.json"),
+                  "stderr": identity(directory / "stderr.log")}
         if args.phase == "timing":
             result["timing"] = timing_summary(result, len(planned))
         results[name] = result

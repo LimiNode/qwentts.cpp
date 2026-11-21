@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 from run_eos_corpus import environment, gpu_identity, identity, source_identity
-from run_eos_research import wait_for_probe, write_json
+from run_eos_research import write_json
 from run_prefill_research import GPU
 
 
@@ -41,7 +41,18 @@ def main() -> int:
                "measurement_scope": "separate profiled prefill; max-token termination expected; not speech acceptance"})
     with (output / "stdout.log").open("xb") as out, (output / "stderr.log").open("xb") as err:
         process = subprocess.Popen(command, env=env, stdout=out, stderr=err, cwd=args.probe.parent)
-        returncode = wait_for_probe(process, 180, output / "watchdog.json")
+        try:
+            returncode = process.wait(timeout=180)
+        except subprocess.TimeoutExpired:
+            # Nsight owns an application child: terminate the exact owned tree,
+            # unlike the ordinary childless probe watchdog.
+            terminated = subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                                        capture_output=True, text=True, timeout=30)
+            write_json(output / "watchdog.json", {"timeout": True, "nsys_pid": process.pid,
+                       "tree_termination_returncode": terminated.returncode,
+                       "stdout": terminated.stdout, "stderr": terminated.stderr})
+            process.wait(timeout=15)
+            returncode = 124
     write_json(output / "execution.json", {"returncode": returncode})
     if returncode:
         return returncode

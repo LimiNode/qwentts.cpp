@@ -51,6 +51,71 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#ifdef QWEN_RESEARCH_PREFILL
+#    include "research_prefill.h"
+
+#    include <chrono>
+
+// One bounded shape cache with an independent scheduler/allocator. The normal
+// pipeline scheduler is reused by other graphs and cannot own retained IO.
+struct ResearchPrefillState {
+    ResearchPrefillSettings    settings;
+    ResearchPrefillObservation observation;
+    BackendPair                bp = {};
+    GraphArena                 arena;
+    ggml_backend_sched_t       sched = nullptr;
+    bool                       valid = false;
+    int                        T = 0, n_past = 0, kv_set = 0, n_kv_pad = 0;
+    bool                       last_only = false, use_fa = false, clamp = false;
+    struct ggml_cgraph *       graph  = nullptr;
+    struct ggml_tensor *       pos    = nullptr;
+    struct ggml_tensor *       mask   = nullptr;
+    struct ggml_tensor *       rows   = nullptr;
+    struct ggml_tensor *       input  = nullptr;
+    struct ggml_tensor *       hidden = nullptr;
+    struct ggml_tensor *       logits = nullptr;
+};
+
+static void research_prefill_free(ResearchPrefillState * state) {
+    if (!state) {
+        return;
+    }
+    if (state->sched) {
+        ggml_backend_sched_free(state->sched);
+    }
+    graph_arena_free(&state->arena);
+    delete state;
+}
+
+// Host wall intervals only: do not insert GPU synchronizations or additional
+// tensor readbacks. compute_wait includes the existing synchronous compute.
+struct ResearchPrefillClock {
+    using Clock = std::chrono::steady_clock;
+    bool              active;
+    Clock::time_point start;
+    Clock::time_point previous;
+
+    explicit ResearchPrefillClock(bool enabled) : active(enabled) {
+        if (active) {
+            start = previous = Clock::now();
+        }
+    }
+
+    double lap() {
+        if (!active) {
+            return 0.0;
+        }
+        const auto   now = Clock::now();
+        const double ms  = std::chrono::duration<double, std::milli>(now - previous).count();
+        previous         = now;
+        return ms;
+    }
+
+    double total() const {
+        return active ? std::chrono::duration<double, std::milli>(Clock::now() - start).count() : 0.0;
+    }
+};
+#endif
 
 struct TalkerForwardOutput {
     // Final hidden state for the last position [hidden] f32 (post final
@@ -290,103 +355,189 @@ static bool talker_forward_core(const TalkerWeights * tw,
                                 bool                  clamp_fp16,
                                 bool                  read_hidden_host,
                                 const char *          dump_dir,
-                                TalkerForwardOutput * out) {
+                                TalkerForwardOutput * out
+#ifdef QWEN_RESEARCH_PREFILL
+                                ,
+                                ResearchPrefillState * research = nullptr
+#endif
+) {
+#ifdef QWEN_RESEARCH_PREFILL
+    ResearchPrefillClock clock(research && research->settings.profile);
+    if (research) {
+        research->observation.available = false;
+    }
+    double               build_ms = 0.0, allocation_ms = 0.0;
+    bool                 retained_hit = false;
+#endif
     const int hidden   = tw->hidden_size;
     const int n_layers = tw->num_hidden_layers;
     const int vocab    = tw->vocab_size;
     const int T_full   = n_past + T;
 
-    // Attention window rounded up to 256 and clamped to the cache size.
-    // Fixed shapes over spans of 256 decode steps let the CUDA graph
+    // Attention window rounded up to its configured alignment (normally 256)
+    // and clamped to the cache size. Fixed shapes let the CUDA graph
     // executable update in place (pointer patch) instead of rebuilding.
     // Ternary instead of std::min: windows.h min/max macros break the
     // latter in headers on MSVC.
-    const int kv_pad_raw = (int) GGML_PAD(T_full, 256);
+    const int kv_pad_raw = (int) GGML_PAD(T_full, kv->attention_alignment);
     const int n_kv_pad   = kv_pad_raw < kv->max_seq_len ? kv_pad_raw : kv->max_seq_len;
 
-    const int             max_nodes = talker_graph_max_nodes(n_layers);
-    struct ggml_context * gctx      = graph_arena_begin(arena);
-
-    // IO tensors: positions and causal mask. The mask spans
-    // [n_kv_pad, T]: for each fresh query q in [0, T) keys k in
-    // [0, n_past + q] carry 0 and every other slot carries neg inf,
-    // including the padded tail beyond T_full.
-    struct ggml_tensor * pos_in  = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, T);
-    struct ggml_tensor * mask_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, n_kv_pad, T);
-    ggml_set_name(pos_in, "positions");
-    ggml_set_name(mask_in, "causal_mask");
-
-    // KV write positions as data: identical topology at every step,
-    // pure CUDA graph replay across the decode loop.
-    struct ggml_tensor * rows_in = ggml_new_tensor_1d(gctx, GGML_TYPE_I64, T);
-    ggml_set_name(rows_in, "kv_rows");
-    ggml_set_input(rows_in);
-
-    // Input: the raw prefill embedding uploaded from host.
-    struct ggml_tensor * x_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, hidden, T);
-    ggml_set_input(x_in);
-    ggml_set_name(x_in, "input_embed");
-
-    struct ggml_cgraph * gf = ggml_new_graph_custom(gctx, max_nodes, false);
-
-    // Build the layer stack. Bisect taps fire on prefill only.
+    const int                         max_nodes   = talker_graph_max_nodes(n_layers);
     const bool                        record_taps = (dump_dir != NULL) && (n_past == 0);
-    struct ggml_tensor *              h           = x_in;
+    bool                              last_only   = false;
+    bool                              graph_ready = false;
     std::vector<struct ggml_tensor *> taps(TALKER_N_BISECT_LAYERS, NULL);
-    for (int l = 0; l < n_layers; l++) {
-        h = talker_layer_forward(gctx, tw, tw->layers[(size_t) l], h, pos_in, mask_in, rows_in,
-                                 kv_cache_k(kv, kv_set, l), kv_cache_v(kv, kv_set, l), T, n_kv_pad, use_flash_attn,
-                                 clamp_fp16, gf);
-        if (record_taps && talker_is_bisect_layer(l)) {
-            for (int i = 0; i < TALKER_N_BISECT_LAYERS; i++) {
-                if (TALKER_BISECT_LAYERS[i] == l) {
-                    char tap_name[64];
-                    snprintf(tap_name, sizeof(tap_name), "tap_l%d", l);
-                    ggml_set_name(h, tap_name);
-                    ggml_set_output(h);
-                    taps[(size_t) i] = h;
-                    break;
+    struct ggml_tensor *              pos_in  = nullptr;
+    struct ggml_tensor *              mask_in = nullptr;
+    struct ggml_tensor *              rows_in = nullptr;
+    struct ggml_tensor *              x_in    = nullptr;
+    struct ggml_tensor *              h_final = nullptr;
+    struct ggml_tensor *              logits  = nullptr;
+    struct ggml_cgraph *              gf      = nullptr;
+#ifdef QWEN_RESEARCH_PREFILL
+    // Full tensor diagnostics retain the original full-row graph.
+    last_only         = research && research->settings.last_only && !dump_dir && !read_hidden_host;
+    const bool retain = research && research->settings.retain && !dump_dir && !read_hidden_host;
+    if (retain) {
+        if (!research->sched) {
+            research->sched = backend_sched_new(research->bp, 4096);
+        }
+        if (!research->sched || (!research->arena.ctx && !graph_arena_init(&research->arena, max_nodes))) {
+            fprintf(stderr, "[ResearchPrefill] FATAL: retained scheduler/arena allocation failed\n");
+            return false;
+        }
+        sched        = research->sched;
+        arena        = &research->arena;
+        retained_hit = research->valid && research->T == T && research->n_past == n_past &&
+                       research->kv_set == kv_set && research->n_kv_pad == n_kv_pad &&
+                       research->last_only == last_only && research->use_fa == use_flash_attn &&
+                       research->clamp == clamp_fp16;
+        if (retained_hit) {
+            pos_in      = research->pos;
+            mask_in     = research->mask;
+            rows_in     = research->rows;
+            x_in        = research->input;
+            h_final     = research->hidden;
+            logits      = research->logits;
+            gf          = research->graph;
+            graph_ready = true;
+        } else {
+            research->valid = false;
+        }
+    }
+    const double setup_ms = clock.lap();
+#endif
+    if (!graph_ready) {
+        struct ggml_context * gctx = graph_arena_begin(arena);
+
+        // IO tensors: positions and causal mask. The mask spans
+        // [n_kv_pad, T]: for each fresh query q in [0, T) keys k in
+        // [0, n_past + q] carry 0 and every other slot carries neg inf,
+        // including the padded tail beyond T_full.
+        pos_in  = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, T);
+        mask_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, n_kv_pad, T);
+        ggml_set_name(pos_in, "positions");
+        ggml_set_name(mask_in, "causal_mask");
+
+        // KV write positions as data: identical topology at every step,
+        // pure CUDA graph replay across the decode loop.
+        rows_in = ggml_new_tensor_1d(gctx, GGML_TYPE_I64, T);
+        ggml_set_name(rows_in, "kv_rows");
+        ggml_set_input(rows_in);
+
+        // Input: the raw prefill embedding uploaded from host.
+        x_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, hidden, T);
+        ggml_set_input(x_in);
+        ggml_set_name(x_in, "input_embed");
+
+        gf = ggml_new_graph_custom(gctx, max_nodes, false);
+
+        // Build the layer stack. Bisect taps fire on prefill only.
+        struct ggml_tensor * h = x_in;
+        for (int l = 0; l < n_layers; l++) {
+            h = talker_layer_forward(gctx, tw, tw->layers[(size_t) l], h, pos_in, mask_in, rows_in,
+                                     kv_cache_k(kv, kv_set, l), kv_cache_v(kv, kv_set, l), T, n_kv_pad, use_flash_attn,
+                                     clamp_fp16, gf);
+            if (record_taps && talker_is_bisect_layer(l)) {
+                for (int i = 0; i < TALKER_N_BISECT_LAYERS; i++) {
+                    if (TALKER_BISECT_LAYERS[i] == l) {
+                        char tap_name[64];
+                        snprintf(tap_name, sizeof(tap_name), "tap_l%d", l);
+                        ggml_set_name(h, tap_name);
+                        ggml_set_output(h);
+                        taps[(size_t) i] = h;
+                        break;
+                    }
                 }
             }
         }
-    }
 
-    struct ggml_tensor * h_final = ggml_rms_norm(gctx, h, tw->rms_norm_eps);
-    h_final                      = ggml_mul(gctx, h_final, tw->norm_w);
-    ggml_set_name(h_final, "hidden_final");
-    if (record_taps || read_hidden_host) {
-        ggml_set_output(h_final);
-    }
-
-    // Bridge: the last position hidden copies on device into column
-    // `kv_set` of the persistent [hidden, max_batch] tensor. Constant
-    // destination address across steps, so the decode graph topology
-    // stays replayable.
-    struct ggml_tensor * h_last =
-        ggml_view_1d(gctx, h_final, hidden, (size_t) (T - 1) * (size_t) hidden * sizeof(float));
-    struct ggml_tensor * bridge_col = ggml_view_1d(gctx, hidden_bridge, hidden, (size_t) kv_set * hidden_bridge->nb[1]);
-    struct ggml_tensor * bridge_cpy = ggml_cpy(gctx, h_last, bridge_col);
-
-    // codec_head: [hidden, vocab]. ggml_mul_mat returns [vocab, T].
-    struct ggml_tensor * logits = ggml_mul_mat(gctx, tw->codec_head_w, h_final);
-    ggml_set_name(logits, "logits");
-
-    if (record_taps) {
-        for (int i = 0; i < TALKER_N_BISECT_LAYERS; i++) {
-            if (taps[(size_t) i]) {
-                ggml_build_forward_expand(gf, taps[(size_t) i]);
-            }
+        // This variant keeps all transformer rows but normalizes/projects only the
+        // row consumed by generation. Selecting before norm mirrors speech.cpp.
+        if (last_only) {
+            h = ggml_view_2d(gctx, h, hidden, 1, h->nb[1], (size_t) (T - 1) * h->nb[1]);
         }
-        ggml_build_forward_expand(gf, h_final);
-    }
-    ggml_build_forward_expand(gf, logits);
-    ggml_build_forward_expand(gf, bridge_cpy);
+        h_final = ggml_rms_norm(gctx, h, tw->rms_norm_eps);
+        h_final = ggml_mul(gctx, h_final, tw->norm_w);
+        ggml_set_name(h_final, "hidden_final");
+        if (record_taps || read_hidden_host) {
+            ggml_set_output(h_final);
+        }
 
-    ggml_backend_sched_reset(sched);
-    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
-        fprintf(stderr, "[TalkerForward] FATAL: graph allocation failed\n");
+        // Bridge: the last position hidden copies on device into column
+        // `kv_set` of the persistent [hidden, max_batch] tensor. Constant
+        // destination address across steps, so the decode graph topology
+        // stays replayable.
+        struct ggml_tensor * h_last =
+            ggml_view_1d(gctx, h_final, hidden, (size_t) (last_only ? 0 : T - 1) * (size_t) hidden * sizeof(float));
+        struct ggml_tensor * bridge_col =
+            ggml_view_1d(gctx, hidden_bridge, hidden, (size_t) kv_set * hidden_bridge->nb[1]);
+        struct ggml_tensor * bridge_cpy = ggml_cpy(gctx, h_last, bridge_col);
+
+        // codec_head: [hidden, vocab]. ggml_mul_mat returns [vocab, T].
+        logits = ggml_mul_mat(gctx, tw->codec_head_w, h_final);
+        ggml_set_name(logits, "logits");
+
+        if (record_taps) {
+            for (int i = 0; i < TALKER_N_BISECT_LAYERS; i++) {
+                if (taps[(size_t) i]) {
+                    ggml_build_forward_expand(gf, taps[(size_t) i]);
+                }
+            }
+            ggml_build_forward_expand(gf, h_final);
+        }
+        ggml_build_forward_expand(gf, logits);
+        ggml_build_forward_expand(gf, bridge_cpy);
+#ifdef QWEN_RESEARCH_PREFILL
+        build_ms = clock.lap();
+#endif
+
         ggml_backend_sched_reset(sched);
-        return false;
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+            fprintf(stderr, "[TalkerForward] FATAL: graph allocation failed\n");
+            ggml_backend_sched_reset(sched);
+            return false;
+        }
+#ifdef QWEN_RESEARCH_PREFILL
+        allocation_ms = clock.lap();
+        if (retain) {
+            research->T         = T;
+            research->n_past    = n_past;
+            research->kv_set    = kv_set;
+            research->n_kv_pad  = n_kv_pad;
+            research->last_only = last_only;
+            research->use_fa    = use_flash_attn;
+            research->clamp     = clamp_fp16;
+            research->pos       = pos_in;
+            research->mask      = mask_in;
+            research->rows      = rows_in;
+            research->input     = x_in;
+            research->hidden    = h_final;
+            research->logits    = logits;
+            research->graph     = gf;
+            research->valid     = true;
+        }
+#endif
     }
 
     // Upload input embedding (host [T, hidden] -> ggml [hidden, T]).
@@ -426,12 +577,23 @@ static bool talker_forward_core(const TalkerWeights * tw,
         }
         ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
     }
+#ifdef QWEN_RESEARCH_PREFILL
+    const double upload_ms = clock.lap();
+#endif
 
     if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "[TalkerForward] FATAL: graph compute failed\n");
         ggml_backend_sched_reset(sched);
+#ifdef QWEN_RESEARCH_PREFILL
+        if (retain) {
+            research->valid = false;
+        }
+#endif
         return false;
     }
+#ifdef QWEN_RESEARCH_PREFILL
+    const double compute_ms = clock.lap();
+#endif
 
     // Bisect dumps: pull each tap [hidden, T] back to host as [T, hidden].
     if (record_taps) {
@@ -458,7 +620,8 @@ static bool talker_forward_core(const TalkerWeights * tw,
     out->logits_last.assign((size_t) vocab, 0.0f);
     {
         size_t row_bytes = (size_t) vocab * sizeof(float);
-        ggml_backend_tensor_get(logits, out->logits_last.data(), (size_t) (T - 1) * row_bytes, row_bytes);
+        ggml_backend_tensor_get(logits, out->logits_last.data(), (size_t) (last_only ? 0 : T - 1) * row_bytes,
+                                row_bytes);
     }
     if (read_hidden_host) {
         out->hidden_last.assign((size_t) hidden, 0.0f);
@@ -476,6 +639,40 @@ static bool talker_forward_core(const TalkerWeights * tw,
     // nodes so positions [n_past, n_past + T) are now populated. The
     // arena and the sched allocation persist into the next forward.
     kv->cur_len[(size_t) kv_set] = T_full;
+#ifdef QWEN_RESEARCH_PREFILL
+    const double readback_ms = clock.lap();
+    if (clock.active) {
+        ResearchPrefillObservation & observation = research->observation;
+        observation.available                    = true;
+        observation.last_only                    = last_only;
+        observation.retained_hit                 = retained_hit;
+        observation.diagnostic                   = dump_dir != nullptr;
+        observation.T                            = T;
+        observation.n_past                       = n_past;
+        observation.slot                         = kv_set;
+        observation.n_kv_pad                     = n_kv_pad;
+        observation.graph_nodes                  = ggml_graph_n_nodes(gf);
+        observation.scheduler_splits             = ggml_backend_sched_get_n_splits(sched);
+        observation.setup_ms                     = setup_ms;
+        observation.graph_build_ms               = build_ms;
+        observation.schedule_alloc_ms            = allocation_ms;
+        observation.upload_ms                    = upload_ms;
+        observation.compute_wait_ms              = compute_ms;
+        observation.readback_ms                  = readback_ms;
+        observation.total_ms                     = clock.total();
+        observation.logits_last                  = out->logits_last;
+        fprintf(stderr,
+                "[ResearchPrefill] {\"T\":%d,\"n_past\":%d,\"slot\":%d,\"window\":%d,\"alignment\":%d,\"kv_f16\":%s,"
+                "\"last_only\":%s,\"retain\":%s,\"retained_hit\":%s,\"diagnostic\":%s,"
+                "\"graph_nodes\":%d,\"scheduler_splits\":%d,"
+                "\"setup_ms\":%.6f,\"graph_build_ms\":%.6f,\"schedule_alloc_ms\":%.6f,"
+                "\"upload_ms\":%.6f,\"compute_wait_ms\":%.6f,\"readback_ms\":%.6f,\"total_ms\":%.6f}\n",
+                T, n_past, kv_set, n_kv_pad, kv->attention_alignment, research->settings.kv_f16 ? "true" : "false",
+                last_only ? "true" : "false", retain ? "true" : "false", retained_hit ? "true" : "false",
+                dump_dir ? "true" : "false", observation.graph_nodes, observation.scheduler_splits, setup_ms, build_ms,
+                allocation_ms, upload_ms, compute_ms, readback_ms, observation.total_ms);
+    }
+#endif
     return true;
 }
 
@@ -492,14 +689,24 @@ static bool talker_forward_prefill(const TalkerWeights * tw,
                                    bool                  use_flash_attn,
                                    bool                  clamp_fp16,
                                    const char *          dump_dir,
-                                   TalkerForwardOutput * out) {
+                                   TalkerForwardOutput * out
+#ifdef QWEN_RESEARCH_PREFILL
+                                   ,
+                                   ResearchPrefillState * research = nullptr
+#endif
+) {
     kv_cache_reset(kv, kv_set);
     if (T > kv->max_seq_len) {
         fprintf(stderr, "[TalkerForward] FATAL: prefill T=%d exceeds cache max_seq_len=%d\n", T, kv->max_seq_len);
         return false;
     }
     return talker_forward_core(tw, kv, kv_set, sched, arena, hidden_bridge, input_embed, T, 0, use_flash_attn,
-                               clamp_fp16, dump_dir != NULL, dump_dir, out);
+                               clamp_fp16, dump_dir != NULL, dump_dir, out
+#ifdef QWEN_RESEARCH_PREFILL
+                               ,
+                               research
+#endif
+    );
 }
 
 // Build the batched per-layer block over KV sets [0, N), one fresh
@@ -569,7 +776,7 @@ static struct ggml_tensor * talker_layer_forward_batch(struct ggml_context * ctx
 
     // Batched read: [hd, n_kv_pad, n_kv, N] views of the 4D cache. The
     // window covers every set's causal context and rounds up so the
-    // shape stays constant across 256 consecutive decode steps; the
+    // shape stays constant across one alignment class of decode steps; the
     // mask carries neg inf past each set's own context and the cache
     // buffer is zero initialized, so the padded tail contributes
     // nothing.
@@ -803,11 +1010,12 @@ static bool talker_forward_decode(const TalkerWeights *            tw,
             max_len = len;
         }
     }
-    const int kv_pad_raw = (int) GGML_PAD(max_len, 256);
+    const int alignment = kv->attention_alignment;
+    const int kv_pad_raw = (int) GGML_PAD(max_len, alignment);
     const int n_kv_pad   = kv_pad_raw < kv->max_seq_len ? kv_pad_raw : kv->max_seq_len;
     const bool record_layer_taps = read_hidden_host;
 
-    TalkerDecodeGraph * tg = &graphs[(size_t) ((n_kv_pad + 255) / 256 - 1)];
+    TalkerDecodeGraph * tg = &graphs[(size_t) ((n_kv_pad + alignment - 1) / alignment - 1)];
     if (tg->ctx && (tg->N != N || (!tg->layer_taps.empty()) != record_layer_taps)) {
         talker_decode_graph_free(tg);
     }

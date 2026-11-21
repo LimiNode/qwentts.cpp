@@ -28,6 +28,9 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#ifdef QWEN_RESEARCH_PREFILL
+#include <new>
+#endif
 #include <sstream>
 #include <string>
 #include <utility>
@@ -371,6 +374,14 @@ bool pipeline_tts_load(PipelineTTS * pt,
                        int           max_batch,
                        float         codec_chunk_sec,
                        int           stream_max_chunk_frames) {
+#ifdef QWEN_RESEARCH_PREFILL
+    std::string research_error;
+    pt->research_prefill = nullptr;
+    if (!research_prefill_from_env(pt->research_prefill_settings, research_error)) {
+        qt_log(QT_LOG_ERROR, "[ResearchPrefill] %s", research_error.c_str());
+        return false;
+    }
+#endif
     pt->bp                  = bp;
     pt->backend             = bp.backend;
     pt->sched               = NULL;
@@ -483,7 +494,11 @@ bool pipeline_tts_load(PipelineTTS * pt,
     // max_new_tokens ~ 1500, so 4096 has 60% headroom). Predictor holds
     // one frame of 16 sub-steps per slot.
     if (!kv_cache_init(&pt->talker_kv, pt->talker.num_hidden_layers, pt->talker.num_key_value_heads,
-                       pt->talker.head_dim, 4096, pt->max_batch, pt->backend)) {
+                       pt->talker.head_dim, 4096, pt->max_batch, pt->backend
+#ifdef QWEN_RESEARCH_PREFILL
+                       , pt->research_prefill_settings.kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32
+#endif
+                       )) {
         ggml_backend_sched_free(pt->sched);
         pt->sched = NULL;
         pipeline_codec_free(&pt->codec);
@@ -492,6 +507,9 @@ bool pipeline_tts_load(PipelineTTS * pt,
         gf_close(&pt->gguf_talker);
         return false;
     }
+#ifdef QWEN_RESEARCH_PREFILL
+    pt->talker_kv.attention_alignment = pt->research_prefill_settings.window;
+#endif
     if (!kv_cache_init(&pt->code_predictor_kv, pt->code_predictor.num_hidden_layers,
                        pt->code_predictor.num_key_value_heads, pt->code_predictor.head_dim, pt->num_code_groups,
                        pt->max_batch, pt->backend)) {
@@ -546,7 +564,8 @@ bool pipeline_tts_load(PipelineTTS * pt,
     // fixed and the positions, kv rows, and mask baked in. Wider
     // predictor sets and the batched talker decode graphs build lazily
     // on first use.
-    pt->talker_decode_graphs.resize(((size_t) pt->talker_kv.max_seq_len + 255) / 256);
+    const size_t alignment = (size_t) pt->talker_kv.attention_alignment;
+    pt->talker_decode_graphs.resize(((size_t) pt->talker_kv.max_seq_len + alignment - 1) / alignment);
     bool graphs_ok = graph_arena_init(&pt->talker_arena, talker_graph_max_nodes(pt->talker.num_hidden_layers)) &&
                      pipeline_tts_cp_graphs_ensure(pt, 1);
     if (!graphs_ok) {
@@ -571,6 +590,16 @@ bool pipeline_tts_load(PipelineTTS * pt,
         gf_close(&pt->gguf_talker);
         return false;
     }
+#ifdef QWEN_RESEARCH_PREFILL
+    pt->research_prefill = new (std::nothrow) ResearchPrefillState;
+    if (!pt->research_prefill) {
+        qt_log(QT_LOG_ERROR, "[ResearchPrefill] state allocation failed");
+        pipeline_tts_free(pt);
+        return false;
+    }
+    pt->research_prefill->settings = pt->research_prefill_settings;
+    pt->research_prefill->bp = bp;
+#endif
 
     qt_log(QT_LOG_INFO,
            "[Pipeline] Loaded: arch=%s variant=%s tokenizer=%s codebooks=%d speaker_encoder=%s speakers=%zu fa=%s "
@@ -581,7 +610,21 @@ bool pipeline_tts_load(PipelineTTS * pt,
     return true;
 }
 
+#ifdef QWEN_RESEARCH_PREFILL
+bool pipeline_tts_research_prefill_observe(const PipelineTTS * pt, ResearchPrefillObservation * out) {
+    if (!pt || !out || !pt->research_prefill || !pt->research_prefill->observation.available) {
+        return false;
+    }
+    *out = pt->research_prefill->observation;
+    return true;
+}
+#endif
+
 void pipeline_tts_free(PipelineTTS * pt) {
+#ifdef QWEN_RESEARCH_PREFILL
+    research_prefill_free(pt->research_prefill);
+    pt->research_prefill = nullptr;
+#endif
     for (size_t n = 0; n < pt->cp_graphs.size(); n++) {
         code_predictor_graph_set_free(&pt->cp_graphs[n]);
     }
@@ -1327,7 +1370,11 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
     Timer               t_prefill;
     if (!talker_forward_prefill(&pt->talker, &pt->talker_kv, slot_idx, pt->sched, &pt->talker_arena, pt->hidden_bridge,
                                 s.prompt.input_embed.data(), s.prompt.T_ctx, pt->use_flash_attn, pt->clamp_fp16,
-                                params->dump_dir, &fw)) {
+                                params->dump_dir, &fw
+#ifdef QWEN_RESEARCH_PREFILL
+                                , pt->research_prefill
+#endif
+                                )) {
         // The lane just attached is the tail one; dropping it needs no
         // compaction.
         if (s.codec_set >= 0) {

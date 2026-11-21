@@ -152,6 +152,12 @@ if(QWEN_RESEARCH_FRAME_SEEDS)
     target_compile_definitions(qwen-core PRIVATE QWEN_RESEARCH_FRAME_SEEDS=1)
 endif()
 
+option(QWEN_RESEARCH_PREFILL "Enable private prefill profiling and optimization experiments" OFF)
+if(QWEN_RESEARCH_PREFILL)
+    # Internal tools include PipelineTTS, so they must see its research layout.
+    target_compile_definitions(qwen-core PUBLIC QWEN_RESEARCH_PREFILL=1)
+endif()
+
 # Public shared library for ABI consumers (Python ctypes, Rust bindgen,
 # Go cgo). Opt-in : -DQWEN_SHARED=ON at configure time. Exports only
 # the QT_API-marked symbols ; every internal pipeline_* / backend_*
@@ -173,6 +179,9 @@ if(QWEN_SHARED)
     link_ggml_backends(qwen)
     if(QWEN_RESEARCH_FRAME_SEEDS)
         target_compile_definitions(qwen PRIVATE QWEN_RESEARCH_FRAME_SEEDS=1)
+    endif()
+    if(QWEN_RESEARCH_PREFILL)
+        target_compile_definitions(qwen PRIVATE QWEN_RESEARCH_PREFILL=1)
     endif()
 endif()
 
@@ -223,6 +232,14 @@ link_ggml_backends(test-abi-c)
 # Model-free sampling contract regression: EOS is masked only for the first
 # codec frame and remains eligible on subsequent generation steps.
 enable_testing()
+add_executable(test-prefill-settings-contract tests/prefill_settings_contract.cpp)
+target_include_directories(test-prefill-settings-contract PRIVATE ${CMAKE_SOURCE_DIR}/src)
+if(MSVC)
+    target_compile_options(test-prefill-settings-contract PRIVATE /W4 /WX)
+else()
+    target_compile_options(test-prefill-settings-contract PRIVATE -Wall -Wextra -Werror -pedantic)
+endif()
+add_test(NAME prefill_settings_contract COMMAND test-prefill-settings-contract)
 if(QWEN_RESEARCH_FRAME_SEEDS)
     add_executable(eos-research-probe tests/eos_research_probe.cpp)
     target_compile_definitions(eos-research-probe PRIVATE QWEN_RESEARCH_FRAME_SEEDS=1)

@@ -6,44 +6,52 @@
 #include <string>
 #include <vector>
 
+enum class ResearchPrefixSource { Split, Full };
+
+static inline const char * research_prefix_source_name(ResearchPrefixSource source) {
+    return source == ResearchPrefixSource::Full ? "full" : "split";
+}
+
 struct ResearchPrefillSettings {
-    bool profile     = false;
-    bool last_only   = false;
-    bool kv_f16      = false;
-    int  window      = 256;
-    bool retain      = false;
-    int  prefix_rows = 0;
+    bool                 profile       = false;
+    bool                 last_only     = false;
+    bool                 kv_f16        = false;
+    int                  window        = 256;
+    bool                 retain        = false;
+    int                  prefix_rows   = 0;
+    ResearchPrefixSource prefix_source = ResearchPrefixSource::Split;
 };
 
 // Private snapshot made from the normal final-logits readback. It must only be
 // read between requests; inference remains serialized by the pipeline owner.
 struct ResearchPrefillObservation {
-    bool               available              = false;
-    bool               last_only              = false;
-    bool               retained_hit           = false;
-    bool               diagnostic             = false;
-    int                T                      = 0;
-    int                n_past                 = 0;
-    int                slot                   = 0;
-    int                n_kv_pad               = 0;
-    int                graph_nodes            = 0;
-    int                scheduler_splits       = 0;
-    double             setup_ms               = 0.0;
-    double             graph_build_ms         = 0.0;
-    double             schedule_alloc_ms      = 0.0;
-    double             upload_ms              = 0.0;
-    double             compute_wait_ms        = 0.0;
-    double             readback_ms            = 0.0;
-    double             total_ms               = 0.0;
-    int                prefix_rows            = 0;
-    int                prompt_rows            = 0;
-    int                common_rows_with_first = 0;
-    bool               prefix_hit             = false;
-    double             prefix_setup_ms        = 0.0;
-    double             prefix_snapshot_ms     = 0.0;
-    double             prefix_restore_ms      = 0.0;
-    double             prefix_total_ms        = 0.0;
-    std::vector<float> logits_last;
+    bool                 available              = false;
+    bool                 last_only              = false;
+    bool                 retained_hit           = false;
+    bool                 diagnostic             = false;
+    int                  T                      = 0;
+    int                  n_past                 = 0;
+    int                  slot                   = 0;
+    int                  n_kv_pad               = 0;
+    int                  graph_nodes            = 0;
+    int                  scheduler_splits       = 0;
+    double               setup_ms               = 0.0;
+    double               graph_build_ms         = 0.0;
+    double               schedule_alloc_ms      = 0.0;
+    double               upload_ms              = 0.0;
+    double               compute_wait_ms        = 0.0;
+    double               readback_ms            = 0.0;
+    double               total_ms               = 0.0;
+    int                  prefix_rows            = 0;
+    int                  prompt_rows            = 0;
+    int                  common_rows_with_first = 0;
+    bool                 prefix_hit             = false;
+    ResearchPrefixSource prefix_source          = ResearchPrefixSource::Split;
+    double               prefix_setup_ms        = 0.0;
+    double               prefix_snapshot_ms     = 0.0;
+    double               prefix_restore_ms      = 0.0;
+    double               prefix_total_ms        = 0.0;
+    std::vector<float>   logits_last;
 };
 
 static inline bool research_prefill_parse_bool(const char * value, bool & out) {
@@ -85,7 +93,8 @@ static inline bool research_prefill_parse(const char *              profile,
                                           const char *              retain,
                                           ResearchPrefillSettings & out,
                                           std::string &             error,
-                                          const char *              prefix_rows = nullptr) {
+                                          const char *              prefix_rows   = nullptr,
+                                          const char *              prefix_source = nullptr) {
     ResearchPrefillSettings candidate;
     if (!research_prefill_parse_bool(profile, candidate.profile)) {
         error = "QWEN_PREFILL_PROFILE must be 0 or 1";
@@ -128,6 +137,18 @@ static inline bool research_prefill_parse(const char *              profile,
         }
         candidate.prefix_rows = rows;
     }
+    if (prefix_source && *prefix_source) {
+        if (std::strcmp(prefix_source, "full") == 0) {
+            candidate.prefix_source = ResearchPrefixSource::Full;
+        } else if (std::strcmp(prefix_source, "split") != 0) {
+            error = "QWEN_PREFILL_PREFIX_SOURCE must be split or full";
+            return false;
+        }
+        if (!candidate.prefix_rows) {
+            error = "QWEN_PREFILL_PREFIX_SOURCE requires QWEN_PREFILL_PREFIX_ROWS";
+            return false;
+        }
+    }
     out = candidate;
     error.clear();
     return true;
@@ -137,5 +158,5 @@ static inline bool research_prefill_from_env(ResearchPrefillSettings & out, std:
     return research_prefill_parse(std::getenv("QWEN_PREFILL_PROFILE"), std::getenv("QWEN_PREFILL_LAST_ONLY"),
                                   std::getenv("QWEN_PREFILL_KV"), std::getenv("QWEN_PREFILL_WINDOW"),
                                   std::getenv("QWEN_PREFILL_RETAIN"), out, error,
-                                  std::getenv("QWEN_PREFILL_PREFIX_ROWS"));
+                                  std::getenv("QWEN_PREFILL_PREFIX_ROWS"), std::getenv("QWEN_PREFILL_PREFIX_SOURCE"));
 }

@@ -786,6 +786,7 @@ static bool research_prefill_run(const TalkerWeights *  tw,
                                                    input_embed, T, tw->hidden_size);
     }
     const bool prefix_hit      = prefix_rows && research->prefix_valid;
+    bool full_result_ready = false;
     double     prefix_setup_ms = 0.0, prefix_snapshot_ms = 0.0, prefix_restore_ms = 0.0;
     if (prefix_rows) {
         const size_t prefix_values = static_cast<size_t>(prefix_rows) * static_cast<size_t>(tw->hidden_size);
@@ -814,14 +815,25 @@ static bool research_prefill_run(const TalkerWeights *  tw,
                 qt_set_error("research prefix snapshot allocation failed");
                 return false;
             }
-            TalkerForwardOutput prefix_output;
-            if (!talker_forward_core(tw, kv, kv_set, sched, arena, hidden_bridge, input_embed, prefix_rows, 0,
-                                     use_flash_attn, clamp_fp16, false, nullptr, &prefix_output, research, false)) {
-                return false;
+            if (research->settings.prefix_source == ResearchPrefixSource::Full) {
+                // Causal control: snapshot rows produced with the original full
+                // prompt shape, and retain that request's original full output.
+                if (!talker_forward_core(tw, kv, kv_set, sched, arena, hidden_bridge, input_embed, T, 0, use_flash_attn,
+                                         clamp_fp16, false, nullptr, out, research)) {
+                    return false;
+                }
+                full_result_ready = true;
+            } else {
+                TalkerForwardOutput prefix_output;
+                if (!talker_forward_core(tw, kv, kv_set, sched, arena, hidden_bridge, input_embed, prefix_rows, 0,
+                                         use_flash_attn, clamp_fp16, false, nullptr, &prefix_output, research, false)) {
+                    return false;
+                }
             }
             prefix_setup_ms = setup_clock.total();
             ResearchPrefillClock snapshot_clock(true);
             if (ggml_backend_graph_compute(research->bp.backend, research->prefix_kv.save) != GGML_STATUS_SUCCESS) {
+                research->observation.available = false;
                 qt_set_error("research prefix device snapshot failed");
                 return false;
             }
@@ -830,18 +842,21 @@ static bool research_prefill_run(const TalkerWeights *  tw,
             research->prefix_valid = true;
         }
     }
-    const bool success = talker_forward_core(
-        tw, kv, kv_set, sched, arena, hidden_bridge,
-        input_embed + static_cast<size_t>(prefix_rows) * static_cast<size_t>(tw->hidden_size), T - prefix_rows,
-        prefix_rows, use_flash_attn, clamp_fp16, dump_dir != nullptr, dump_dir, out, research);
-    if (!success) {
-        return false;
+    if (!full_result_ready) {
+        const bool success = talker_forward_core(
+            tw, kv, kv_set, sched, arena, hidden_bridge,
+            input_embed + static_cast<size_t>(prefix_rows) * static_cast<size_t>(tw->hidden_size), T - prefix_rows,
+            prefix_rows, use_flash_attn, clamp_fp16, dump_dir != nullptr, dump_dir, out, research);
+        if (!success) {
+            return false;
+        }
     }
     auto & observation                 = research->observation;
     observation.prefix_rows            = prefix_rows;
     observation.prompt_rows            = T;
     observation.common_rows_with_first = common_rows;
     observation.prefix_hit             = prefix_hit;
+    observation.prefix_source          = research->settings.prefix_source;
     observation.prefix_setup_ms        = prefix_setup_ms;
     observation.prefix_snapshot_ms     = prefix_snapshot_ms;
     observation.prefix_restore_ms      = prefix_restore_ms;
@@ -849,10 +864,13 @@ static bool research_prefill_run(const TalkerWeights *  tw,
     if (research->settings.profile || prefix_rows) {
         fprintf(
             stderr,
-            "[ResearchPrefix] {\"prompt_rows\":%d,\"common_rows_with_first\":%d,\"prefix_rows\":%d,\"prefix_hit\":%s,"
+            "[ResearchPrefix] "
+            "{\"prompt_rows\":%d,\"common_rows_with_first\":%d,\"prefix_rows\":%d,\"prefix_hit\":%s,\"prefix_source\":"
+            "\"%s\","
             "\"prefix_setup_ms\":%.6f,\"prefix_snapshot_ms\":%.6f,\"prefix_restore_ms\":%.6f,\"prefix_total_ms\":%.6f}"
             "\n",
-            T, common_rows, prefix_rows, prefix_hit ? "true" : "false", prefix_setup_ms, prefix_snapshot_ms,
+            T, common_rows, prefix_rows, prefix_hit ? "true" : "false",
+            research_prefix_source_name(observation.prefix_source), prefix_setup_ms, prefix_snapshot_ms,
             prefix_restore_ms, observation.prefix_total_ms);
     }
     return true;

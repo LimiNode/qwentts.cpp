@@ -53,8 +53,30 @@ int main() {
                           "prefix failure is atomic");
     }
     failures += check(research_prefill_parse(nullptr, nullptr, nullptr, nullptr, nullptr, settings, error) &&
-                          settings.prefix_rows == 0,
+                          settings.prefix_rows == 0 && settings.prefix_source == ResearchPrefixSource::Split,
                       "prefix is opt-in only");
+    failures += check(research_prefill_parse("1", "0", "f32", "256", "0", settings, error, "86", "full") &&
+                          settings.prefix_source == ResearchPrefixSource::Full && settings.prefix_rows == 86,
+                      "full-prefill causal source selected");
+    const char * invalid_source[] = { "auto", "FULL", "full ", "prefix", "0" };
+    for (const char * value : invalid_source) {
+        failures += check(!research_prefill_parse("0", "0", "f32", "256", "0", settings, error, "86", value) &&
+                              settings.prefix_source == ResearchPrefixSource::Full && settings.prefix_rows == 86 &&
+                              settings.profile,
+                          "invalid source rejected atomically");
+    }
+    for (const char * source : { "split", "full" }) {
+        failures += check(!research_prefill_parse("0", "0", "f32", "256", "0", settings, error, nullptr, source) &&
+                              settings.prefix_source == ResearchPrefixSource::Full && settings.prefix_rows == 86 &&
+                              settings.profile,
+                          "explicit source requires prefix rows atomically");
+    }
+    failures += check(research_prefill_parse("0", "0", "f32", "256", "0", settings, error, "9", "split") &&
+                          settings.prefix_source == ResearchPrefixSource::Split && settings.prefix_rows == 9,
+                      "explicit split source selected");
+    failures += check(std::strcmp(research_prefix_source_name(ResearchPrefixSource::Full), "full") == 0 &&
+                          std::strcmp(research_prefix_source_name(ResearchPrefixSource::Split), "split") == 0,
+                      "source observation names stable");
     const float first[]        = { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f };
     const float different[]    = { 1.0f, 2.0f, 3.0f, 4.0f, 9.0f, 6.0f };
     const float changed_head[] = { 1.0f, 0.0f, 3.0f, 4.0f, 5.0f, 6.0f };

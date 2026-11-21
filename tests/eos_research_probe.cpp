@@ -226,6 +226,7 @@ void write_prefill_observation(std::ostream & results, const ResearchPrefillObse
         << ",\"prefix_rows\":" << observation.prefix_rows << ",\"prompt_rows\":" << observation.prompt_rows
         << ",\"common_rows_with_first\":" << observation.common_rows_with_first
         << ",\"prefix_hit\":" << (observation.prefix_hit ? "true" : "false")
+        << ",\"prefix_source\":\"" << research_prefix_source_name(observation.prefix_source) << '"'
         << ",\"prefix_setup_ms\":" << observation.prefix_setup_ms
         << ",\"prefix_snapshot_ms\":" << observation.prefix_snapshot_ms
         << ",\"prefix_restore_ms\":" << observation.prefix_restore_ms

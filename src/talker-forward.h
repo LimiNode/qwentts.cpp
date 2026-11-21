@@ -56,6 +56,55 @@
 
 #    include <chrono>
 
+struct ResearchPrefixKV {
+    struct ggml_context * ctx     = nullptr;
+    ggml_backend_buffer_t buffer  = nullptr;
+    struct ggml_cgraph *  save    = nullptr;
+    struct ggml_cgraph *  restore = nullptr;
+};
+
+static void research_prefix_kv_free(ResearchPrefixKV * prefix) {
+    if (prefix->buffer) {
+        ggml_backend_buffer_free(prefix->buffer);
+    }
+    if (prefix->ctx) {
+        ggml_free(prefix->ctx);
+    }
+    *prefix = ResearchPrefixKV{};
+}
+
+// Snapshot only the selected rows. ggml_cpy handles the live cache's head
+// strides on device; no KV contents are read back through the host.
+static bool research_prefix_kv_init(ResearchPrefixKV * prefix, KVCache * kv, int rows, ggml_backend_t backend) {
+    const int    nodes = 8 * kv->n_layers + 32;
+    const size_t bytes = ggml_tensor_overhead() * static_cast<size_t>(12 * kv->n_layers + 64) +
+                         2 * ggml_graph_overhead_custom(static_cast<size_t>(nodes), false);
+    struct ggml_init_params params = { bytes, nullptr, true };
+    prefix->ctx                    = ggml_init(params);
+    if (!prefix->ctx) {
+        return false;
+    }
+    prefix->save    = ggml_new_graph_custom(prefix->ctx, nodes, false);
+    prefix->restore = ggml_new_graph_custom(prefix->ctx, nodes, false);
+    for (int layer = 0; layer < kv->n_layers; ++layer) {
+        for (int part = 0; part < 2; ++part) {
+            struct ggml_tensor * live = part == 0 ? kv_cache_k(kv, 0, layer) : kv_cache_v(kv, 0, layer);
+            struct ggml_tensor * live_prefix =
+                ggml_view_3d(prefix->ctx, live, kv->head_dim, rows, kv->n_kv_heads, live->nb[1], live->nb[2], 0);
+            struct ggml_tensor * saved =
+                ggml_new_tensor_3d(prefix->ctx, live->type, kv->head_dim, rows, kv->n_kv_heads);
+            ggml_build_forward_expand(prefix->save, ggml_cpy(prefix->ctx, live_prefix, saved));
+            ggml_build_forward_expand(prefix->restore, ggml_cpy(prefix->ctx, saved, live_prefix));
+        }
+    }
+    prefix->buffer = ggml_backend_alloc_ctx_tensors(prefix->ctx, backend);
+    if (!prefix->buffer || ggml_backend_buffer_is_host(prefix->buffer)) {
+        research_prefix_kv_free(prefix);
+        return false;
+    }
+    return true;
+}
+
 // One bounded shape cache with an independent scheduler/allocator. The normal
 // pipeline scheduler is reused by other graphs and cannot own retained IO.
 struct ResearchPrefillState {
@@ -74,6 +123,12 @@ struct ResearchPrefillState {
     struct ggml_tensor *       input  = nullptr;
     struct ggml_tensor *       hidden = nullptr;
     struct ggml_tensor *       logits = nullptr;
+    ResearchPrefixKV           prefix_kv;
+    bool                       prefix_valid    = false;
+    bool                       prefix_poisoned = false;
+    std::vector<float>         prefix_input;
+    std::vector<float>         first_prompt;
+    int                        first_prompt_rows = 0;
 };
 
 static void research_prefill_free(ResearchPrefillState * state) {
@@ -83,6 +138,7 @@ static void research_prefill_free(ResearchPrefillState * state) {
     if (state->sched) {
         ggml_backend_sched_free(state->sched);
     }
+    research_prefix_kv_free(&state->prefix_kv);
     graph_arena_free(&state->arena);
     delete state;
 }
@@ -358,7 +414,8 @@ static bool talker_forward_core(const TalkerWeights * tw,
                                 TalkerForwardOutput * out
 #ifdef QWEN_RESEARCH_PREFILL
                                 ,
-                                ResearchPrefillState * research = nullptr
+                                ResearchPrefillState * research = nullptr,
+                                bool read_logits_host = true
 #endif
 ) {
 #ifdef QWEN_RESEARCH_PREFILL
@@ -620,8 +677,11 @@ static bool talker_forward_core(const TalkerWeights * tw,
     out->logits_last.assign((size_t) vocab, 0.0f);
     {
         size_t row_bytes = (size_t) vocab * sizeof(float);
-        ggml_backend_tensor_get(logits, out->logits_last.data(), (size_t) (last_only ? 0 : T - 1) * row_bytes,
-                                row_bytes);
+#ifdef QWEN_RESEARCH_PREFILL
+        if (read_logits_host)
+#endif
+            ggml_backend_tensor_get(logits, out->logits_last.data(), (size_t) (last_only ? 0 : T - 1) * row_bytes,
+                                    row_bytes);
     }
     if (read_hidden_host) {
         out->hidden_last.assign((size_t) hidden, 0.0f);
@@ -641,7 +701,7 @@ static bool talker_forward_core(const TalkerWeights * tw,
     kv->cur_len[(size_t) kv_set] = T_full;
 #ifdef QWEN_RESEARCH_PREFILL
     const double readback_ms = clock.lap();
-    if (clock.active) {
+    if (clock.active && read_logits_host) {
         ResearchPrefillObservation & observation = research->observation;
         observation.available                    = true;
         observation.last_only                    = last_only;
@@ -678,6 +738,115 @@ static bool talker_forward_core(const TalkerWeights * tw,
 
 // Prefill: reset KV set `kv_set` and write T_ctx positions in one
 // shot. input_embed is [T, hidden] f32 row-major. dump_dir may be NULL.
+#ifdef QWEN_RESEARCH_PREFILL
+static bool research_prefill_run(const TalkerWeights *  tw,
+                                 KVCache *              kv,
+                                 int                    kv_set,
+                                 ggml_backend_sched_t   sched,
+                                 GraphArena *           arena,
+                                 struct ggml_tensor *   hidden_bridge,
+                                 const float *          input_embed,
+                                 int                    T,
+                                 bool                   use_flash_attn,
+                                 bool                   clamp_fp16,
+                                 const char *           dump_dir,
+                                 TalkerForwardOutput *  out,
+                                 ResearchPrefillState * research) {
+    ResearchPrefillClock total_clock(true);
+    research->observation.available = false;
+    const int prefix_rows           = research->settings.prefix_rows;
+    if (prefix_rows && (kv_set != 0 || kv->n_sets != 1 || dump_dir || prefix_rows >= T)) {
+        qt_set_error("research prefix requires one slot, no diagnostics and 1 <= prefix rows < prompt rows");
+        return false;
+    }
+    if (research->prefix_poisoned) {
+        qt_set_error("research prefix was invalidated by an embedding mismatch; reload the handle");
+        return false;
+    }
+    int common_rows = -1;
+    if (research->settings.profile) {
+        if (research->first_prompt.empty()) {
+            research->first_prompt.assign(input_embed,
+                                          input_embed + static_cast<size_t>(T) * static_cast<size_t>(tw->hidden_size));
+            research->first_prompt_rows = T;
+        }
+        common_rows = research_prefill_common_rows(research->first_prompt.data(), research->first_prompt_rows,
+                                                   input_embed, T, tw->hidden_size);
+    }
+    const bool prefix_hit      = prefix_rows && research->prefix_valid;
+    double     prefix_setup_ms = 0.0, prefix_snapshot_ms = 0.0, prefix_restore_ms = 0.0;
+    if (prefix_rows) {
+        const size_t prefix_values = static_cast<size_t>(prefix_rows) * static_cast<size_t>(tw->hidden_size);
+        if (prefix_hit) {
+            // Byte equality is deliberately stronger than an input hash. The
+            // cache is poisoned on mismatch and cannot silently learn a new
+            // conditioning prefix in this process.
+            if (research->prefix_input.size() != prefix_values ||
+                std::memcmp(research->prefix_input.data(), input_embed, prefix_values * sizeof(float)) != 0) {
+                research->prefix_valid    = false;
+                research->prefix_poisoned = true;
+                qt_set_error("research prefix embedding mismatch: cached rows are not invariant");
+                return false;
+            }
+            ResearchPrefillClock restore_clock(true);
+            if (ggml_backend_graph_compute(research->bp.backend, research->prefix_kv.restore) != GGML_STATUS_SUCCESS) {
+                qt_set_error("research prefix device restore failed");
+                return false;
+            }
+            kv->cur_len[0]    = prefix_rows;
+            prefix_restore_ms = restore_clock.total();
+        } else {
+            ResearchPrefillClock setup_clock(true);
+            if (!research->prefix_kv.ctx &&
+                !research_prefix_kv_init(&research->prefix_kv, kv, prefix_rows, research->bp.backend)) {
+                qt_set_error("research prefix snapshot allocation failed");
+                return false;
+            }
+            TalkerForwardOutput prefix_output;
+            if (!talker_forward_core(tw, kv, kv_set, sched, arena, hidden_bridge, input_embed, prefix_rows, 0,
+                                     use_flash_attn, clamp_fp16, false, nullptr, &prefix_output, research, false)) {
+                return false;
+            }
+            prefix_setup_ms = setup_clock.total();
+            ResearchPrefillClock snapshot_clock(true);
+            if (ggml_backend_graph_compute(research->bp.backend, research->prefix_kv.save) != GGML_STATUS_SUCCESS) {
+                qt_set_error("research prefix device snapshot failed");
+                return false;
+            }
+            prefix_snapshot_ms = snapshot_clock.total();
+            research->prefix_input.assign(input_embed, input_embed + prefix_values);
+            research->prefix_valid = true;
+        }
+    }
+    const bool success = talker_forward_core(
+        tw, kv, kv_set, sched, arena, hidden_bridge,
+        input_embed + static_cast<size_t>(prefix_rows) * static_cast<size_t>(tw->hidden_size), T - prefix_rows,
+        prefix_rows, use_flash_attn, clamp_fp16, dump_dir != nullptr, dump_dir, out, research);
+    if (!success) {
+        return false;
+    }
+    auto & observation                 = research->observation;
+    observation.prefix_rows            = prefix_rows;
+    observation.prompt_rows            = T;
+    observation.common_rows_with_first = common_rows;
+    observation.prefix_hit             = prefix_hit;
+    observation.prefix_setup_ms        = prefix_setup_ms;
+    observation.prefix_snapshot_ms     = prefix_snapshot_ms;
+    observation.prefix_restore_ms      = prefix_restore_ms;
+    observation.prefix_total_ms        = total_clock.total();
+    if (research->settings.profile || prefix_rows) {
+        fprintf(
+            stderr,
+            "[ResearchPrefix] {\"prompt_rows\":%d,\"common_rows_with_first\":%d,\"prefix_rows\":%d,\"prefix_hit\":%s,"
+            "\"prefix_setup_ms\":%.6f,\"prefix_snapshot_ms\":%.6f,\"prefix_restore_ms\":%.6f,\"prefix_total_ms\":%.6f}"
+            "\n",
+            T, common_rows, prefix_rows, prefix_hit ? "true" : "false", prefix_setup_ms, prefix_snapshot_ms,
+            prefix_restore_ms, observation.prefix_total_ms);
+    }
+    return true;
+}
+#endif
+
 static bool talker_forward_prefill(const TalkerWeights * tw,
                                    KVCache *             kv,
                                    int                   kv_set,
@@ -700,6 +869,12 @@ static bool talker_forward_prefill(const TalkerWeights * tw,
         fprintf(stderr, "[TalkerForward] FATAL: prefill T=%d exceeds cache max_seq_len=%d\n", T, kv->max_seq_len);
         return false;
     }
+#ifdef QWEN_RESEARCH_PREFILL
+    if (research && (research->settings.profile || research->settings.prefix_rows)) {
+        return research_prefill_run(tw, kv, kv_set, sched, arena, hidden_bridge, input_embed, T, use_flash_attn,
+                                    clamp_fp16, dump_dir, out, research);
+    }
+#endif
     return talker_forward_core(tw, kv, kv_set, sched, arena, hidden_bridge, input_embed, T, 0, use_flash_attn,
                                clamp_fp16, dump_dir != NULL, dump_dir, out
 #ifdef QWEN_RESEARCH_PREFILL

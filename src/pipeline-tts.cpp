@@ -381,6 +381,11 @@ bool pipeline_tts_load(PipelineTTS * pt,
         qt_log(QT_LOG_ERROR, "[ResearchPrefill] %s", research_error.c_str());
         return false;
     }
+    if (pt->research_prefill_settings.prefix_rows && (max_batch > 1 || !bp.has_gpu)) {
+        qt_set_error("research prefix requires max_batch=1 and a GPU backend");
+        qt_log(QT_LOG_ERROR, "[ResearchPrefix] max_batch=1 and a GPU backend are required");
+        return false;
+    }
 #endif
     pt->bp                  = bp;
     pt->backend             = bp.backend;
@@ -1023,6 +1028,13 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
     const struct qt_tts_params * params = job->params;
     job->status                         = QT_STATUS_OK;
     job->error.clear();
+#ifdef QWEN_RESEARCH_PREFILL
+    if (pt->research_prefill) pt->research_prefill->observation.available = false;
+    if (pt->research_prefill_settings.prefix_rows && params->dump_dir) {
+        qt_set_error("research prefix does not support diagnostic dumps");
+        return tts_admit_fail(job, QT_STATUS_INVALID_PARAMS);
+    }
+#endif
 
     if ((int) e->slots.size() >= pt->max_batch) {
         qt_set_error("tts_engine_admit: no free slot (%d active, max_batch %d)", (int) e->slots.size(), pt->max_batch);
@@ -1279,6 +1291,14 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
         return tts_admit_fail(job, QT_STATUS_GENERATE_FAILED);
     }
     s.perf.build_ms = t_build.ms();
+#ifdef QWEN_RESEARCH_PREFILL
+    if (pt->research_prefill_settings.prefix_rows &&
+        pt->research_prefill_settings.prefix_rows >= s.prompt.T_ctx) {
+        qt_set_error("research prefix rows must be smaller than the actual prompt");
+        e->slots.pop_back();
+        return tts_admit_fail(job, QT_STATUS_INVALID_PARAMS);
+    }
+#endif
 
     if (params->dump_dir) {
         DebugDumper d;

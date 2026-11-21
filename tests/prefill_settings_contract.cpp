@@ -43,5 +43,31 @@ int main() {
     failures += check(!settings.profile && !settings.last_only && !settings.kv_f16 && settings.window == 256 &&
                           !settings.retain && error.empty(),
                       "baseline reset");
+    failures +=
+        check(research_prefill_parse("1", "0", "f32", "256", "0", settings, error, "86") && settings.prefix_rows == 86,
+              "explicit prefix experiment");
+    const char * invalid_prefix[] = { "0", "-1", "4096", "999999999999999999999999", "2.5", " 2", "+2" };
+    for (const char * value : invalid_prefix) {
+        failures += check(!research_prefill_parse("0", "0", "f32", "256", "0", settings, error, value) &&
+                              settings.prefix_rows == 86 && settings.profile,
+                          "prefix failure is atomic");
+    }
+    failures += check(research_prefill_parse(nullptr, nullptr, nullptr, nullptr, nullptr, settings, error) &&
+                          settings.prefix_rows == 0,
+                      "prefix is opt-in only");
+    const float first[]        = { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f };
+    const float different[]    = { 1.0f, 2.0f, 3.0f, 4.0f, 9.0f, 6.0f };
+    const float changed_head[] = { 1.0f, 0.0f, 3.0f, 4.0f, 5.0f, 6.0f };
+    failures += check(research_prefill_common_rows(first, 3, first, 3, 2) == 3, "identical prompt rows");
+    failures += check(research_prefill_common_rows(first, 3, different, 3, 2) == 2, "actual changing row detected");
+    failures += check(research_prefill_common_rows(first, 3, changed_head, 3, 2) == 0, "changed conditioning detected");
+    failures += check(research_prefill_common_rows(first, 3, first, 2, 2) == 2, "different prompt lengths bounded");
+    failures += check(research_prefill_common_rows(nullptr, 3, first, 3, 2) == 0 &&
+                          research_prefill_common_rows(first, 0, first, 3, 2) == 0 &&
+                          research_prefill_common_rows(first, 3, first, 3, 0) == 0,
+                      "invalid row comparisons bounded");
+    const float zero[]          = { 0.0f };
+    const float negative_zero[] = { -0.0f };
+    failures += check(research_prefill_common_rows(zero, 1, negative_zero, 1, 1) == 0, "byte equality is conservative");
     return failures ? 1 : 0;
 }

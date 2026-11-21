@@ -64,32 +64,52 @@ def logits_difference(left: Path, right: Path) -> dict:
                             == max(range(len(bv)), key=bv.__getitem__)}
 
 
-def collect(directory: Path, planned: list[dict], trace: bool) -> list[dict]:
+def collect(directory: Path, planned: list[dict], trace: bool) -> tuple[list[dict], list[str]]:
     path = directory / "probe" / "results.jsonl"
+    issues = []
     if not path.exists():
-        return []
-    traces = parse_frames(directory / "stderr.log") if trace else []
+        return [], ["no flushed result file"]
+    try:
+        traces = parse_frames(directory / "stderr.log") if trace else []
+    except (OSError, ValueError, KeyError) as error:
+        traces = []
+        issues.append(f"trace: {error}")
     rows = []
     for index, line in enumerate(path.read_text(encoding="utf-8").splitlines()):
-        row = json.loads(line)
-        if index >= len(planned) or (row["group"], row["lane"], row["seed"]) != (index, 0, planned[index]["seed"]):
-            raise ValueError("result order differs from frozen plan")
+        try:
+            row = json.loads(line)
+            if index >= len(planned) or (row["group"], row["lane"], row["seed"]) != (index, 0, planned[index]["seed"]):
+                raise ValueError("result order differs from frozen plan")
+            if not 0 <= row["frames"] <= 256 or not 0 <= row["samples"] <= 256 * 1920:
+                raise ValueError("result exceeds frozen bounds")
+        except (ValueError, KeyError, TypeError) as error:
+            issues.append(f"group {index}: {error}")
+            break
         raw = directory / "probe" / f"group-{index}-lane-0.f32"
-        if raw.stat().st_size != row["samples"] * 4:
-            raise ValueError("PCM size mismatch")
-        row.update(planned[index], raw=identity(raw), wav=make_wav(raw), coverage="unassessed")
+        row.update(planned[index], coverage="unassessed")
+        try:
+            if raw.stat().st_size != row["samples"] * 4:
+                raise ValueError("PCM size mismatch")
+            row.update(raw=identity(raw), wav=make_wav(raw))
+        except (OSError, ValueError) as error:
+            issues.append(f"group {index} audio: {error}")
+            row["artifact_error"] = str(error)
         observation = row.get("prefill_observation")
         if observation:
             logits = directory / "probe" / observation["logits_f32"]
-            row["logits"] = identity(logits)
+            try:
+                row["logits"] = identity(logits)
+            except OSError as error:
+                issues.append(f"group {index} logits: {error}")
         if trace:
             if index >= len(traces) or traces[index]["seed"] != row["seed"]:
-                raise ValueError("trace seed/order mismatch")
-            row["codes"] = traces[index]["codes"]
-            if len(row["codes"]) != min(128, row["frames"]):
-                raise ValueError("missing bounded complete-frame trace")
+                issues.append(f"group {index}: trace seed/order mismatch")
+            else:
+                row["codes"] = traces[index]["codes"]
+                if len(row["codes"]) != min(128, row["frames"]):
+                    issues.append(f"group {index}: missing bounded complete-frame trace")
         rows.append(row)
-    return rows
+    return rows, issues
 
 
 def summarize(rows: list[dict]) -> dict:
@@ -106,12 +126,13 @@ def summarize(rows: list[dict]) -> dict:
             "coverage": "unassessed", "human_listening": "not_run"}
 
 
-def compare(rows: list[dict], baseline: list[dict]) -> list[dict]:
+def compare(rows: list[dict], baseline: list[dict]) -> dict:
     result = []
     for row, control in zip(rows, baseline):
         if (row["text_label"], row["seed"]) != (control["text_label"], control["seed"]):
             raise ValueError("unpaired experiment")
-        item = {"group": row["group"], "raw_equal": row["raw"]["sha256"] == control["raw"]["sha256"],
+        item = {"group": row["group"], "raw_equal": (row["raw"]["sha256"] == control["raw"]["sha256"])
+                if "raw" in row and "raw" in control else None,
                 "frames_equal": row["frames"] == control["frames"],
                 "terminal_equal": (row["status"], row["finish_reason"]) == (control["status"], control["finish_reason"])}
         if "logits" in row and "logits" in control:
@@ -119,7 +140,8 @@ def compare(rows: list[dict], baseline: list[dict]) -> list[dict]:
         if "codes" in row and "codes" in control:
             item["bounded_codes_equal"] = row["codes"] == control["codes"]
         result.append(item)
-    return result
+    return {"candidate_observed": len(rows), "baseline_observed": len(baseline),
+            "paired": len(result), "same_observed_denominator": len(rows) == len(baseline), "rows": result}
 
 
 def main() -> int:
@@ -129,6 +151,7 @@ def main() -> int:
     parser.add_argument("--inputs", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--codec", type=Path, required=True)
+    parser.add_argument("--customvoice-codec", type=Path)
     parser.add_argument("--models", nargs="+", choices=("ru-stress", "base", "customvoice"), default=["ru-stress", "base", "customvoice"])
     parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=list(VARIANTS))
     parser.add_argument("--dependency-directory", type=Path, action="append", default=[])
@@ -137,8 +160,10 @@ def main() -> int:
     args = parser.parse_args()
     args.repo, args.output = args.repo.resolve(), args.output.resolve()
     args.output.relative_to(args.repo / ".tmp" / "base-acceptance")
-    if not 1 <= args.seconds <= 1800 or "baseline" not in args.variants:
-        parser.error("bounded budget and baseline variant required")
+    if (not 1 <= args.seconds <= 1800 or "baseline" not in args.variants
+            or args.variants.index("baseline") != int(args.variants[0] == "unobserved")
+            or len(args.variants) != len(set(args.variants))):
+        parser.error("bounded budget and unique variants with baseline before candidates required")
     model_paths = {
         "ru-stress": args.repo / "models/ru-stress/qwen-talker-1.7b-ru-stress-Q8_0.gguf",
         "base": args.repo / "models/qwen-talker-1.7b-base-Q8_0.gguf",
@@ -162,8 +187,14 @@ def main() -> int:
     for name in (*INPUT_HASHES, "ru-yes.txt", "ru-two-sentences.txt", "en-unseen.txt"):
         shutil.copyfile(args.inputs / name, inputs / name)
     planned = cases(args.causal)
+    runtime = [identity(p) for p in sorted(args.probe.parent.glob("*.dll"))]
+    runtime += [identity(p) for directory in args.dependency_directory for p in sorted(directory.glob("cublas*.dll"))]
+    runtime += [identity(p) for directory in args.dependency_directory for p in sorted(directory.glob("cudart*.dll"))]
+    cache = args.probe.parent / "CMakeCache.txt"
     write_json(args.output / "plan.json", {"cases": planned, "variants": args.variants, "models": models,
                "codec": identity(args.codec), "probe": identity(args.probe), "source": source_identity(),
+               "customvoice_codec": identity(args.customvoice_codec) if args.customvoice_codec else None,
+               "runtime_files": runtime, "cmake_cache": identity(cache) if cache.exists() else None,
                "gpu": gpu, "seconds": args.seconds, "trace": args.causal,
                "inputs": {p.name: identity(p) for p in inputs.iterdir()},
                "timing_scope": "host wall; CUDA kernel/event time requires independent profiler"})
@@ -178,7 +209,8 @@ def main() -> int:
             directory = args.output / f"{label}-{variant}"
             directory.mkdir()
             observed = variant != "unobserved"
-            manifest = {"talker": str(model_paths[label]), "codec": str(args.codec.resolve()),
+            codec = args.customvoice_codec if label == "customvoice" and args.customvoice_codec else args.codec
+            manifest = {"talker": str(model_paths[label]), "codec": str(codec.resolve()),
                         "max_batch": 1, "max_tokens": 256, "deadline_ms": 60000,
                         "stream_max_chunk_frames": 8, "observe_decisions": args.causal,
                         "observe_prefill": observed, "groups": [
@@ -207,8 +239,12 @@ def main() -> int:
                     status = "timeout"
             if returncode not in (None, 0):
                 status = "failed"
-            rows = collect(directory, planned, args.causal)
-            variants[variant] = {"state": status, "returncode": returncode, "rows": rows, "summary": summarize(rows)}
+            rows, issues = collect(directory, planned, args.causal)
+            if issues or len(rows) != len(planned):
+                status = "incomplete" if status == "completed" else status
+            variants[variant] = {"state": status, "returncode": returncode, "rows": rows,
+                                 "issues": issues, "not_run_groups": list(range(len(rows), len(planned))),
+                                 "summary": summarize(rows)}
             if variant != "baseline" and "baseline" in variants:
                 variants[variant]["comparison"] = compare(rows, variants["baseline"].get("rows", []))
             write_json(directory / "collected.json", variants[variant])

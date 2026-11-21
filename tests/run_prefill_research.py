@@ -26,6 +26,7 @@ VARIANTS = {
                  "QWEN_PREFILL_WINDOW": "64", "QWEN_PREFILL_RETAIN": "1"},
     "baseline-end": {},
     "prefix": {},
+    "prefix-full": {"QWEN_PREFILL_PREFIX_SOURCE": "full"},
     "prefix-combined": {"QWEN_PREFILL_LAST_ONLY": "1", "QWEN_PREFILL_KV": "f16",
                         "QWEN_PREFILL_WINDOW": "64", "QWEN_PREFILL_RETAIN": "1"},
 }
@@ -161,6 +162,8 @@ def main() -> int:
     parser.add_argument("--russian-only", action="store_true")
     parser.add_argument("--speaker-only", action="store_true",
                         help="Base clone mode A cost control; not a voice-quality equivalence claim")
+    parser.add_argument("--disable-cuda-graphs", action="store_true",
+                        help="Match a comparator built without GGML CUDA graphs; research only")
     parser.add_argument("--dependency-directory", type=Path, action="append", default=[])
     parser.add_argument("--seconds", type=int, default=1800)
     parser.add_argument("--causal", action="store_true")
@@ -211,6 +214,7 @@ def main() -> int:
                "gpu": gpu, "seconds": args.seconds, "trace": args.causal,
                "prefix_rows": args.prefix_rows,
                "speaker_only": args.speaker_only,
+               "disable_cuda_graphs": args.disable_cuda_graphs,
                "inputs": {p.name: identity(p) for p in inputs.iterdir()},
                "timing_scope": "host wall; CUDA kernel/event time requires independent profiler"})
     deadline = time.monotonic() + args.seconds
@@ -242,6 +246,8 @@ def main() -> int:
             env = environment(GPU, [args.probe.parent, *args.dependency_directory], args.causal)
             env = {k: v for k, v in env.items() if not k.startswith("QWEN_PREFILL_")}
             env.update(QWEN_PREFILL_PROFILE="1" if observed else "0", **VARIANTS[variant])
+            if args.disable_cuda_graphs:
+                env["GGML_CUDA_DISABLE_GRAPHS"] = "1"
             if variant.startswith("prefix"):
                 env["QWEN_PREFILL_PREFIX_ROWS"] = str(args.prefix_rows)
             write_json(directory / "environment.json", {k: v for k, v in env.items() if k.startswith(("GGML_", "CUDA_", "QWEN_"))})

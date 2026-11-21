@@ -42,6 +42,12 @@ class PrefillResearchContract(unittest.TestCase):
             combined.update(research.VARIANTS[label])
         self.assertEqual(research.VARIANTS["combined"], combined)
 
+    def test_full_prefix_is_an_explicit_separate_control(self):
+        self.assertEqual(research.VARIANTS["prefix"], {})
+        self.assertEqual(research.VARIANTS["prefix-full"],
+                         {"QWEN_PREFILL_PREFIX_SOURCE": "full"})
+        self.assertNotIn("QWEN_PREFILL_PREFIX_SOURCE", research.VARIANTS["combined"])
+
     def test_retained_input_hashes_are_sha256(self):
         for value in research.INPUT_HASHES.values():
             self.assertEqual(len(value), 64)

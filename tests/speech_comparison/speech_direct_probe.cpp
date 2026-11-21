@@ -2,6 +2,7 @@
 // Usage: probe model.gguf device output_dir speaker language seed runs text_file...
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -39,6 +40,14 @@ std::string phases(const SynthesisStats& stats) {
         ",\"talker_decode_ms\":" + json_number(stats.talker * 1000) +
         ",\"code_predictor_ms\":" + json_number(stats.code_predictor * 1000) +
         ",\"codec_ms\":" + json_number(stats.codec * 1000) + "}";
+}
+
+std::string sampling(const SamplingParams& params) {
+    return "{\"greedy\":" + std::string(params.greedy ? "true" : "false") +
+        ",\"temperature\":" + json_number(params.temperature) +
+        ",\"top_k\":" + std::to_string(params.top_k) +
+        ",\"top_p\":" + json_number(params.top_p) +
+        ",\"repetition_penalty\":" + json_number(params.repetition_penalty) + "}";
 }
 
 } // namespace
@@ -83,10 +92,18 @@ int main(int argc, char** argv) {
                 }
                 SynthesisStats stats, first_stats;
                 std::vector<float> audio;
+                bool invalid_pcm = false, capacity_exceeded = false;
                 size_t chunks = 0, first_samples = 0;
                 Clock::time_point first;
                 const auto start = Clock::now();
                 const auto outcome = synth.synthesize(request, [&](const float* samples, size_t count) {
+                    if (count == 0 || count > 256 * 1920 || audio.size() + count > 256 * 1920) {
+                        capacity_exceeded = true;
+                        return false;
+                    }
+                    for (size_t at = 0; at < count; ++at) {
+                        if (!std::isfinite(samples[at])) { invalid_pcm = true; return false; }
+                    }
                     if (chunks == 0) {
                         first = Clock::now();
                         first_stats = stats;
@@ -121,6 +138,11 @@ int main(int argc, char** argv) {
                     ",\"chunks\":" + std::to_string(chunks) +
                     ",\"frames\":" + std::to_string(outcome.frames) +
                     ",\"natural_eos\":" + (outcome.ended ? "true" : "false") +
+                    ",\"invalid_pcm\":" + (invalid_pcm ? "true" : "false") +
+                    ",\"capacity_exceeded\":" + (capacity_exceeded ? "true" : "false") +
+                    ",\"talker_sampling\":" + sampling(synth.generation().talker) +
+                    ",\"predictor_sampling\":" + sampling(synth.generation().code_predictor) +
+                    ",\"min_frames\":" + std::to_string(synth.generation().min_frames) +
                     ",\"sample_rate\":" + std::to_string(synth.sample_rate()) +
                     ",\"samples\":" + std::to_string(audio.size()) +
                     ",\"seconds\":" + json_number(static_cast<double>(audio.size()) / synth.sample_rate()) +

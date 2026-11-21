@@ -32,9 +32,13 @@ static void research_prefill_tap(ResearchPrefillLayerCapture * capture,
     if (!capture) {
         return;
     }
-    // Output flags prevent allocator reuse before readback. They may affect
-    // fusion, so these observations must not be used as latency measurements.
-    ggml_set_output(tensor);
+    // A view's output flag does not protect its backing allocation when the
+    // allocator releases the last view. Retain the view and its owner chain
+    // until readback. These flags may affect allocation/fusion, so these
+    // observations must not be used as latency measurements.
+    for (auto * owner = tensor; owner; owner = owner->view_src) {
+        ggml_set_output(owner);
+    }
     capture->taps->push_back({ capture->layer, stage, tensor });
 }
 
@@ -107,7 +111,8 @@ static void research_prefill_diag_taps(const std::string &                     d
         const int shape[] = { rows, static_cast<int>(ggml_nelements(tensor) / rows) };
         research_prefill_diag_dump(directory, name, values.data(), shape, 2);
         index << "{\"layer\":" << tap.layer << ",\"stage\":\"" << tap.stage << "\",\"file\":\"" << name
-              << ".bin\",\"op\":\"" << ggml_op_name(tensor->op) << "\",\"tensor\":";
+              << ".bin\",\"op\":\"" << ggml_op_name(tensor->op)
+              << "\",\"output_retention\":\"view_and_backing_chain\",\"tensor\":";
         research_prefill_diag_tensor_shape(index, tensor);
         for (int source = 0; source < 2; ++source) {
             if (tensor->src[source]) {

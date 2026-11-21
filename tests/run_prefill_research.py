@@ -55,7 +55,7 @@ def cases(causal: bool) -> list[dict]:
 
 def logits_difference(left: Path, right: Path) -> dict:
     a, b = left.read_bytes(), right.read_bytes()
-    if len(a) != len(b) or len(a) % 4:
+    if not a or len(a) != len(b) or len(a) % 4:
         return {"shape_equal": False, "byte_equal": False}
     av, bv = struct.unpack(f"<{len(a)//4}f", a), struct.unpack(f"<{len(b)//4}f", b)
     if not all(math.isfinite(v) for v in (*av, *bv)):
@@ -105,8 +105,10 @@ def collect(directory: Path, planned: list[dict], trace: bool,
         if observation:
             logits = directory / "probe" / observation["logits_f32"]
             try:
+                if observation["logits_count"] <= 0 or logits.stat().st_size != observation["logits_count"] * 4:
+                    raise ValueError("empty or size-inconsistent logits observation")
                 row["logits"] = identity(logits)
-            except OSError as error:
+            except (OSError, ValueError, KeyError) as error:
                 issues.append(f"group {index} logits: {error}")
         if trace:
             if index >= len(traces) or traces[index]["seed"] != row["seed"]:

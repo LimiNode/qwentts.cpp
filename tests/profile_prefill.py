@@ -32,6 +32,9 @@ def main() -> int:
     env = environment(GPU, [args.probe.parent, *args.dependency_directory], False)
     env = {k: v for k, v in env.items() if not k.startswith("QWEN_PREFILL_")}
     env.update(QWEN_PREFILL_PROFILE="1", QWEN_PREFILL_NVTX="1")
+    temporary = output / "temporary"
+    temporary.mkdir()
+    env.update(TMP=str(temporary), TEMP=str(temporary))
     command = [str(args.nsys.resolve()), "profile", "--trace=cuda,nvtx", "--sample=none",
                "--cpuctxsw=none", "--cuda-graph-trace=graph", "--output=" + str(output / "trace"),
                str(args.probe.resolve()), str(output / "manifest.json"), str(output / "probe")]

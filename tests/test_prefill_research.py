@@ -71,6 +71,10 @@ class PrefillResearchContract(unittest.TestCase):
             self.assertAlmostEqual(changed["rms"], math.sqrt(1.25 / 3))
             second.write_bytes(struct.pack("<2f", 1, 2))
             self.assertFalse(research.logits_difference(first, second)["shape_equal"])
+            first.write_bytes(b"")
+            second.write_bytes(b"")
+            self.assertFalse(research.logits_difference(first, second)["shape_equal"])
+            first.write_bytes(struct.pack("<3f", 1, 2, 4))
             second.write_bytes(struct.pack("<3f", 1, math.inf, 3))
             with self.assertRaisesRegex(ValueError, "nonfinite"):
                 research.logits_difference(first, second)
@@ -143,6 +147,19 @@ class PrefillResearchContract(unittest.TestCase):
             self.assertEqual(rows[0]["status"], -1)
             self.assertEqual(len(issues), 1)
             self.assertIn("artifact_error", rows[0])
+
+    def test_collect_rejects_empty_observation_but_keeps_audio(self):
+        with tempfile.TemporaryDirectory(dir=self.temp_root) as folder:
+            root = Path(folder)
+            terminal, planned = self.fixture(root)
+            terminal["prefill_observation"] = {"logits_f32": "empty.f32", "logits_count": 0}
+            (root / "probe/empty.f32").write_bytes(b"")
+            (root / "probe/results.jsonl").write_text(json.dumps(terminal) + "\n", encoding="utf-8")
+            rows, issues = research.collect(root, planned, False)
+            self.assertEqual(len(rows), 1)
+            self.assertIn("wav", rows[0])
+            self.assertNotIn("logits", rows[0])
+            self.assertTrue(any("empty or size-inconsistent" in issue for issue in issues))
 
     def test_collect_retains_but_rejects_an_ignored_conditioning_switch(self):
         for conditioning in ("base_icl", "base_speaker_only"):

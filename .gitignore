@@ -3,6 +3,7 @@ build/
 *.wav
 
 tests/*/
+!tests/speech_comparison/
 
 checkpoints/
 models/*.gguf

@@ -74,3 +74,57 @@ worst-case PCM/log allowance plus512MiB free reserve. Max1800s overall,
 No standalone retry, live suffix buffer, actual speculative dual fork,
 classifier, physical playback, semantic coverage or held-out qualification is
 implemented by this stage. The Bridge frozen plan owns the subsequent work.
+
+## Measured discovery matrix: 2026-11-22
+
+CMP 50HX UUID `GPU-40361931-6cb5-ac58-a059-5ba3e70986fb`, RU-stress Q8_0,
+original Q8_0 codec and unchanged Kraftwerk conditioning. Payloads remain in
+the Bridge checkout's ignored
+`.tmp/base-acceptance/eos-recovery-20261122/matrix-001/`. See the
+[Bridge results report](https://github.com/LimiNode/qwen3-tts-bridge-cpp/blob/research/native-prefill-latency/docs/reports/native-eos-recovery-mechanics-20261122.md)
+for the full identity and evidence ledger.
+
+The static probe was built from native source
+`382e20a3fd52d341820d35f6ea5a2d5c23d42447`; the runner checkout was clean at
+`b16d8af6c365e9deb0fd503df9a695c1092ad4f4` (later runner/tests/CI changes only).
+Probe SHA-256:
+`ef53929578325efba9c74028997adbb8ee486c3470ef108ba462505deaf94435`.
+Probe, runtime and model identities were unchanged after execution.
+
+- Streaming controls: 14/14 matched retained frame counts, natural EOS and
+  raw PCM SHA-256, including both repetitions.
+- Unchanged replay: 21/21 matched original complete 16-code histories and
+  f32 PCM byte-for-byte, restoring boundaries 0/1/2 without another prefill.
+- Recovery groups: 21/21 mechanically valid; 15 triggered interventions and
+  six healthy controls did not intervene. All new audio remains unlistened;
+  longer output is not established text recovery.
+
+The following are final frame counts, not semantic success counts. Each
+triggered method used continuation seed 64; all final outcomes were natural EOS.
+
+| Original seed | Original frames | EOS resample | Rollback1 | Rollback2 |
+| --- | --- | --- | --- | --- |
+| 2 | 3 | 3 | 87 | 87 |
+| 14 | 3 | 3 | 104 | 2 |
+| 72 | 6 | 6 | 71 | 84 |
+| 75 | 2 | 94 | 85 | 84 |
+| 78 | 3 | 97 | 86 | 85 |
+
+Healthy seeds 42/64 retained 101/84 frames respectively, with original/final
+codes and PCM identical in all three policy groups. Every triggered output
+preserved the complete-code prefix before its actual restore boundary.
+Buffered original PCM did **not** equal retained streaming PCM in any of the
+42 replay/recovery groups; observed original Talker decisions matched, and
+buffered original full-code histories were stable per seed. Thus unchanged
+buffered replay passes, but buffered/streaming codec equivalence does not.
+
+Across replay/recovery groups, summed snapshot capture cost was 166.3–515.1 ms
+per original attempt; actual restore cost was 36.4–42.2 ms per restoration.
+Retained host copies of device payload totaled 178,151,424–534,454,272 bytes per
+group. These diagnostic synchronous copies are not an optimized ring buffer,
+GPU-kernel-only timing, process-memory measurement or peak-VRAM measurement.
+
+This establishes bounded buffered mechanics only. No live commit/rollback,
+codec fork, TTFA improvement, text coverage, held-out quality or release gate
+is qualified. Public ABI, sampler defaults and Bridge engine pin remain
+unchanged; no experimental policy is promoted.

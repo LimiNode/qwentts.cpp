@@ -259,6 +259,10 @@ if(QWEN_RESEARCH_FRAME_SEEDS)
     target_link_libraries(eos-research-probe PRIVATE qwen-core yyjson)
     link_ggml_backends(eos-research-probe)
     add_test(NAME eos_research_observer_contract COMMAND eos-research-probe --self-test)
+    add_executable(codec-stream-replay-probe tests/codec_stream_replay_probe.cpp)
+    target_link_libraries(codec-stream-replay-probe PRIVATE qwen-core)
+    link_ggml_backends(codec-stream-replay-probe)
+    add_test(NAME codec_stream_replay_contract COMMAND codec-stream-replay-probe --self-test)
 endif()
 add_executable(test-frame-seed-contract tests/frame_seed_contract.cpp)
 target_include_directories(test-frame-seed-contract PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -321,6 +325,9 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME eos_recovery_python
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_eos_recovery.py)
+    add_test(NAME codec_replay_python
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_codec_replay.py)
     add_test(NAME eos_research_runner_python
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_eos_research_runner.py)

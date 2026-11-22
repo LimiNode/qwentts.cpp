@@ -71,9 +71,37 @@ it is not the full matrix or full-text recovery. Both variants preflight a
 worst-case PCM/log allowance plus512MiB free reserve. Max1800s overall,
 600s/process and60s/logical group; watchdogs terminate only the owned probe.
 
-No standalone retry, live suffix buffer, actual speculative dual fork,
+No live suffix buffer, actual speculative dual fork,
 classifier, physical playback, semantic coverage or held-out qualification is
 implemented by this stage. The Bridge frozen plan owns the subsequent work.
+
+## Full retry and private codec-state follow-up
+
+`--retry-comparison` preserves the14controls/21replays, then compares rollback1
+and `full-retry` twice for each seed (28groups), reversing policy order in
+repeat1. Retry retains the original artifacts and performs a fresh admission
+and prefill on the same engine, without AR snapshots. One original cancellation
+deadline covers both attempts; prefill itself is not interruptible. Metadata
+distinguishes prefill_count2 from restore_frame=-1 and records retry admission
+and prefill spans. Use group_total_ms for both-attempt cost, not final job time.
+The runner independently checks original bytes, repeats, and retry seed64
+against same-run fresh buffered64. Default historical schedules are unchanged.
+
+`codec-stream-replay-probe` reuses existing private streaming-codec snapshots;
+it does not add another decoder or public API. `run_codec_replay.py` freezes
+six retained discovery code histories, explicitly transposes frame-major AR
+files, primes the full reference, then compares snapshot restoration and
+reset/reconstruction. It checks all existing snapshot tensor bytes/position,
+complete PCM, and a changed continuation against independently decoded fresh
+candidate under the same schedule. FixedT1 boundaries0/1/2 and production-ramp
+0/1/3 are separate; ineligible common-prefix boundaries are skipped. These are
+teacher-forced one-lane tests, not live AR rollback, commit-buffer, multi-lane,
+timing or listening qualification. Both runners are plan-only without --execute.
+
+Quality review: the new retry branch extends the existing attempt owner and
+keeps its deadline/cleanup, rather than copying the synthesis loop. The separate
+codec probe reuses production state walkers and decoder; host inspection is
+deliberately diagnostic. No engine runtime source, public ABI or defaults change.
 
 ## Measured discovery matrix: 2026-11-22
 

@@ -28,6 +28,15 @@ class RecoveryStudyTests(unittest.TestCase):
         stages = study.schedule()
         self.assertEqual(study.disk_bound(stages), study.RESERVE_BYTES + 98 * 256 * 1920 * 6 + 32 * 1024**2)
 
+    def test_retry_schedule_preserves_gates_and_counterbalances_order(self):
+        stages = study.schedule(retry_comparison=True)
+        self.assertEqual(stages[:2], study.schedule()[:2])
+        self.assertEqual([len(stage["cases"]) for stage in stages], [14, 21, 28])
+        cases = stages[2]["cases"]
+        self.assertEqual([case["recovery"]["policy"] for case in cases[:2]], ["rollback-1", "full-retry"])
+        self.assertEqual([case["recovery"]["policy"] for case in cases[14:16]], ["full-retry", "rollback-1"])
+        self.assertEqual(study.disk_bound(stages), study.RESERVE_BYTES + 112 * 256 * 1920 * 6 + 32 * 1024**2)
+
     def test_smoke_is_known_short_replay_not_recovery(self):
         stages = study.schedule(True)
         self.assertEqual([len(stage["cases"]) for stage in stages], [10, 15])
@@ -114,7 +123,7 @@ class RecoveryStudyTests(unittest.TestCase):
         for suffix, data in ((".f32", pcm), ("-original.f32", pcm),
                              ("-original.i32", codes), ("-codes.i32", codes)):
             Path(str(stem) + suffix).write_bytes(data)
-        row = {"group": 0, "lane": 0, "seed": 42, "status": 0, "frames": 1,
+        row = {"group": 0, "lane": 0, "seed": 42, "status": 0, "frames": 1, "finish_reason": 1,
                "invalid_pcm": False, "capacity_exceeded": False, "decision_capture_invalid": False,
                "execution_mode": "streaming" if streaming else "buffered-uncommitted", "chunks": [],
                "research_recovery": {"policy": "replay", "original_frames": 1, "committed_samples": 0,
@@ -139,19 +148,52 @@ class RecoveryStudyTests(unittest.TestCase):
         case = {"seed": 2, "recovery": {"policy": "rollback-1", "continuation_seed": 64}}
         recovery = {"original_status": 0, "original_finish_reason": 1, "original_frames": 3,
                     "trigger_max_frames": 8, "triggered": True, "attempt_count": 2,
-                    "restore_frame": 2, "continuation_seed": 64}
+                    "restore_frame": 2, "continuation_seed": 64, "prefill_count": 1}
         study.validate_recovery({"research_recovery": recovery}, case, study.KNOWN)
         for key, value in (("original_status", 1), ("original_finish_reason", 3), ("original_frames", 4),
                            ("trigger_max_frames", 7), ("triggered", False), ("attempt_count", 1),
-                           ("restore_frame", 1), ("continuation_seed", 65)):
+                           ("restore_frame", 1), ("continuation_seed", 65), ("prefill_count", 2)):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 study.validate_recovery({"research_recovery": {**recovery, key: value}}, case, study.KNOWN)
 
     def test_healthy_long_control_may_skip_intervention(self):
         case = {"seed": 42, "recovery": {"policy": "rollback-2", "continuation_seed": 64}}
         recovery = {"original_status": 0, "original_finish_reason": 1, "original_frames": 90,
-                    "trigger_max_frames": 8, "triggered": False, "attempt_count": 1, "restore_frame": -1}
+                    "trigger_max_frames": 8, "triggered": False, "attempt_count": 1,
+                    "restore_frame": -1, "prefill_count": 1}
         study.validate_recovery({"research_recovery": recovery}, case, {42: 90})
+
+    def test_full_retry_requires_fresh_prefill_without_restore_and_valid_cost(self):
+        case = {"seed": 2, "recovery": {"policy": "full-retry", "continuation_seed": 64}}
+        recovery = {"original_status": 0, "original_finish_reason": 1, "original_frames": 3,
+                    "trigger_max_frames": 8, "triggered": True, "attempt_count": 2,
+                    "restore_frame": -1, "continuation_seed": 64, "prefill_count": 2,
+                    "snapshot_ms": 0, "restore_ms": 0, "peak_snapshot_bytes": 0,
+                    "retry_admission_ms": 160., "retry_prefill_ms": 150.}
+        study.validate_recovery({"research_recovery": recovery}, case, study.KNOWN)
+        for field, value in (("restore_frame", 0), ("prefill_count", 1), ("snapshot_ms", 1),
+                             ("restore_ms", 1), ("peak_snapshot_bytes", 1), ("retry_admission_ms", 0),
+                             ("retry_prefill_ms", float("nan"))):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                study.validate_recovery({"research_recovery": {**recovery, field: value}}, case, study.KNOWN)
+        healthy = {**recovery, "original_frames": 101, "triggered": False, "attempt_count": 1,
+                   "prefill_count": 1, "retry_admission_ms": 0, "retry_prefill_ms": 0}
+        study.validate_recovery({"research_recovery": healthy}, {**case, "seed": 42}, {42: 101})
+
+    def test_retry_gate_checks_bytes_repeat_and_fresh_control(self):
+        fresh = [{"seed": seed, "original_raw": {"sha256": f"pcm{seed}"},
+                  "original_codes": {"sha256": f"codes{seed}"}} for seed in (2, 64)]
+        row = {"seed": 2, "mechanical_valid": True, "frames": 84, "finish_reason": 1,
+               "original_raw": fresh[0]["original_raw"], "original_codes": fresh[0]["original_codes"],
+               "raw": fresh[1]["original_raw"], "final_codes": fresh[1]["original_codes"],
+               "research_recovery": {"policy": "full-retry", "triggered": True, "continuation_seed": 64}}
+        rows = [row, json.loads(json.dumps(row))]
+        self.assertTrue(study.retry_pairs_passed(rows, fresh, 2))
+        self.assertFalse(study.retry_pairs_passed(rows, fresh, 4))
+        for field in ("original_raw", "original_codes", "raw", "final_codes"):
+            bad = json.loads(json.dumps(rows))
+            bad[1][field]["sha256"] = "changed"
+            self.assertFalse(study.retry_pairs_passed(bad, fresh, 2))
 
     def test_collector_independently_checks_replay_bytes(self):
         with tempfile.TemporaryDirectory(dir=self.temporary_root) as temporary:

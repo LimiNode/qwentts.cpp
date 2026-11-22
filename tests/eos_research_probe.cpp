@@ -54,7 +54,7 @@ bool optional_boolean(yyjson_val * object, const char * key, bool fallback) {
     return value ? yyjson_get_bool(value) : fallback;
 }
 
-enum class RecoveryPolicy { None, Replay, EosResample, Rollback1, Rollback2 };
+enum class RecoveryPolicy { None, Replay, EosResample, Rollback1, Rollback2, FullRetry };
 struct RecoveryConfig {
     RecoveryPolicy policy = RecoveryPolicy::None;
     std::string name = "none";
@@ -81,6 +81,7 @@ RecoveryConfig recovery_config(yyjson_val * group) {
     else if (result.name == "eos-resample") result.policy = RecoveryPolicy::EosResample;
     else if (result.name == "rollback-1") result.policy = RecoveryPolicy::Rollback1;
     else if (result.name == "rollback-2") result.policy = RecoveryPolicy::Rollback2;
+    else if (result.name == "full-retry") result.policy = RecoveryPolicy::FullRetry;
     else throw std::runtime_error("unknown recovery policy");
     if (yyjson_obj_get(value, "trigger_max_frames")) {
         result.trigger_max_frames = integer_field(value, "trigger_max_frames", 1, 8);
@@ -131,7 +132,9 @@ void recovery_self_test() {
     if (parse("{}").policy != RecoveryPolicy::None ||
         parse("{\"recovery\":{\"policy\":\"replay\",\"snapshot_frame\":0}}").snapshot_frame != 0 ||
         parse("{\"recovery\":{\"policy\":\"rollback-2\",\"continuation_seed\":64}}").policy != RecoveryPolicy::Rollback2 ||
-        parse("{\"recovery\":{\"policy\":\"eos-resample\",\"continuation_seed\":0}}").continuation_seed != 0) {
+        parse("{\"recovery\":{\"policy\":\"eos-resample\",\"continuation_seed\":0}}").continuation_seed != 0 ||
+        parse("{\"recovery\":{\"policy\":\"full-retry\",\"continuation_seed\":64}}").policy != RecoveryPolicy::FullRetry ||
+        parse("{\"recovery\":{\"policy\":\"full-retry\",\"continuation_seed\":0}}").continuation_seed != 0) {
         throw std::runtime_error("recovery policy parsing failed");
     }
     const char * invalid[] = {
@@ -139,6 +142,11 @@ void recovery_self_test() {
         "{\"recovery\":{\"policy\":\"rollback-1\"}}",
         "{\"recovery\":{\"policy\":\"rollback-1\",\"continuation_seed\":-1}}",
         "{\"recovery\":{\"policy\":\"rollback-1\",\"continuation_seed\":1,\"snapshot_frame\":0}}",
+        "{\"recovery\":{\"policy\":\"full-retry\"}}",
+        "{\"recovery\":{\"policy\":\"full-retry\",\"continuation_seed\":-1}}",
+        "{\"recovery\":{\"policy\":\"full-retry\",\"continuation_seed\":\"64\"}}",
+        "{\"recovery\":{\"policy\":\"full-retry\",\"continuation_seed\":64,\"snapshot_frame\":0}}",
+        "{\"recovery\":{\"policy\":\"full-retry\",\"continuation_seed\":64,\"trigger_max_frames\":9}}",
         "{\"recovery\":{\"policy\":\"replay\",\"snapshot_frame\":9}}",
         "{\"recovery\":{\"policy\":\"replay\",\"snapshot_frame\":1,\"continuation_seed\":1}}",
         "{\"recovery\":{\"policy\":\"replay\",\"snapshot_frame\":1,\"trigger_max_frames\":0}}",
@@ -148,6 +156,17 @@ void recovery_self_test() {
         bool rejected = false;
         try { (void) parse(json); } catch (const std::runtime_error &) { rejected = true; }
         if (!rejected) throw std::runtime_error("invalid recovery policy accepted");
+    }
+    const char * invalid_groups[] = {
+        "[{\"seeds\":[1,2],\"recovery\":{\"policy\":\"full-retry\",\"continuation_seed\":64}}]",
+        "[{\"seeds\":[1],\"diagnostic_dump\":true,\"recovery\":{\"policy\":\"full-retry\",\"continuation_seed\":64}}]"};
+    for (const char * json : invalid_groups) {
+        JsonDoc doc(yyjson_read(json, std::strlen(json), 0), yyjson_doc_free);
+        if (!doc) throw std::runtime_error("invalid recovery group self-test JSON");
+        bool rejected = false;
+        try { (void) group_recovery_configs(yyjson_doc_get_root(doc.get()), 1); }
+        catch (const std::runtime_error &) { rejected = true; }
+        if (!rejected) throw std::runtime_error("invalid full retry group accepted");
     }
     if (tts_engine_research_snapshot(nullptr) ||
         tts_engine_research_restore(nullptr, nullptr, 0, nullptr) ||
@@ -323,10 +342,13 @@ struct RecoveryObservation {
     int original_status = 0;
     int original_finish_reason = 0;
     int restore_frame = -1;
+    int prefill_count = 1;
     int64_t continuation_seed = 0;
     double snapshot_ms = 0.0;
     double restore_ms = 0.0;
     double original_completed_ms = 0.0;
+    double retry_admission_ms = 0.0;
+    double retry_prefill_ms = 0.0;
     size_t peak_snapshot_bytes = 0;
     std::vector<TtsResearchDecision> original_decisions;
 };
@@ -379,7 +401,8 @@ void write_recovery_observation(std::ostream & results, const RecoveryConfig & c
                                  const RecoveryObservation & observation, Clock::time_point start) {
     if (!observation.enabled) { results << "null"; return; }
     results << "{\"policy\":\"" << config.name << "\",\"buffered_uncommitted\":true"
-        << ",\"committed_samples\":0,\"prefill_count\":1,\"streaming_qualified\":false"
+        << ",\"committed_samples\":0,\"prefill_count\":" << observation.prefill_count
+        << ",\"streaming_qualified\":false"
         << ",\"trigger_max_frames\":" << config.trigger_max_frames
         << ",\"triggered\":" << (observation.triggered ? "true" : "false")
         << ",\"attempt_count\":" << (observation.triggered ? 2 : 1)
@@ -391,6 +414,8 @@ void write_recovery_observation(std::ostream & results, const RecoveryConfig & c
         << ",\"continuation_seed\":" << observation.continuation_seed
         << ",\"snapshot_ms\":" << observation.snapshot_ms
         << ",\"restore_ms\":" << observation.restore_ms
+        << ",\"retry_admission_ms\":" << observation.retry_admission_ms
+        << ",\"retry_prefill_ms\":" << observation.retry_prefill_ms
         << ",\"peak_snapshot_bytes\":" << observation.peak_snapshot_bytes
         << ",\"snapshot_byte_scope\":\"host_copies_of_device_payload_only\""
         << ",\"replay_codes_equal\":";
@@ -675,6 +700,7 @@ int main(int argc, char ** argv) {
             }
             std::array<Lane, 2> observations;
             std::array<qt_tts_params, 2> params{};
+            qt_tts_params retry_params{};
             std::array<qt_audio, 2> audio{};
             std::array<TtsJob, 2> jobs{};
             DecisionCapture capture{&observations, &jobs, lanes};
@@ -719,13 +745,14 @@ int main(int argc, char ** argv) {
             std::vector<TtsJob *> retired;
             std::vector<Step> steps;
             std::vector<SnapshotOwner> snapshots;
-            if (recovery_observation.enabled) {
+            const bool use_snapshots = recovery_observation.enabled && recovery.policy != RecoveryPolicy::FullRetry;
+            if (use_snapshots) {
                 for (int frame = 0; frame <= 8; ++frame) {
                     snapshots.emplace_back(nullptr, tts_engine_research_snapshot_free);
                 }
             }
             while (tts_engine_active(owner.engine)) {
-                if (recovery_observation.enabled && steps.size() <= 8) {
+                if (use_snapshots && steps.size() <= 8) {
                     SnapshotOwner snapshot(tts_engine_research_snapshot(owner.engine), tts_engine_research_snapshot_free);
                     if (!snapshot) throw std::runtime_error("bounded AR snapshot unavailable");
                     const auto info = tts_engine_research_snapshot_info(snapshot.get());
@@ -755,21 +782,41 @@ int main(int argc, char ** argv) {
                 if (jobs[0].status == QT_STATUS_OK &&
                     (recovery.policy == RecoveryPolicy::Replay ||
                      (jobs[0].finish_reason == QT_FINISH_EOS && jobs[0].n_frames <= recovery.trigger_max_frames))) {
-                    const int rewind = recovery.policy == RecoveryPolicy::Rollback1 ? 1 :
-                                       recovery.policy == RecoveryPolicy::Rollback2 ? 2 : 0;
-                    const int target = recovery.policy == RecoveryPolicy::Replay ? recovery.snapshot_frame :
-                                       jobs[0].n_frames - rewind;
-                    if (target < 0 || target > 8 || !snapshots[static_cast<size_t>(target)]) {
-                        throw std::runtime_error("requested rollback/replay boundary unavailable");
-                    }
                     const int64_t seed = recovery.policy == RecoveryPolicy::Replay ? params[0].seed : recovery.continuation_seed;
-                    qt_audio_free(&audio[0]);
-                    if (!tts_engine_research_restore(owner.engine, snapshots[static_cast<size_t>(target)].get(),
-                                                      seed, &recovery_observation.restore_ms)) {
-                        throw std::runtime_error("bounded AR restoration failed");
+                    if (recovery.policy == RecoveryPolicy::FullRetry) {
+                        qt_audio_free(&audio[0]);
+                        if (!tts_engine_research_capture_codes(owner.engine, true)) {
+                            throw std::runtime_error("cannot reset retired code capture for full retry");
+                        }
+                        // Preserve the row's original seed and the unchanged lane deadline.
+                        retry_params = params[0];
+                        retry_params.seed = seed;
+                        jobs[0] = {};
+                        jobs[0].params = &retry_params;
+                        jobs[0].resolved_seed = seed;
+                        jobs[0].out = &audio[0];
+                        const auto retry_start = Clock::now();
+                        if (!tts_engine_admit(owner.engine, &jobs[0])) {
+                            throw std::runtime_error("full retry admission failed: " + jobs[0].error);
+                        }
+                        recovery_observation.retry_admission_ms = elapsed(retry_start);
+                        recovery_observation.prefill_count = 2;
+                    } else {
+                        const int rewind = recovery.policy == RecoveryPolicy::Rollback1 ? 1 :
+                                           recovery.policy == RecoveryPolicy::Rollback2 ? 2 : 0;
+                        const int target = recovery.policy == RecoveryPolicy::Replay ? recovery.snapshot_frame :
+                                           jobs[0].n_frames - rewind;
+                        if (target < 0 || target > 8 || !snapshots[static_cast<size_t>(target)]) {
+                            throw std::runtime_error("requested rollback/replay boundary unavailable");
+                        }
+                        qt_audio_free(&audio[0]);
+                        if (!tts_engine_research_restore(owner.engine, snapshots[static_cast<size_t>(target)].get(),
+                                                          seed, &recovery_observation.restore_ms)) {
+                            throw std::runtime_error("bounded AR restoration failed");
+                        }
+                        recovery_observation.restore_frame = target;
                     }
                     recovery_observation.triggered = true;
-                    recovery_observation.restore_frame = target;
                     recovery_observation.continuation_seed = seed;
                     observations[0].decision_count = 0;
                     observations[0].decision_overflow = false;
@@ -777,6 +824,9 @@ int main(int argc, char ** argv) {
                     while (tts_engine_active(owner.engine)) {
                         tts_engine_step(owner.engine, &retired);
                         steps.push_back({elapsed(start), tts_engine_active(owner.engine), retired.size(), 1});
+                    }
+                    if (recovery.policy == RecoveryPolicy::FullRetry) {
+                        recovery_observation.retry_prefill_ms = jobs[0].prefill_ms;
                     }
                     auto * final_codes = tts_engine_research_codes(owner.engine, &jobs[0]);
                     if (!final_codes) throw std::runtime_error("missing restored complete codes");

@@ -28,7 +28,7 @@ MAX_TOKENS = 256
 RESERVE_BYTES = 512 * 1024**2
 
 
-def schedule(smoke: bool = False) -> list[dict]:
+def schedule(smoke: bool = False, retry_comparison: bool = False) -> list[dict]:
     """Discovery mechanics only; do not call these held-out recovery successes."""
     controls = [{"seed": seed, "repeat": repeat} for repeat in range(2) for seed in SEEDS]
     replay = [{"seed": seed, "recovery": {"policy": "replay", "snapshot_frame": frame}}
@@ -39,6 +39,12 @@ def schedule(smoke: bool = False) -> list[dict]:
     if smoke:
         return [{"name": name, "cases": [case for case in cases if case["seed"] in KNOWN]}
                 for name, cases in (("controls", controls), ("replay", replay))]
+    if retry_comparison:
+        recovery = [{"seed": seed, "repeat": repeat, "recovery": {
+            "policy": policy, "trigger_max_frames": 8,
+            "continuation_seed": 65 if seed == 64 else 64}}
+            for repeat in range(2) for seed in SEEDS
+            for policy in (("rollback-1", "full-retry") if repeat == 0 else ("full-retry", "rollback-1"))]
     return [{"name": name, "cases": cases} for name, cases in
             (("controls", controls), ("replay", replay), ("recovery", recovery))]
 
@@ -98,12 +104,24 @@ def validate_recovery(row: dict, case: dict, expected_frames: dict[int, int]) ->
         raise ValueError("effective intervention trigger/attempt count differs")
     if triggered:
         rewind = {"eos-resample": 0, "rollback-1": 1, "rollback-2": 2}
-        target = config["snapshot_frame"] if replay else original_frames - rewind[config["policy"]]
+        target = (-1 if config["policy"] == "full-retry" else
+                  config["snapshot_frame"] if replay else original_frames - rewind[config["policy"]])
         seed = case["seed"] if replay else config["continuation_seed"]
         if recovery["restore_frame"] != target or recovery["continuation_seed"] != seed:
             raise ValueError("effective restore boundary or continuation seed differs")
     elif recovery["restore_frame"] != -1:
         raise ValueError("non-intervened control claims restoration")
+    if config["policy"] == "full-retry":
+        if recovery["prefill_count"] != (2 if triggered else 1):
+            raise ValueError("full retry did not report a fresh prefill")
+        if any(recovery[field] != 0 for field in ("snapshot_ms", "restore_ms", "peak_snapshot_bytes")):
+            raise ValueError("full retry unexpectedly used a snapshot")
+        for field in ("retry_admission_ms", "retry_prefill_ms"):
+            span = recovery[field]
+            if not math.isfinite(span) or (span <= 0 if triggered else span != 0):
+                raise ValueError("invalid full retry timing")
+    elif recovery["prefill_count"] != 1:
+        raise ValueError("AR recovery unexpectedly performed another prefill")
 
 
 def collect(directory: Path, cases: list[dict], expected_frames: dict[int, int] | None = None) -> tuple[list[dict], list[str]]:
@@ -119,6 +137,8 @@ def collect(directory: Path, cases: list[dict], expected_frames: dict[int, int] 
                 raise ValueError("result/case identity mismatch")
             if row["status"] != 0 or row["invalid_pcm"] or row["capacity_exceeded"] or row["decision_capture_invalid"]:
                 raise ValueError("probe reports invalid/failed outcome")
+            if row["finish_reason"] != 1:
+                raise ValueError("outcome did not reach natural EOS")
             if "recovery" not in case and case["seed"] in KNOWN and row["frames"] != KNOWN[case["seed"]]:
                 raise ValueError("known early-EOS frame count did not reproduce")
             stem = directory / "probe" / f"group-{index}-lane-0"
@@ -130,7 +150,7 @@ def collect(directory: Path, cases: list[dict], expected_frames: dict[int, int] 
             if "recovery" in case:
                 if not recovery or row["execution_mode"] != "buffered-uncommitted" or row["chunks"]:
                     raise ValueError("recovery falsely labeled streaming or missing metadata")
-                if recovery["committed_samples"] != 0 or recovery["prefill_count"] != 1 or recovery["streaming_qualified"]:
+                if recovery["committed_samples"] != 0 or recovery["streaming_qualified"]:
                     raise ValueError("unsupported recovery/commit contract")
                 if recovery["policy"] != case["recovery"]["policy"]:
                     raise ValueError("effective recovery policy differs")
@@ -172,6 +192,34 @@ def controls_match(rows: list[dict], old: list[dict]) -> bool:
     return bool(rows)
 
 
+def retry_pairs_passed(rows: list[dict], replay: list[dict], planned: int) -> bool:
+    """Compare actual bytes, including full retry versus same-run fresh seed64."""
+    if len(rows) != planned or not all(row.get("mechanical_valid") for row in rows):
+        return False
+    fresh = {row["seed"]: row for row in replay}
+    seen = {}
+    for row in rows:
+        seed, recovery = row["seed"], row["research_recovery"]
+        control = fresh[seed]
+        if any(row[field]["sha256"] != control[field]["sha256"]
+               for field in ("original_raw", "original_codes")):
+            return False
+        pair = (recovery["policy"], seed)
+        result = (row["frames"], row["finish_reason"], row["raw"]["sha256"], row["final_codes"]["sha256"])
+        if pair in seen and seen[pair] != result:
+            return False
+        seen[pair] = result
+        if recovery["policy"] == "full-retry" and recovery["triggered"]:
+            expected = fresh[recovery["continuation_seed"]]
+            if (row["raw"]["sha256"], row["final_codes"]["sha256"]) != (
+                    expected["original_raw"]["sha256"], expected["original_codes"]["sha256"]):
+                return False
+        if not recovery["triggered"] and any(row[end]["sha256"] != row[start]["sha256"]
+                for start, end in (("original_raw", "raw"), ("original_codes", "final_codes"))):
+            return False
+    return len(seen) * 2 == planned
+
+
 def launch_owned(command, runtime, env, out, err, timeout, watchdog):
     """Kill/reap the owned process even when watchdog diagnostics cannot be written."""
     process = subprocess.Popen(command, cwd=runtime, env=env, stdout=out, stderr=err)
@@ -193,8 +241,11 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seconds", type=int, default=1800)
     parser.add_argument("--execute", action="store_true")
-    parser.add_argument("--smoke", action="store_true",
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--smoke", action="store_true",
                         help="Only five known short-EOS controls and exact replays, cap8frames; no rescue/timing claim")
+    mode.add_argument("--retry-comparison", action="store_true",
+                      help="Compare rollback1 and full retry, twice, after unchanged control/replay gates")
     args = parser.parse_args()
     if not 1 <= args.seconds <= 1800:
         parser.error("seconds must be 1..1800")
@@ -205,10 +256,10 @@ def main() -> int:
     probe, runtime = args.probe.resolve(), args.runtime.resolve()
     if probe.parent != runtime and list(probe.parent.glob("*.dll")):
         raise ValueError("isolated probe directory must not contain local DLL overrides")
-    stages = schedule(args.smoke)
+    stages = schedule(args.smoke, args.retry_comparison)
     max_tokens, log_bytes = (8, 8 * 1024**2) if args.smoke else (MAX_TOKENS, 32 * 1024**2)
     free = shutil.disk_usage(repo).free
-    required = disk_bound(stages, max_tokens, log_bytes)
+    required = disk_bound(stages, max_tokens, log_bytes) + (128 * 1024**2 if args.retry_comparison else 0)
     if args.execute and free < required:
         raise ValueError(f"disk preflight: need {required} bytes including512MiB reserve; have {free}")
     before = {"probe": identity(probe), "runtime": [identity(p) for p in sorted(runtime.glob("*.dll"))],
@@ -237,6 +288,7 @@ def main() -> int:
         "gpu": gpu_identity(GPU) if args.execute else "not_queried_plan_only",
         "seconds": args.seconds, "disk_required_bytes": required, "disk_free_bytes": free,
         "smoke_only": args.smoke, "max_tokens": max_tokens,
+        "retry_comparison": args.retry_comparison,
         "prespecified_gate": "exact retained streaming controls, then all planned exact replay pairs, then interventions if planned",
         "scope": "buffered uncommitted mechanics; no fork/streaming latency or semantic recovery qualification"})
     if not args.execute:
@@ -274,6 +326,11 @@ def main() -> int:
                 matched = replay_passed(rows, len(cases))
                 if not matched:
                     issues.append("unchanged replay did not pass all complete-code/PCM comparisons; interventions blocked")
+                passed = passed and matched
+            elif args.retry_comparison:
+                matched = retry_pairs_passed(rows, results["replay"]["rows"], len(cases))
+                if not matched:
+                    issues.append("retry comparison changed originals/repeats or differs from fresh seed64")
                 passed = passed and matched
             results[name] = {"state": "mechanical_pass" if passed else "failed", "returncode": code,
                              "rows": rows, "issues": issues, "missing_groups": len(cases) - len(rows)}

@@ -96,8 +96,8 @@ Probe, runtime and model identities were unchanged after execution.
 - Unchanged replay: 21/21 matched original complete 16-code histories and
   f32 PCM byte-for-byte, restoring boundaries 0/1/2 without another prefill.
 - Recovery groups: 21/21 mechanically valid; 15 triggered interventions and
-  six healthy controls did not intervene. All new audio remains unlistened;
-  longer output is not established text recovery.
+  six healthy controls did not intervene. Initial collection left listening
+  unassessed; the later user observations below do not alter mechanical data.
 
 The following are final frame counts, not semantic success counts. Each
 triggered method used continuation seed 64; all final outcomes were natural EOS.
@@ -125,6 +125,24 @@ group. These diagnostic synchronous copies are not an optimized ring buffer,
 GPU-kernel-only timing, process-memory measurement or peak-VRAM measurement.
 
 This establishes bounded buffered mechanics only. No live commit/rollback,
-codec fork, TTFA improvement, text coverage, held-out quality or release gate
+codec fork, TTFA improvement, general text coverage, held-out quality or release gate
 is qualified. Public ABI, sampler defaults and Bridge engine pin remain
 unchanged; no experimental policy is promoted.
+
+## Scoped user listening follow-up
+
+On2026-11-22 the user assessed all17 blinded WAVs in the Bridge shortlist;
+copy/source byte counts and SHA-256 were reverified. Rollback1 has5/5 OK
+observations on known seeds2/14/72/75/78, rollback2 has4/5 (seed14 failed),
+and EOS resample has2/5 (seeds2/14/72 failed). Healthy streaming64 control
+is OK; buffered-original14 control fails. Total12 OK and5 failed includes
+both controls; policy denominators include only their own five candidates.
+
+OK supports subjective requested-text recognizability in response to the
+requested-text/extraneous-sounds question, not detailed stress, voice identity,
+prosody, all artifact classes or release quality. The Bridge per-file report
+`docs/reports/native-eos-recovery-listening-20261122.json` and three separate
+indexed receipts retain positive rollback1 `partial_pass` and the failures.
+Known-case positive listening makes rollback1 the next research candidate,
+not a general EOS fix. Codec continuity, snapshot overhead and held-out/live
+streaming gates are unchanged. No new GPU execution, pin/default or ABI change.

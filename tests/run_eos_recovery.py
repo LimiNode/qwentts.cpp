@@ -82,7 +82,31 @@ def replay_passed(rows: list[dict], planned: int) -> bool:
         and row["research_recovery"].get("replay_pcm_equal") is True for row in rows)
 
 
-def collect(directory: Path, cases: list[dict]) -> tuple[list[dict], list[str]]:
+def validate_recovery(row: dict, case: dict, expected_frames: dict[int, int]) -> None:
+    recovery, config = row["research_recovery"], case["recovery"]
+    original_frames = recovery["original_frames"]
+    if recovery["original_status"] != 0 or recovery["original_finish_reason"] != 1:
+        raise ValueError("original did not complete with natural EOS")
+    if case["seed"] in expected_frames and original_frames != expected_frames[case["seed"]]:
+        raise ValueError("original frame count differs from retained control")
+    threshold = config.get("trigger_max_frames", 8)
+    if recovery["trigger_max_frames"] != threshold:
+        raise ValueError("effective recovery trigger differs")
+    replay = config["policy"] == "replay"
+    triggered = replay or original_frames <= threshold
+    if recovery["triggered"] is not triggered or recovery["attempt_count"] != (2 if triggered else 1):
+        raise ValueError("effective intervention trigger/attempt count differs")
+    if triggered:
+        rewind = {"eos-resample": 0, "rollback-1": 1, "rollback-2": 2}
+        target = config["snapshot_frame"] if replay else original_frames - rewind[config["policy"]]
+        seed = case["seed"] if replay else config["continuation_seed"]
+        if recovery["restore_frame"] != target or recovery["continuation_seed"] != seed:
+            raise ValueError("effective restore boundary or continuation seed differs")
+    elif recovery["restore_frame"] != -1:
+        raise ValueError("non-intervened control claims restoration")
+
+
+def collect(directory: Path, cases: list[dict], expected_frames: dict[int, int] | None = None) -> tuple[list[dict], list[str]]:
     rows, issues = [], []
     results = directory / "probe/results.jsonl"
     if not results.is_file():
@@ -95,6 +119,8 @@ def collect(directory: Path, cases: list[dict]) -> tuple[list[dict], list[str]]:
                 raise ValueError("result/case identity mismatch")
             if row["status"] != 0 or row["invalid_pcm"] or row["capacity_exceeded"] or row["decision_capture_invalid"]:
                 raise ValueError("probe reports invalid/failed outcome")
+            if "recovery" not in case and case["seed"] in KNOWN and row["frames"] != KNOWN[case["seed"]]:
+                raise ValueError("known early-EOS frame count did not reproduce")
             stem = directory / "probe" / f"group-{index}-lane-0"
             raw = stem.with_suffix(".f32")
             validate_pcm(raw, row["frames"])
@@ -108,6 +134,7 @@ def collect(directory: Path, cases: list[dict]) -> tuple[list[dict], list[str]]:
                     raise ValueError("unsupported recovery/commit contract")
                 if recovery["policy"] != case["recovery"]["policy"]:
                     raise ValueError("effective recovery policy differs")
+                validate_recovery(row, case, expected_frames if expected_frames is not None else KNOWN)
                 original = Path(str(stem) + "-original.f32")
                 original_codes = Path(str(stem) + "-original.i32")
                 final_codes = Path(str(stem) + "-codes.i32")
@@ -143,6 +170,19 @@ def controls_match(rows: list[dict], old: list[dict]) -> bool:
                 expected["frames"], expected["finish_reason"], expected["raw"]["sha256"]):
             return False
     return bool(rows)
+
+
+def launch_owned(command, runtime, env, out, err, timeout, watchdog):
+    """Kill/reap the owned process even when watchdog diagnostics cannot be written."""
+    process = subprocess.Popen(command, cwd=runtime, env=env, stdout=out, stderr=err)
+    try:
+        return wait_for_probe(process, timeout, watchdog)
+    finally:
+        try:
+            if process.poll() is None:
+                process.kill()
+        finally:
+            process.wait(timeout=15)
 
 
 def main() -> int:
@@ -202,6 +242,7 @@ def main() -> int:
     if not args.execute:
         return 0
     old = json.loads((retained / "all-observations.json").read_text(encoding="utf-8"))
+    expected_frames = {item["seed"]: item["frames"] for item in old if item["text_label"] == "original"}
     results = {stage["name"]: {"state": "not_run", "rows": []} for stage in stages}
     deadline = time.monotonic() + args.seconds
     interrupted = False
@@ -214,18 +255,15 @@ def main() -> int:
             directory.mkdir()
             print(f"START {name}: {len(cases)} groups", flush=True)
             with (directory / "stdout.log").open("xb") as out, (directory / "stderr.log").open("xb") as err:
-                process = subprocess.Popen([str(probe), str(output / (name + "-manifest.json")),
-                    str(directory / "probe")], cwd=runtime, env=env, stdout=out, stderr=err)
                 try:
-                    code = wait_for_probe(process, min(600, max(0.001, deadline - time.monotonic())),
-                                          directory / "watchdog.json")
+                    code = launch_owned([str(probe), str(output / (name + "-manifest.json")),
+                        str(directory / "probe")], runtime, env, out, err,
+                        min(600, max(0.001, deadline - time.monotonic())), directory / "watchdog.json")
                 except subprocess.TimeoutExpired:
                     code = None
                 except KeyboardInterrupt:
-                    process.kill()
-                    process.wait(timeout=15)
                     interrupted, code = True, None
-            rows, issues = collect(directory, cases)
+            rows, issues = collect(directory, cases, expected_frames)
             passed = code == 0 and len(rows) == len(cases) and not issues
             if name == "controls":
                 matched = controls_match(rows, old)

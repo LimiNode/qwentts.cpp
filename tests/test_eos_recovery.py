@@ -5,6 +5,8 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import run_eos_recovery as study
 
@@ -32,6 +34,23 @@ class RecoveryStudyTests(unittest.TestCase):
         self.assertTrue(all(case["seed"] in study.KNOWN for stage in stages for case in stage["cases"]))
         self.assertEqual(study.disk_bound(stages, 8, 8 * 1024**2),
                          study.RESERVE_BYTES + 40 * 8 * 1920 * 6 + 8 * 1024**2)
+
+    def test_low_disk_blocks_before_hashing_models_or_launching(self):
+        with tempfile.TemporaryDirectory(dir=self.temporary_root) as temporary:
+            repo = Path(temporary)
+            argv = ["study", "--repo", str(repo), "--probe", str(repo / "binary/probe.exe"),
+                    "--runtime", str(repo / "runtime"), "--output", str(repo / ".tmp/base-acceptance/new"),
+                    "--execute"]
+            with (patch("sys.argv", argv),
+                  patch.object(study.shutil, "disk_usage", return_value=SimpleNamespace(free=0)),
+                  patch.object(study, "identity") as identity,
+                  patch.object(study.subprocess, "Popen") as launch,
+                  patch.object(study, "gpu_identity") as gpu):
+                with self.assertRaisesRegex(ValueError, "disk preflight"):
+                    study.main()
+                identity.assert_not_called()
+                launch.assert_not_called()
+                gpu.assert_not_called()
 
     def test_manifest_fixed_predictor_and_original_text(self):
         manifest = study.make_manifest(Path("E:/repo"), Path("E:/repo/inputs"), study.schedule()[1]["cases"])
@@ -95,14 +114,44 @@ class RecoveryStudyTests(unittest.TestCase):
         for suffix, data in ((".f32", pcm), ("-original.f32", pcm),
                              ("-original.i32", codes), ("-codes.i32", codes)):
             Path(str(stem) + suffix).write_bytes(data)
-        row = {"group": 0, "lane": 0, "seed": 2, "status": 0, "frames": 1,
+        row = {"group": 0, "lane": 0, "seed": 42, "status": 0, "frames": 1,
                "invalid_pcm": False, "capacity_exceeded": False, "decision_capture_invalid": False,
                "execution_mode": "streaming" if streaming else "buffered-uncommitted", "chunks": [],
                "research_recovery": {"policy": "replay", "original_frames": 1, "committed_samples": 0,
                     "prefill_count": 1, "streaming_qualified": False, "triggered": True,
+                    "trigger_max_frames": 8, "attempt_count": 2, "original_status": 0,
+                    "original_finish_reason": 1, "restore_frame": 0, "continuation_seed": 42,
                     "replay_codes_equal": not lie, "replay_pcm_equal": True}}
         (probe / "results.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
-        return study.collect(directory, [{"seed": 2, "recovery": {"policy": "replay"}}])
+        return study.collect(directory, [{"seed": 42, "recovery": {"policy": "replay", "snapshot_frame": 0}}])
+
+    def test_watchdog_write_error_still_kills_and_reaps_owned_process(self):
+        process = Mock()
+        process.poll.return_value = None
+        with (patch.object(study.subprocess, "Popen", return_value=process),
+              patch.object(study, "wait_for_probe", side_effect=OSError("disk full"))):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                study.launch_owned(["probe"], Path("runtime"), {}, None, None, 1, Path("watchdog.json"))
+        process.kill.assert_called_once()
+        process.wait.assert_called_once_with(timeout=15)
+
+    def test_effective_restore_contract_rejects_wrong_seed_boundary_or_original(self):
+        case = {"seed": 2, "recovery": {"policy": "rollback-1", "continuation_seed": 64}}
+        recovery = {"original_status": 0, "original_finish_reason": 1, "original_frames": 3,
+                    "trigger_max_frames": 8, "triggered": True, "attempt_count": 2,
+                    "restore_frame": 2, "continuation_seed": 64}
+        study.validate_recovery({"research_recovery": recovery}, case, study.KNOWN)
+        for key, value in (("original_status", 1), ("original_finish_reason", 3), ("original_frames", 4),
+                           ("trigger_max_frames", 7), ("triggered", False), ("attempt_count", 1),
+                           ("restore_frame", 1), ("continuation_seed", 65)):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                study.validate_recovery({"research_recovery": {**recovery, key: value}}, case, study.KNOWN)
+
+    def test_healthy_long_control_may_skip_intervention(self):
+        case = {"seed": 42, "recovery": {"policy": "rollback-2", "continuation_seed": 64}}
+        recovery = {"original_status": 0, "original_finish_reason": 1, "original_frames": 90,
+                    "trigger_max_frames": 8, "triggered": False, "attempt_count": 1, "restore_frame": -1}
+        study.validate_recovery({"research_recovery": recovery}, case, {42: 90})
 
     def test_collector_independently_checks_replay_bytes(self):
         with tempfile.TemporaryDirectory(dir=self.temporary_root) as temporary:

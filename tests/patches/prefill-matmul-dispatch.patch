@@ -1,0 +1,56 @@
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index a0e6de78..ac679c8a 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -1812,6 +1812,27 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
++    // Isolated diagnostic patch; no ordinary-build or release promotion.
++    const bool research_talker = src0->type == GGML_TYPE_Q8_0 && ne11 > 1 &&
++        std::strncmp(src0->name, "talker.blk.", 11) == 0;
++    const bool research_trace = research_talker && std::strcmp(src0->name, "talker.blk.0.attn_q.weight") == 0 &&
++        std::getenv("GGML_RESEARCH_MATMUL_TRACE") != nullptr;
++    auto research_route = [&](const char * route) {
++        if (research_trace) {
++            GGML_LOG_WARN("RESEARCH_MATMUL weight=%s cols=%lld route=%s\n", src0->name, (long long) ne11, route);
++        }
++    };
++    if (research_talker && std::getenv("GGML_RESEARCH_FORCE_CUBLAS_Q8") != nullptr) {
++        research_route("forced-cublas");
++        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
++        return;
++    }
++    if (research_talker && std::getenv("GGML_RESEARCH_FORCE_MMQ_Q8") != nullptr) {
++        research_route("forced-mmq");
++        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
++        return;
++    }
++
+     const int32_t hint = ggml_get_op_params_i32(dst, 1);
+     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
+         return;
+@@ -1823,6 +1844,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
+         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
++        research_route("fallback-cublas");
+         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+         return;
+     }
+@@ -1841,12 +1863,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+         return;
+     }
+     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
++        research_route("mmvq");
+         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+         return;
+     }
+     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
++        research_route("mmq");
+         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+         return;
+     }
++    research_route("cublas");
+     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+ }

@@ -5,7 +5,7 @@
 // and set count and never reallocates. Reset just rewinds cur_len.
 //
 // Layout per layer, both K and V :
-//   4D ggml_tensor [hd, max_seq_len, n_kv, n_sets] f32, contiguous on hd
+//   4D ggml_tensor [hd, max_seq_len, n_kv, n_sets], contiguous on hd
 // plus one 3D view [hd, max_seq_len, n_kv] per set for the per-sequence
 // prefill path and device side set copies. The batched decode graph
 // views the 4D tensor directly with ne3 = N over sets [0, N).
@@ -30,6 +30,7 @@ struct KVCache {
     int head_dim;
     int max_seq_len;
     int n_sets;
+    int attention_alignment = 256;
 
     // Write head per set.
     std::vector<int> cur_len;
@@ -55,7 +56,9 @@ static struct ggml_tensor * kv_cache_v(const KVCache * kv, int set, int layer) {
 }
 
 // Allocate a fresh KV cache backed by a dedicated buffer on `backend`.
-// Tensors are zero initialised: the padded attention window reads past
+// F32 is the normal storage type; the private Talker research path can select
+// F16 without changing the Code Predictor. Tensors are zero initialised:
+// the padded attention window reads past
 // cur_len and the masked tail must see finite values.
 static bool kv_cache_init(KVCache *      kv,
                           int            n_layers,
@@ -63,7 +66,8 @@ static bool kv_cache_init(KVCache *      kv,
                           int            head_dim,
                           int            max_seq_len,
                           int            n_sets,
-                          ggml_backend_t backend) {
+                          ggml_backend_t backend,
+                          enum ggml_type type = GGML_TYPE_F32) {
     kv->n_layers    = n_layers;
     kv->n_kv_heads  = n_kv_heads;
     kv->head_dim    = head_dim;
@@ -88,8 +92,8 @@ static bool kv_cache_init(KVCache *      kv,
     }
 
     for (int l = 0; l < n_layers; l++) {
-        kv->k4[(size_t) l] = ggml_new_tensor_4d(kv->ctx, GGML_TYPE_F32, head_dim, max_seq_len, n_kv_heads, n_sets);
-        kv->v4[(size_t) l] = ggml_new_tensor_4d(kv->ctx, GGML_TYPE_F32, head_dim, max_seq_len, n_kv_heads, n_sets);
+        kv->k4[(size_t) l] = ggml_new_tensor_4d(kv->ctx, type, head_dim, max_seq_len, n_kv_heads, n_sets);
+        kv->v4[(size_t) l] = ggml_new_tensor_4d(kv->ctx, type, head_dim, max_seq_len, n_kv_heads, n_sets);
         char name[64];
         snprintf(name, sizeof(name), "kv_k_l%d", l);
         ggml_set_name(kv->k4[(size_t) l], name);
@@ -121,8 +125,7 @@ static bool kv_cache_init(KVCache *      kv,
     // Zero-init the buffer so any out of bounds read returns a known value.
     ggml_backend_buffer_clear(kv->buffer, 0);
 
-    size_t bytes_per_layer =
-        (size_t) head_dim * (size_t) max_seq_len * (size_t) n_kv_heads * (size_t) n_sets * sizeof(float);
+    size_t bytes_per_layer = ggml_nbytes(kv->k4[0]);
     size_t total_mb = (size_t) (2 * n_layers) * bytes_per_layer / (1024 * 1024);
     fprintf(stderr, "[KVCache] Allocated: %d layers, %d KV heads, head_dim %d, max_seq_len %d, %d sets -> %zu MB\n",
             n_layers, n_kv_heads, head_dim, max_seq_len, n_sets, total_mb);

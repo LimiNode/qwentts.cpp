@@ -396,7 +396,7 @@ static bool codec_snap_ensure(PipelineCodec * pc, CodecStateSnap * s) {
 // its slot mirror, device to device on a shared backend. The set views
 // slice the outermost dimension of contiguous owners, so every copy
 // moves one dense block.
-static void codec_snap_copy(PipelineCodec * pc, CodecStateSnap * s, int set, bool save) {
+static void codec_snap_copy(PipelineCodec * pc, const CodecStateSnap * s, int set, bool save) {
     struct ggml_tensor * m = ggml_get_first_tensor(s->ctx);
     for (int i = 0; i < pc->stream_n_state; i++) {
         struct ggml_tensor * v = pc->stream_set_views[(size_t) set * (size_t) pc->stream_n_state + (size_t) i];
@@ -477,6 +477,24 @@ void pipeline_codec_snap_free(CodecStateSnap * s) {
     }
     *s = {};
 }
+
+#ifdef QWEN_RESEARCH_FRAME_SEEDS
+bool pipeline_codec_research_snapshot(PipelineCodec * pc, int set, CodecStateSnap * snapshot) {
+    if (!pc || !snapshot || !pc->stream_ready || set < 0 || set >= pc->stream_sets ||
+        !codec_snap_ensure(pc, snapshot)) return false;
+    codec_snap_copy(pc, snapshot, set, true);
+    snapshot->pos = pc->stream_pos[(size_t) set];
+    return true;
+}
+
+bool pipeline_codec_research_restore(PipelineCodec * pc, int set, const CodecStateSnap * snapshot) {
+    if (!pc || !snapshot || !pc->stream_ready || set < 0 || set >= pc->stream_sets ||
+        !snapshot->ctx || !snapshot->buf) return false;
+    codec_snap_copy(pc, snapshot, set, false);
+    pc->stream_pos[(size_t) set] = snapshot->pos;
+    return true;
+}
+#endif
 
 // Append the streaming decode chain to an existing graph: quantizer,
 // pre conv, sliding window transformer, upsample stage and DAC, all

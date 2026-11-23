@@ -1,0 +1,175 @@
+# Bounded native prefill experiments
+
+Research only. No sampler, model, public C ABI, engine pin, or ordinary build
+default is promoted. The Bridge report `native-prefill-study-20261121.md`
+owns the measured CMP results; this file owns reproduction and switch semantics.
+
+## Build and observation
+
+Both `QWEN_RESEARCH_PREFILL` and `QWEN_RESEARCH_NVTX` default OFF. Ordinary
+builds do not read the prefill experiment environment. The internal observation
+accessor is not a public DLL export. Internal tools inherit the research layout
+through qwen-core's compile definition.
+
+Use a clean build after internal-header changes. On the measurement machine,
+localized MSVC/Ninja include scanning recorded zero pipeline header dependencies;
+an incremental rebuild mixed a new probe layout with a stale static object.
+The failed controls were retained as invalid, and explicitly rebuilding both
+pipeline/qwen objects repaired them. Do not treat a changed version string as
+proof that all affected objects were rebuilt.
+
+For the GPU probe, configure the standalone engine with `GGML_CUDA=ON`,
+`QWEN_RESEARCH_FRAME_SEEDS=ON`, and `QWEN_RESEARCH_PREFILL=ON`; use an explicit
+GPU architecture and initialized host compiler environment. Build
+`eos-research-probe` and `test-prefill-settings-contract`. For the separate
+Nsight experiment add `QWEN_RESEARCH_NVTX=ON`; this requires CUDA and its
+existing NVTX headers, not a new runtime or SDK dependency.
+
+| Environment | Values / meaning |
+| --- | --- |
+| `QWEN_PREFILL_PROFILE` | `0` (default) or `1`; host-wall phases and saved final logits |
+| `QWEN_PREFILL_LAST_ONLY` | `0` (default) or `1`; final norm/head only for the last row; full dumps retain the original graph |
+| `QWEN_PREFILL_KV` | `f32` (default) or `f16`; Talker KV storage, including later decode; Predictor KV unchanged |
+| `QWEN_PREFILL_WINDOW` | `256` (default) or `64`; attention-window alignment, not a smaller total sequence capacity |
+| `QWEN_PREFILL_RETAIN` | `0` (default) or `1`; one compatible prefill graph/scheduler/allocation, keyed by shape and relevant execution settings |
+| `QWEN_PREFILL_PREFIX_ROWS` | absent (default) or integer `1..4095`, also strictly smaller than the actual prompt |
+| `QWEN_PREFILL_PREFIX_SOURCE` | `split` (default) or `full`; an explicit value requires prefix rows |
+| `QWEN_PREFILL_NVTX` | `1` enables labels only in an NVTX-enabled build; use in separate profiler runs |
+| `QWEN_PREFILL_DIAG_DIR` | Separate unique capture root; requires PROFILE=1, LAST_ONLY=0, RETAIN=0 |
+| `QWEN_PREFILL_DIAG_LAYER` | `0` (default), one existing layer, or `all`; <=8 calls, full prompt <=512 rows |
+| `QWEN_PREFILL_ATTN` | `default` or `manual`; prefill only, does not change decode attention |
+
+Invalid settings fail atomically. Set the environment before loading the
+pipeline; do not mutate it concurrently. Retained graphs are bypassed for
+full diagnostics; only one shape is retained. This is not a general cache.
+
+`compute_wait_ms` includes the existing synchronous graph call and waiting;
+it is not pure GPU execution. Phase observation does not add synchronization
+or full-tensor readbacks. The probe copies the existing last-logit readback
+and records its overhead in matched Observer OFF/ON controls. Full dumps,
+frame tracing and Nsight are separate from latency measurements.
+Nsight Systems 2026.4.1 explicitly refuses CUDA tracing on CMP hardware
+(`ERR_NVCMPGPU`). The retained attempt provides NVTX host spans, not CUDA
+kernel timings. Profiler temporary files are routed into its task directory.
+
+## Prefix controls
+
+Prefix reuse requires a GPU, one slot, no tensor dump, and byte-identical
+leading input embeddings. First discover the actual common rows on different
+texts/languages/conditioning with observation only. A speaker name alone does
+not establish reusable context. The research cache rejects the first mismatch
+and remains invalid until pipeline reload; it does not silently choose a new
+prefix, fall back, or implement a production voice/language cache.
+
+`split` first computes only the chosen prefix, snapshots its KV on device,
+then computes the suffix. `full` instead executes and returns the original
+full first prefill and snapshots its leading KV rows. Subsequent requests in
+both variants restore the snapshot and execute the suffix with absolute
+positions. This distinguishes prefix-construction shape changes from suffix
+execution shape changes. Device restore/preparation/snapshot timings are
+separate; `prefill_ms` includes the wrapper, whereas observation core spans
+describe the suffix (or the original full first request in `full`).
+
+Causal attention does not imply floating-point equivalence. Compare final
+logits, forced or sampled codes, raw PCM and EOS separately. A faster result
+or equal argmax does not qualify this path. There is no release cache,
+cross-request cancellation/reset contract or public configuration in this PR.
+
+## Reproducible harnesses
+
+- `tests/run_prefill_research.py --help`: frozen CMP UUID, exact models and
+  conditioning hashes, new output directory, bounded subprocess/total runtime,
+  first-use plus twelve warm same-input pairs, shape/language/EOS controls,
+  final baseline, raw PCM/WAV/logits and all failures retained. `--causal`
+  enables separate bounded complete-code traces; these are not latency runs.
+- `--prefix-rows N --variants baseline prefix prefix-full baseline-end`:
+  explicitly chosen post-discovery comparison. `--russian-only` tests the
+  observed same-language prefix without pretending it also matches English.
+- `--speaker-only`: same Base checkpoint and speaker embedding without ICL
+  reference text/codes, a conditioning-cost control, not equivalent voice quality.
+- `--disable-cuda-graphs`: native control for a comparator compiled with
+  GGML CUDA graphs OFF. Keep native default-graph results separately.
+- `tests/check_prefill_rejection.py --help`: two bounded accepted Russian
+  requests, then expected English-prefix rejection. The probe exits at rejection,
+  so subsequent poisoned-handle behavior is explicitly not hardware-tested.
+- `tests/profile_prefill.py --help`: three four-frame controls with NVTX,
+  independent owned-process-tree watchdog and SQLite export. Max-token endings
+  are intentional diagnostics, not successful speech synthesis.
+- `tests/run_speech_comparison.py --help` and
+  [comparator tools](../tests/speech_comparison/README.md): pinned source,
+  matched checkpoint/tensor payloads, every attempt retained and no hidden
+  warmup. Different RNG algorithms mean integer seeds are not matched draws.
+
+`state=completed` means the process produced all planned result rows. Always
+inspect error, max-token, PCM, EOS, coverage and numerical comparisons separately;
+successful process exit is not a qualification result. Twelve identical warm
+repeats measure jitter, not a distribution across twelve independent texts.
+New artifacts remain unlistened until exact-file human observations are recorded.
+
+## Differential follow-up
+
+`tests/run_prefill_differential.py` accepts a retained same-model manifest,
+explicit prefix rows and one control: default, no-fusion, manual-attention,
+forced-cublas or forced-mmq. Each run executes baseline/prefix with taps OFF/ON,
+four requests per process (original, original, short Russian, original), seed64,
+intentionally limited to four frames. It freezes the executable/DLLs in the
+new run directory. Earlier runs only recorded binary hashes; do not imply that
+the initial executable is retained. No diagnostic timing is benchmark evidence.
+
+Layer captures include input/norm, projections, RoPE, attention and residuals;
+KV captures retain native packed bytes to compare snapshot, restore and suffix
+preservation independently. Corrected taps retain each view's backing owner
+chain. `tests/analyze_prefill_differential.py` excludes legacy unpinned view
+captures and requires complete, paired results. Offline tensor analysis uses an
+existing NumPy install; model-free validation runs without it. No package is
+installed by these tools.
+
+For host-selected CUDA matmul route logs or forcing, explicitly apply
+`tests/patches/prefill-matmul-dispatch.patch` to the pinned GGML checkout in an
+isolated research build. This patch is not a submodule pin update. Rebuild
+ggml-cuda, preserve its SHA-256 and patch hash, and use `--trace-matmul`.
+Forced controls also disable fusion; cuBLAS uses f32 compute. The patch only
+forces Q8_0 Talker matrices with more than one column; single-slot decode is
+unchanged. Route logs are bounded by the four-request experiment and identify
+host dispatch, not complete CUDA kernel traces or timings. The runner rejects
+missing/ignored route controls. Remove only the applied patch after the run;
+never promote it to an engine default from this experiment.
+
+## Short utterances and separate timing
+
+`tests/run_prefill_short.py --help` expands the CustomVoice `ryan` control to
+eight short Russian/English phrases and seeds64/65/72/75. `--phase quality`
+uses six language-isolated processes, with a longer primer before and after
+the16 short cases in each process. Baseline, full-source prefix9 and forced-MMQ
+prefix9 share the same frozen Q8_0 talker/comparator-codec hashes and fusion-OFF
+setting. All108 requests, PCM/WAV, final logits, logs and failures are retained.
+Natural EOS or a long WAV does not establish correct words or absence of cough.
+
+`--phase timing --quality-reference QUALITY_DIRECTORY` requires the matching
+complete mechanical reference, not a human-quality pass. It runs first-use
+plus eight warm repeats of one Russian text/seed64 in each of six processes,
+reversing variant order for the second block. These54 requests have profiling,
+tensor taps, route traces and decision observations OFF. The frozen engine
+still emits an operational prefix-hit line for prefix requests; its residual
+host-log overhead is included. This is not a zero-logging or GPU-event benchmark.
+Exclude incomplete/failed blocks entirely; distinguish first-use, paired block
+drift and warm-request jitter from a broader text/seed latency distribution.
+
+Both phases accept `--repo`, retained `--probe`/`--manifest`, a new `--output`
+under the repository's `.tmp/base-acceptance/`, optional CUDA
+`--dependency-directory`, and bounded `--seconds` (at most1800). Use one shared
+GPU budget across both invocations. The runner freezes and hashes executable,
+DLLs, model/codec, inputs and harness scripts. Its source HEAD identifies the
+harness checkout, not necessarily the source used to build a retained probe;
+preserve that probe's original build/patch receipt separately. This statically
+linked research probe is not Bridge/native-worker or packaged-DLL acceptance.
+
+`completed_with_failures` means all planned quality observations were retained,
+but at least one synthesis had a non-natural or invalid outcome; inspect
+`outcome_issues` and every row. A complete quality observation reference may
+include those explicit failures and is never a human-quality pass. Timing
+eligibility still requires successful natural-EOS audio for the entire block.
+The frozen runtime's unconditional job/seed and first-two-step sampler logs
+also remain; the runner checks their bounds instead of confusing them with
+opt-in full-frame/decision/tensor traces. Their cost is included alongside
+ordinary engine and prefix-hit logs.

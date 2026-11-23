@@ -5,6 +5,7 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import run_eos_corpus as corpus
@@ -203,6 +204,7 @@ class CorpusContract(unittest.TestCase):
                     corpus, "source_identity", return_value={"head": "fixture"}
                 ),
                 patch.object(corpus.subprocess, "Popen") as launch,
+                patch.object(corpus.shutil, "disk_usage", return_value=SimpleNamespace(free=corpus.MIN_FREE_DISK)),
             ):
                 self.assertEqual(corpus.main(argv), 0)
                 launch.assert_not_called()
@@ -224,6 +226,25 @@ class CorpusContract(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "CMP 50HX"):
                 corpus.gpu_identity("GPU-fixture")
             self.assertEqual(query.call_args.args[0][1:3], ["--id", "GPU-fixture"])
+
+    def test_low_disk_guard_blocks_before_model_or_process(self):
+        with tempfile.TemporaryDirectory(dir=self.temp_root) as folder:
+            root = Path(folder)
+            argv = ["--probe", str(root / "probe.exe"), "--talker", str(root / "talker.gguf"),
+                    "--codec", str(root / "codec.gguf"), "--prepared-inputs", str(root / "inputs"),
+                    "--output", str(root / "output"), "--gpu-uuid", "GPU-fixture", "--execute"]
+            with (
+                patch.object(corpus.shutil, "disk_usage", return_value=SimpleNamespace(free=corpus.MIN_FREE_DISK - 1)),
+                patch.object(corpus, "prepare_inputs") as prepare,
+                patch.object(corpus, "gpu_identity") as gpu,
+                patch.object(corpus.subprocess, "Popen") as launch,
+            ):
+                self.assertEqual(corpus.main(argv), 1)
+                prepare.assert_not_called()
+                gpu.assert_not_called()
+                launch.assert_not_called()
+            status = json.loads((root / "output/run-status.json").read_text())
+            self.assertEqual(status["status"], "failed")
 
     def test_failed_child_retains_completed_group_and_bounds_watchdog(self):
         with tempfile.TemporaryDirectory(dir=self.temp_root) as folder:
@@ -283,6 +304,7 @@ class CorpusContract(unittest.TestCase):
                 ),
                 patch.object(corpus.subprocess, "Popen", side_effect=launch),
                 patch.object(corpus, "wait_for_probe", return_value=7) as wait,
+                patch.object(corpus.shutil, "disk_usage", return_value=SimpleNamespace(free=corpus.MIN_FREE_DISK)),
             ):
                 self.assertEqual(corpus.main(argv), 1)
                 self.assertGreater(wait.call_args.args[1], 0)

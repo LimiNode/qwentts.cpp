@@ -23,6 +23,10 @@
 #include "speaker-encoder-weights.h"
 #include "talker-decode-graph.h"
 #include "talker-weights.h"
+#ifdef QWEN_RESEARCH_PREFILL
+#include "research_prefill.h"
+struct ResearchPrefillState;
+#endif
 
 #include <cstdint>
 #ifdef QWEN_RESEARCH_FRAME_SEEDS
@@ -176,6 +180,10 @@ struct PipelineTTS {
     // on sub Ampere CUDA targets.
     bool use_flash_attn;
     bool clamp_fp16;
+#ifdef QWEN_RESEARCH_PREFILL
+    ResearchPrefillSettings research_prefill_settings;
+    ResearchPrefillState * research_prefill = nullptr;
+#endif
 
     // Persistent KV caches, one set per slot: the talker holds the LM
     // contexts, the predictor holds one frame's 16 sub-steps per slot,
@@ -203,6 +211,11 @@ struct PipelineTTS {
     std::vector<TalkerDecodeGraph> talker_decode_graphs;  // one per 256 step window class, lazy
     std::vector<CodePredGraphSet>  cp_graphs;             // index N - 1, lazy per batch width
 };
+
+#ifdef QWEN_RESEARCH_PREFILL
+// Private research seam, not part of qwen.h or the shared-library ABI.
+bool pipeline_tts_research_prefill_observe(const PipelineTTS * pt, ResearchPrefillObservation * out);
+#endif
 
 // Open the talker GGUF and the codec GGUF, load every module on the
 // shared backend. Aborts with a logged error on any missing tensor or
@@ -297,6 +310,41 @@ using TtsResearchDecisionObserver = void (*)(const TtsResearchDecision &, void *
 // A null observer costs no clock read; at most eight early selections plus
 // one later EOS are emitted for each job. This installs no live selector.
 void tts_engine_set_research_observer(TtsEngine * e, TtsResearchDecisionObserver observer, void * user);
+
+// Bounded research checkpoint, captured between engine steps for one slot.
+// Streaming checkpoints include the codec lane and pending chunk schedule;
+// the caller separately owns held PCM and its irreversible commit cursor.
+// This is not a public engine ABI or a production recovery policy.
+struct TtsResearchSnapshot;
+struct TtsResearchSnapshotInfo {
+    int frame = 0;
+    int talker_rows = 0;
+    size_t bytes = 0;
+    double capture_ms = 0.0;
+    bool streaming = false;
+    int decoded_frames = 0;
+    int pending_frames = 0;
+    int codec_target = 0;
+};
+
+bool tts_engine_research_capture_codes(TtsEngine * e, bool enabled);
+TtsResearchSnapshot * tts_engine_research_snapshot(TtsEngine * e);
+void tts_engine_research_snapshot_free(TtsResearchSnapshot * snapshot);
+TtsResearchSnapshotInfo tts_engine_research_snapshot_info(const TtsResearchSnapshot * snapshot);
+// The caller must free any retired buffered qt_audio before restoration.
+// Same engine/job/model only, no concurrent slots; -1 restores the captured
+// RNG key and seed >=0 explicitly selects a continuation key.
+bool tts_engine_research_restore(TtsEngine * e, const TtsResearchSnapshot * snapshot,
+                                int64_t continuation_seed, double * restore_ms);
+// Streaming-only restore, before externally publishing a terminal event.
+// Rejects commits beyond the checkpoint's decoded PCM and non-natural
+// retirements. The caller preserves committed bytes and restores only its
+// held suffix at the current monotonic cursor, using one original deadline.
+// Current job callbacks/cancellation state are never restored from a snapshot.
+bool tts_engine_research_stream_restore(TtsEngine * e, const TtsResearchSnapshot * snapshot,
+                                       int64_t continuation_seed, size_t committed_samples,
+                                       double * restore_ms);
+const std::vector<int32_t> * tts_engine_research_codes(const TtsEngine * e, const TtsJob * job);
 #endif
 
 TtsEngine * tts_engine_new(PipelineTTS * pt, BPETokenizer * tok);

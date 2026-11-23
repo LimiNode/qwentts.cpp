@@ -906,10 +906,10 @@ static bool tts_research_kv_capture(KVCache * kv, int rows, TtsResearchKV * save
             auto * tensor = part == 0 ? kv_cache_k(kv, 0, layer) : kv_cache_v(kv, 0, layer);
             auto & bytes = saved->parts[(size_t) layer * 2 + (size_t) part];
             bytes.resize(saved->head_bytes * (size_t) kv->n_kv_heads);
-            for (int head = 0; head < kv->n_kv_heads; ++head) {
-                ggml_backend_tensor_get(tensor, bytes.data() + (size_t) head * saved->head_bytes,
-                                        (size_t) head * tensor->nb[2], saved->head_bytes);
-            }
+            // One pitched transfer packs all heads without changing the padded
+            // prefix or synchronizing the CUDA stream once per head.
+            ggml_backend_tensor_get_2d(tensor, bytes.data(), 0, saved->head_bytes,
+                                       (size_t) kv->n_kv_heads, tensor->nb[2], saved->head_bytes);
         }
     }
     return true;
@@ -920,10 +920,8 @@ static void tts_research_kv_restore(KVCache * kv, const TtsResearchKV & saved) {
         for (int part = 0; part < 2; ++part) {
             auto * tensor = part == 0 ? kv_cache_k(kv, 0, layer) : kv_cache_v(kv, 0, layer);
             const auto & bytes = saved.parts[(size_t) layer * 2 + (size_t) part];
-            for (int head = 0; head < kv->n_kv_heads; ++head) {
-                ggml_backend_tensor_set(tensor, bytes.data() + (size_t) head * saved.head_bytes,
-                                        (size_t) head * tensor->nb[2], saved.head_bytes);
-            }
+            ggml_backend_tensor_set_2d(tensor, bytes.data(), 0, saved.head_bytes,
+                                       (size_t) kv->n_kv_heads, tensor->nb[2], saved.head_bytes);
         }
     }
     kv->cur_len[0] = saved.cur_len;

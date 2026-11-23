@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
 import subprocess
 import time
@@ -20,6 +21,13 @@ PRIOR = Path(".tmp/base-acceptance/eos-retry-codec-20261122/retry-001/results.js
 HOP = 1920
 HOLDBACK_FRAMES = 16
 NEGATIVE_MODES = ("cancel", "deadline", "cap", "sink-fail", "stale", "newer-admission")
+
+
+def positive_finite_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("absolute monotonic deadline must be finite and positive")
+    return number
 
 
 def schedule() -> list[dict]:
@@ -49,8 +57,10 @@ def make_manifest(repo: Path, inputs: Path, cases: list[dict]) -> dict:
         "reference_i32": str(inputs / "reference.i32"),
         "reference_text_file": str(inputs / "reference.txt"), "reference_frames": 226,
         "max_tokens": MAX_TOKENS, "deadline_ms": 60000,
-        "groups": [{"text_file": str(inputs / "original.txt"), "language": "russian",
-                    **{key: value for key, value in case.items() if key != "repeat"}}
+        "groups": [{"text_file": str(inputs / (case.get("text_label", "original") + ".txt")),
+                    "language": case.get("language", "russian"),
+                    **{key: case[key] for key in ("seed", "mode", "snapshot_frame", "continuation_seed")
+                       if key in case}}
                    for case in cases]}
 
 
@@ -115,9 +125,9 @@ def check_restore(row: dict, case: dict, original: bytes, final: bytes, prefix: 
         expected_frame = case["snapshot_frame"]
         if frame != expected_frame or (decoded, pending, row["codec_target"]) != (1, expected_frame - 1, 2):
             raise ValueError("replay checkpoint did not preserve pending/ramp state")
-        # Seed75 reaches EOS at frame2: terminal drain freezes commits, so
-        # its retired-to-active replay deliberately has C=0, unlike othercp2.
-        expected_commit = HOP if expected_frame == 2 and case["seed"] != 75 else 0
+        # An EOS immediately after checkpoint2 drains the pending frame without
+        # committing it; this depends on the history, not on a particular seed.
+        expected_commit = HOP if expected_frame == 2 and len(original) != 2 * HOP * 4 else 0
         if committed != expected_commit:
             raise ValueError("replay did not exercise its planned partial commit")
     elif frame != row["original_frames"] - 1:
@@ -181,7 +191,8 @@ def collect_negative(directory: Path, index: int, row: dict, case: dict, control
     return row
 
 
-def collect(directory: Path, cases: list[dict], controls: dict[int, dict]) -> tuple[list[dict], list[str]]:
+def collect(directory: Path, cases: list[dict], controls: dict[int | str, dict], *,
+            establish_controls: bool = False) -> tuple[list[dict], list[str]]:
     rows, issues = [], []
     results = directory / "probe/results.jsonl"
     if not results.is_file():
@@ -191,8 +202,9 @@ def collect(directory: Path, cases: list[dict], controls: dict[int, dict]) -> tu
             row, case = json.loads(line), cases[index]
             if (row["group"], row["seed"], row["mode"]) != (index, case["seed"], case["mode"]):
                 raise ValueError("result/case identity mismatch")
+            key = case.get("control_key", case["seed"])
             if case["mode"] in NEGATIVE_MODES:
-                rows.append(collect_negative(directory, index, row, case, controls[case["seed"]]))
+                rows.append(collect_negative(directory, index, row, case, controls[key]))
                 continue
             if row["status"] != 0 or row["finish_reason"] != 1 or row["checks_passed"] is not True:
                 raise ValueError("probe reports failed/non-natural outcome")
@@ -213,7 +225,13 @@ def collect(directory: Path, cases: list[dict], controls: dict[int, dict]) -> tu
                 raise ValueError("actual final sink bytes differ from full generated PCM")
             if final != fresh.read_bytes() or row["fresh_codec_pcm_equal"] is not True:
                 raise ValueError("live PCM differs from independent full streaming-codec reconstruction")
-            control = controls[case["seed"]]
+            new_control = key not in controls
+            if new_control:
+                if not establish_controls or case["mode"] != "baseline":
+                    raise ValueError("missing matching text/seed baseline control")
+                control = {"frames": frames, "raw": identity(raw), "codes": identity(codes)}
+            else:
+                control = controls[key]
             original = Path(control["raw"]["path"]).read_bytes()
             original_codes = Path(control["codes"]["path"]).read_bytes()
             if case["mode"] == "rollback1":
@@ -226,9 +244,9 @@ def collect(directory: Path, cases: list[dict], controls: dict[int, dict]) -> tu
                     raise ValueError("recovery changed original control bytes")
                 if row["original_status"] != 0 or row["original_finish_reason"] != 1:
                     raise ValueError("recovery original did not reach natural EOS")
-                expected_trigger = case["seed"] in KNOWN
+                expected_trigger = original_frames <= 8
                 if row["triggered"] is not expected_trigger:
-                    raise ValueError("discovery trigger differs from frozen known-seed scope")
+                    raise ValueError("rollback trigger differs from the frozen <=8-frame probe policy")
                 if expected_trigger and row["continuation_seed"] != case["continuation_seed"]:
                     raise ValueError("continuation seed differs from frozen policy")
                 row["original_raw"] = identity(original_raw)
@@ -266,6 +284,8 @@ def collect(directory: Path, cases: list[dict], controls: dict[int, dict]) -> tu
                         "sink_pcm": identity(sink),
                         "wav": make_wav(raw), "mechanical_valid": True, "case": case,
                         "word_coverage": "unassessed", "human_listening": "not_run"})
+            if new_control:
+                controls[key] = control
             rows.append(row)
         except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
             issues.append(f"group{index}: {error}")
@@ -278,6 +298,7 @@ def main() -> int:
     for name in ("repo", "probe", "runtime", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--seconds", type=int, default=1800)
+    parser.add_argument("--deadline-monotonic", type=positive_finite_float)
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
     if not 1 <= args.seconds <= 1800:
@@ -319,7 +340,8 @@ def main() -> int:
         "inputs": [identity(path) for path in sorted(inputs.iterdir())],
         "retained_receipt": identity(repo / PRIOR), "retained_controls": controls,
         "gpu": gpu_identity(GPU) if args.execute else "not_queried_plan_only",
-        "seconds": args.seconds, "disk_required_bytes": required, "disk_free_bytes": free,
+        "seconds": args.seconds, "deadline_monotonic": args.deadline_monotonic,
+        "disk_required_bytes": required, "disk_free_bytes": free,
         "environment": {key: value for key, value in env.items() if key.startswith(("QWEN_", "GGML_", "CUDA_"))},
         "prespecified_gate": "exact historical controls,14unchanged live replays,6negative guards, then interventions",
         "scope": "single-lane live AR/codec holdback mechanics; no detector/timing/listening/release qualification"})
@@ -327,7 +349,7 @@ def main() -> int:
         return 0
     results = {stage["name"]: {"state": "not_run", "rows": []} for stage in stages}
     started = time.monotonic()
-    deadline = started + args.seconds
+    deadline = min(started + args.seconds, args.deadline_monotonic or float("inf"))
     interrupted = False
     try:
         for stage in stages:

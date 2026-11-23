@@ -17,13 +17,14 @@ class LiveStudyTests(unittest.TestCase):
         cls.temporary_root = Path(__file__).resolve().parents[1] / ".tmp"
         cls.temporary_root.mkdir(exist_ok=True)
 
-    def fixture(self, directory, mode="replay", frame=2, seed=64, frames=4):
+    def fixture(self, directory, mode="replay", frame=2, seed=64, frames=4, original_frames=None):
         probe = directory / "probe"
         probe.mkdir()
         count = frames * study.HOP
         pcm = struct.pack(f"<{count}f", *([0.01] * count))
         codes = struct.pack(f"<{frames * 16}i", *range(frames * 16))
-        original_frames = min(3, frames) if mode == "rollback1" and seed in study.KNOWN else frames
+        if original_frames is None:
+            original_frames = min(3, frames) if mode == "rollback1" and seed in study.KNOWN else frames
         original_pcm = pcm[:original_frames * study.HOP * 4]
         original_codes = codes[:original_frames * 16 * 4]
         historical_pcm, historical_codes = directory / "retained.f32", directory / "retained.i32"
@@ -34,8 +35,8 @@ class LiveStudyTests(unittest.TestCase):
             case["snapshot_frame"] = frame
         elif mode == "rollback1":
             case["continuation_seed"] = 64
-        triggered = mode == "replay" or mode == "rollback1" and seed in study.KNOWN
-        committed = study.HOP if triggered and frame == 2 and seed != 75 else 0
+        triggered = mode == "replay" or mode == "rollback1" and original_frames <= 8
+        committed = study.HOP if triggered and frame == 2 and original_frames != 2 else 0
         stem = probe / "group-0"
         for suffix, data in ((".f32", pcm), ("-codes.i32", codes), ("-fresh-codec.f32", pcm),
                              ("-committed.f32", pcm),

@@ -214,3 +214,20 @@ indexed receipts retain positive rollback1 `partial_pass` and the failures.
 Known-case positive listening makes rollback1 the next research candidate,
 not a general EOS fix. Codec continuity, snapshot overhead and held-out/live
 streaming gates are unchanged. No new GPU execution, pin/default or ABI change.
+
+## New-text corpus and checkpoint transfer study
+
+`tests/run_live_recovery_corpus.py` uses the existing live probe and collector
+for 72 baseline groups, 12 unchanged replays and 36 conditional rollback groups.
+Text/seed pairs own distinct controls; short replies are not excluded from the
+naive <=8-frame intervention policy. Neither intervention nor a longer WAV is
+semantic recovery evidence. Every missing cell remains explicit.
+
+Research KV capture/restore now batches identical per-head bytes with pitched
+GGML get_2d/set_2d transfers. Precision, padded rows, codec ownership and payload
+size are unchanged. Model-free sentinel tests cover packing/restore equivalence;
+the frozen Bridge plan additionally requires A/B/B/A CUDA code/PCM equality
+before corpus execution. Capture timings are summed over each group's snapshots,
+not single-checkpoint latency. Both runners accept an optional shared absolute
+`--deadline-monotonic`, so identity preflight cannot restart the GPU budget.
+Production ABI/defaults and the Bridge engine pin remain unchanged.

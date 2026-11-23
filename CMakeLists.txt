@@ -275,6 +275,15 @@ if(QWEN_RESEARCH_FRAME_SEEDS)
         target_compile_options(test-research-pcm-holdback PRIVATE -Wall -Wextra -Werror -pedantic)
     endif()
     add_test(NAME research_pcm_holdback_contract COMMAND test-research-pcm-holdback)
+    add_executable(test-research-kv-transfer tests/research_kv_transfer_contract.cpp)
+    target_link_libraries(test-research-kv-transfer PRIVATE ggml)
+    link_ggml_backends(test-research-kv-transfer)
+    if(MSVC)
+        target_compile_options(test-research-kv-transfer PRIVATE /W4 /WX)
+    else()
+        target_compile_options(test-research-kv-transfer PRIVATE -Wall -Wextra -Werror -pedantic)
+    endif()
+    add_test(NAME research_kv_transfer_contract COMMAND test-research-kv-transfer)
 endif()
 add_executable(test-frame-seed-contract tests/frame_seed_contract.cpp)
 target_include_directories(test-frame-seed-contract PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -340,6 +349,9 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME live_stream_recovery_python
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_live_stream_recovery.py)
+    add_test(NAME live_recovery_corpus_python
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_live_recovery_corpus.py)
     add_test(NAME codec_replay_python
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_codec_replay.py)

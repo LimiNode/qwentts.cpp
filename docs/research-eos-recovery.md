@@ -1,12 +1,12 @@
-# Buffered early-EOS checkpoint mechanics
+# Bounded early-EOS checkpoint mechanics
 
-Research-only stage1, not a production policy or a streaming codec fork.
+Research-only mechanics, not a production policy or a streaming codec fork.
 Build `QWEN_RESEARCH_FRAME_SEEDS=ON` and `eos-research-probe`; ordinary builds
 do not expose this internal API. No public C ABI or default changes.
 
 ## Supported state boundary
 
-One buffered slot, zero committed PCM, complete16-code boundaries0..8,
+The original buffered stage supports one slot, zero committed PCM, complete16-code boundaries0..8,
 Talker attention window at most512rows. Snapshots retain host slot/prompt,
 reference ownership, RNG key/subsequence, histories, complete codes, pending
 logits/IDs, Talker padded KV/write head, Predictor KV and hidden bridge.
@@ -20,6 +20,46 @@ Thus the experiment tests one-prefill AR restoration, not live rollback or
 common-prefix PCM continuity. Up to9 host snapshots may retain approximately
 530MB of device payload for the bounded window; this is not a cheap production
 ring buffer or a peak-VRAM measurement.
+
+## Single-lane live checkpoint seam
+
+The same internal snapshot capture can now retain one admitted streaming lane
+at complete AR boundaries0..8, between `tts_engine_step` calls. In addition to
+AR state it owns an independent codec mirror (convolution contexts, carry,
+transformer KV ring and position), the lane mapping, pending complete code
+rows, live flag and shared ramp target. It does not borrow a reference-cache
+LRU slot. Checkpoint destruction frees the mirror. Public ABI and ordinary
+builds remain unchanged; this interface is compiled only with
+`QWEN_RESEARCH_FRAME_SEEDS`.
+
+`TtsResearchSnapshotInfo` distinguishes `frame`, `decoded_frames`,
+`pending_frames` and `codec_target`. Under the production ramp, AR frame2
+means one decoded frame and one pending frame, not two codec callbacks.
+`bytes` includes the independent codec allocation; copying and retaining AR
+state remains diagnostic overhead, not a latency optimization.
+
+The existing `tts_engine_research_restore` stays buffered-only. The separate
+`tts_engine_research_stream_restore(e, snapshot, continuation_seed,
+committed_samples, restore_ms)` rejects any irreversible commit beyond
+`decoded_frames * 1920` before restoring state. It accepts the same active
+job or its internally retired natural-EOS result; cancellation, errors,
+assisted/forced EOS, token limits, another job and any newer admission are
+rejected. The current cancellation callback is polled before restoration;
+one original deadline remains the caller's responsibility. No callback state
+or external deadline is copied back from the checkpoint.
+
+The caller owns bounded held PCM, copies callback samples before their scratch
+storage is reused, and preserves its monotonically increasing commit cursor.
+After a successful restore it keeps all committed bytes unchanged and
+reinstates only the checkpoint's held PCM from the current cursor to the saved
+decoded boundary. Pending rows then pass through the restored ordinary codec
+lane. Params and external reference data remain valid and unchanged, except
+for caller-current callback/cancellation targets. The caller must not publish
+a terminal event until recovery is resolved; an already published terminal
+cannot be revoked. Engine calls remain single-threaded and non-reentrant.
+
+This seam alone establishes no live replay result, detector, bounded-buffer
+policy, speech coverage, physical playback, TTFA or release qualification.
 
 ## Probe input and output
 

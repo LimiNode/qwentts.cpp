@@ -220,6 +220,13 @@ bool pipeline_codec_stream_snapshot(PipelineCodec * pc, uint64_t key, int set);
 
 void pipeline_codec_snap_free(CodecStateSnap * s);
 
+#ifdef QWEN_RESEARCH_FRAME_SEEDS
+// Independently owned checkpoint mirrors, outside the evictable reference LRU.
+// The caller zero-initializes the mirror and frees it with pipeline_codec_snap_free.
+bool pipeline_codec_research_snapshot(PipelineCodec * pc, int set, CodecStateSnap * snapshot);
+bool pipeline_codec_research_restore(PipelineCodec * pc, int set, const CodecStateSnap * snapshot);
+#endif
+
 // Encode a 24 kHz mono waveform into RVQ codes.
 //   audio    : [n_samples] f32 mono 24 kHz. Must be a multiple of
 //              TOKENIZER_HOP_LENGTH (1920); the caller is expected

@@ -311,15 +311,20 @@ using TtsResearchDecisionObserver = void (*)(const TtsResearchDecision &, void *
 // one later EOS are emitted for each job. This installs no live selector.
 void tts_engine_set_research_observer(TtsEngine * e, TtsResearchDecisionObserver observer, void * user);
 
-// Stage-1 AR checkpoint experiment. This deliberately accepts only one
-// buffered slot: there is no mutable codec lane and no PCM has been committed.
-// It is not a streaming codec snapshot or a public engine ABI.
+// Bounded research checkpoint, captured between engine steps for one slot.
+// Streaming checkpoints include the codec lane and pending chunk schedule;
+// the caller separately owns held PCM and its irreversible commit cursor.
+// This is not a public engine ABI or a production recovery policy.
 struct TtsResearchSnapshot;
 struct TtsResearchSnapshotInfo {
     int frame = 0;
     int talker_rows = 0;
     size_t bytes = 0;
     double capture_ms = 0.0;
+    bool streaming = false;
+    int decoded_frames = 0;
+    int pending_frames = 0;
+    int codec_target = 0;
 };
 
 bool tts_engine_research_capture_codes(TtsEngine * e, bool enabled);
@@ -331,6 +336,14 @@ TtsResearchSnapshotInfo tts_engine_research_snapshot_info(const TtsResearchSnaps
 // RNG key and seed >=0 explicitly selects a continuation key.
 bool tts_engine_research_restore(TtsEngine * e, const TtsResearchSnapshot * snapshot,
                                 int64_t continuation_seed, double * restore_ms);
+// Streaming-only restore, before externally publishing a terminal event.
+// Rejects commits beyond the checkpoint's decoded PCM and non-natural
+// retirements. The caller preserves committed bytes and restores only its
+// held suffix at the current monotonic cursor, using one original deadline.
+// Current job callbacks/cancellation state are never restored from a snapshot.
+bool tts_engine_research_stream_restore(TtsEngine * e, const TtsResearchSnapshot * snapshot,
+                                       int64_t continuation_seed, size_t committed_samples,
+                                       double * restore_ms);
 const std::vector<int32_t> * tts_engine_research_codes(const TtsEngine * e, const TtsJob * job);
 #endif
 

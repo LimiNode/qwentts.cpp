@@ -263,6 +263,18 @@ if(QWEN_RESEARCH_FRAME_SEEDS)
     target_link_libraries(codec-stream-replay-probe PRIVATE qwen-core)
     link_ggml_backends(codec-stream-replay-probe)
     add_test(NAME codec_stream_replay_contract COMMAND codec-stream-replay-probe --self-test)
+    add_executable(live-stream-recovery-probe tests/live_stream_recovery_probe.cpp)
+    target_compile_definitions(live-stream-recovery-probe PRIVATE QWEN_RESEARCH_FRAME_SEEDS=1)
+    target_link_libraries(live-stream-recovery-probe PRIVATE qwen-core yyjson)
+    link_ggml_backends(live-stream-recovery-probe)
+    add_test(NAME live_stream_recovery_probe_contract COMMAND live-stream-recovery-probe --self-test)
+    add_executable(test-research-pcm-holdback tests/research_pcm_holdback_contract.cpp)
+    if(MSVC)
+        target_compile_options(test-research-pcm-holdback PRIVATE /W4 /WX)
+    else()
+        target_compile_options(test-research-pcm-holdback PRIVATE -Wall -Wextra -Werror -pedantic)
+    endif()
+    add_test(NAME research_pcm_holdback_contract COMMAND test-research-pcm-holdback)
 endif()
 add_executable(test-frame-seed-contract tests/frame_seed_contract.cpp)
 target_include_directories(test-frame-seed-contract PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -325,6 +337,9 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME eos_recovery_python
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_eos_recovery.py)
+    add_test(NAME live_stream_recovery_python
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_live_stream_recovery.py)
     add_test(NAME codec_replay_python
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_codec_replay.py)

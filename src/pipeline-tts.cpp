@@ -884,7 +884,13 @@ struct TtsResearchSnapshot {
     TtsResearchKV talker;
     TtsResearchKV predictor;
     std::vector<float> bridge;
+    CodecStateSnap codec{};
+    int codec_cur_len = 0;
+    int codec_live = 0;
+    std::vector<int32_t> codec_pending;
     TtsResearchSnapshotInfo info;
+
+    ~TtsResearchSnapshot() { pipeline_codec_snap_free(&codec); }
 };
 
 // Copy only the padded attention window. Rows beyond it are masked until
@@ -929,13 +935,20 @@ TtsResearchSnapshot * tts_engine_research_snapshot(TtsEngine * e) {
 #ifdef QWEN_RESEARCH_PREFILL
     if (e->pt->research_prefill_settings.prefix_rows) return nullptr;
 #endif
-    if (slot.streaming || slot.codec_set != -1 || e->codec_M || e->codec_pending_n ||
-        slot.finished || slot.step < 0 || slot.step > 8 || slot.job->params->dump_dir ||
+    if (slot.finished || slot.step < 0 || slot.step > 8 || slot.job->params->dump_dir ||
         slot.all_codes.size() != (size_t) slot.step || slot.talker_history.size() != (size_t) slot.step ||
         slot.subseq_counter != (int64_t) slot.step * e->pt->num_code_groups ||
         slot.frame_seed_schedule.mode != ResearchFrameSeedMode::Baseline ||
         !slot.forced_talker_frames.empty() || !slot.forced_talker_history.empty() ||
         !slot.forced_predictor_frames.empty()) return nullptr;
+    if (slot.streaming) {
+        if (slot.codec_set != 0 || e->codec_M != 1 || e->codec_pending_n < 0 ||
+            e->codec_pending_n > slot.step || e->codec_target < 1 ||
+            e->codec_target > e->pt->stream_max_chunk_frames ||
+            (e->codec_target & (e->codec_target - 1)) != 0 ||
+            e->codec_pending_n >= e->codec_target || !e->pt->codec.stream_ready ||
+            e->pt->codec.stream_pos[0] != slot.ref_codes_T + slot.step - e->codec_pending_n) return nullptr;
+    } else if (slot.codec_set != -1 || e->codec_M || e->codec_pending_n) return nullptr;
     Timer clock;
     const int alignment = e->pt->talker_kv.attention_alignment;
     const int rows = ((e->pt->talker_kv.cur_len[0] + 1 + alignment - 1) / alignment) * alignment;
@@ -950,11 +963,23 @@ TtsResearchSnapshot * tts_engine_research_snapshot(TtsEngine * e) {
     saved->bridge.resize((size_t) e->pt->talker.hidden_size);
     ggml_backend_tensor_get(e->pt->hidden_bridge, saved->bridge.data(), 0,
                             saved->bridge.size() * sizeof(float));
+    if (slot.streaming) {
+        saved->codec_pending.assign(e->codec_pending.begin(),
+            e->codec_pending.begin() + (size_t) e->codec_pending_n * (size_t) e->pt->num_code_groups);
+        saved->codec_live = e->codec_live[0];
+        saved->codec_cur_len = e->pt->codec.stream_kv.cur_len[0];
+        if (!pipeline_codec_research_snapshot(&e->pt->codec, 0, &saved->codec)) return nullptr;
+        saved->info.streaming = true;
+        saved->info.decoded_frames = slot.step - e->codec_pending_n;
+        saved->info.pending_frames = e->codec_pending_n;
+        saved->info.codec_target = e->codec_target;
+    }
     saved->info.frame = slot.step;
     saved->info.talker_rows = rows;
     saved->info.bytes = saved->bridge.size() * sizeof(float);
     for (const auto & part : saved->talker.parts) saved->info.bytes += part.size();
     for (const auto & part : saved->predictor.parts) saved->info.bytes += part.size();
+    if (saved->codec.buf) saved->info.bytes += ggml_backend_buffer_get_size(saved->codec.buf);
     saved->info.capture_ms = clock.ms();
     return saved.release();
 }
@@ -965,11 +990,8 @@ TtsResearchSnapshotInfo tts_engine_research_snapshot_info(const TtsResearchSnaps
     return snapshot ? snapshot->info : TtsResearchSnapshotInfo{};
 }
 
-bool tts_engine_research_restore(TtsEngine * e, const TtsResearchSnapshot * saved,
-                                int64_t continuation_seed, double * restore_ms) {
-    if (!e || !saved || saved->owner != e || !e->research_capture_codes || e->pt->max_batch != 1 ||
-        e->slots.size() > 1 || (!e->slots.empty() && e->slots[0].job != saved->slot.job) ||
-        e->codec_M || e->codec_pending_n || saved->slot.job->out->samples || continuation_seed < -1) return false;
+static bool tts_research_restore_apply(TtsEngine * e, const TtsResearchSnapshot * saved,
+                                       int64_t continuation_seed, double * restore_ms) {
     Timer clock;
     // Construct host state first: allocation failure must not leave partially
     // restored device state, and copied pointers are rebound to their owners.
@@ -979,6 +1001,19 @@ bool tts_engine_research_restore(TtsEngine * e, const TtsResearchSnapshot * save
         slot.step - 1 < slot.prompt.T_trailing ?
             slot.prompt.trailing_text_hidden.data() + (size_t) (slot.step - 1) * (size_t) slot.prompt.hidden :
             slot.prompt.tts_pad_embed.data();
+    if (saved->info.streaming) {
+        if (!pipeline_codec_research_restore(&e->pt->codec, 0, &saved->codec)) return false;
+        e->pt->codec.stream_kv.cur_len[0] = saved->codec_cur_len;
+        e->codec_M = 1;
+        e->codec_target = saved->info.codec_target;
+        e->codec_pending_n = saved->info.pending_frames;
+        if (!saved->codec_pending.empty()) {
+            std::memcpy(e->codec_pending.data(), saved->codec_pending.data(),
+                        saved->codec_pending.size() * sizeof(int32_t));
+        }
+        e->codec_live[0] = saved->codec_live;
+        e->codec_outs[0] = nullptr;
+    }
     tts_research_kv_restore(&e->pt->talker_kv, saved->talker);
     tts_research_kv_restore(&e->pt->code_predictor_kv, saved->predictor);
     ggml_backend_tensor_set(e->pt->hidden_bridge, saved->bridge.data(), 0,
@@ -993,6 +1028,38 @@ bool tts_engine_research_restore(TtsEngine * e, const TtsResearchSnapshot * save
     e->research_codes.clear();
     if (restore_ms) *restore_ms = clock.ms();
     return true;
+}
+
+bool tts_engine_research_restore(TtsEngine * e, const TtsResearchSnapshot * saved,
+                                int64_t continuation_seed, double * restore_ms) {
+    if (!e || !saved || saved->owner != e || !e->research_capture_codes || e->pt->max_batch != 1 ||
+        saved->info.streaming || e->slots.size() > 1 ||
+        (!e->slots.empty() && e->slots[0].job != saved->slot.job) ||
+        e->codec_M || e->codec_pending_n || saved->slot.job->out->samples || continuation_seed < -1) return false;
+    return tts_research_restore_apply(e, saved, continuation_seed, restore_ms);
+}
+
+bool tts_engine_research_stream_restore(TtsEngine * e, const TtsResearchSnapshot * saved,
+                                       int64_t continuation_seed, size_t committed_samples,
+                                       double * restore_ms) {
+    if (!e || !saved || saved->owner != e || !e->research_capture_codes || e->pt->max_batch != 1 ||
+        !saved->info.streaming || continuation_seed < -1 ||
+        committed_samples > (size_t) saved->info.decoded_frames * (size_t) TOKENIZER_HOP_LENGTH ||
+        e->next_serial != saved->slot.serial + 1 || e->slots.size() > 1 ||
+        saved->slot.job->out->samples || !saved->slot.job->params->on_chunk) return false;
+    const TtsJob * job = saved->slot.job;
+    const auto * params = job->params;
+    if (params->cancel && params->cancel(params->cancel_user_data)) return false;
+    if (e->slots.empty()) {
+        if (e->codec_M || e->codec_pending_n || e->research_codes_job != job ||
+            job->status != QT_STATUS_OK || job->finish_reason != QT_FINISH_EOS) return false;
+    } else {
+        const auto & current = e->slots[0];
+        if (current.job != job || current.serial != saved->slot.serial || current.finished ||
+            current.fin_status != QT_STATUS_OK || !current.streaming || current.codec_set != 0 ||
+            e->codec_M != 1) return false;
+    }
+    return tts_research_restore_apply(e, saved, continuation_seed, restore_ms);
 }
 
 const std::vector<int32_t> * tts_engine_research_codes(const TtsEngine * e, const TtsJob * job) {

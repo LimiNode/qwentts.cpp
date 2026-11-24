@@ -25,8 +25,7 @@ static inline void compose_icl_prompt(float * dst, const float * text, int text_
         const float * codec_row = full_text && row < text_rows ? codec_pad :
             codec + static_cast<size_t>(full_text ? row - text_rows : row) * width;
         float * out = dst + static_cast<size_t>(row) * width;
-        std::memcpy(out, text_row, bytes);
-        for (int col = 0; col < hidden; ++col) out[col] += codec_row[col];
+        for (int col = 0; col < hidden; ++col) out[col] = text_row[col] + codec_row[col];
     }
     const int remainder = full_text ? 0 : std::max(0, text_rows - codec_rows);
     trailing_rows = remainder > 0 ? remainder : 1;

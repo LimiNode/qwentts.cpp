@@ -294,6 +294,9 @@ struct TtsResearchDecision {
     int sampled_token;  // original stochastic/greedy result before forcing
     bool forced;
     bool eos;
+    // Borrowed only for the observer call, after the existing sampler chain.
+    const float * logits = nullptr;
+    size_t logits_count = 0;
 };
 
 constexpr int TTS_RESEARCH_EARLY_DECISIONS = 8;

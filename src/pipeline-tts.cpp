@@ -1965,7 +1965,8 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
             // work. The observer copies this bounded event; no device readback.
             const TtsResearchDecision decision{
                 std::chrono::steady_clock::now(), s.job, s.serial, i, s.step,
-                c0, sampled_c0, forced_c0, c0 == codec_eos_id};
+                c0, sampled_c0, forced_c0, c0 == codec_eos_id,
+                s.logits.data(), s.logits.size()};
             e->research_observer(decision, e->research_observer_user);
         }
 #endif

@@ -17,7 +17,7 @@ int main() {
     failures +=
         check(research_prefill_parse(nullptr, nullptr, nullptr, nullptr, nullptr, settings, error), "defaults parse");
     failures += check(!settings.profile && !settings.last_only && !settings.kv_f16 && settings.window == 256 &&
-                          !settings.retain && error.empty(),
+                          !settings.retain && !settings.icl_full_text && error.empty(),
                       "baseline defaults");
     failures += check(research_prefill_parse("1", "1", "f16", "64", "1", settings, error), "all options parse");
     failures +=
@@ -128,5 +128,14 @@ int main() {
     const float zero[]          = { 0.0f };
     const float negative_zero[] = { -0.0f };
     failures += check(research_prefill_common_rows(zero, 1, negative_zero, 1, 1) == 0, "byte equality is conservative");
+    const auto parse_icl = [&](const char * value) {
+        return research_prefill_parse(nullptr, nullptr, nullptr, nullptr, nullptr, settings, error,
+                                      nullptr, nullptr, nullptr, nullptr, nullptr, value);
+    };
+    failures += check(parse_icl("1") && settings.icl_full_text && !settings.profile && settings.prefix_rows == 0,
+                      "full-text ICL is independently opt-in");
+    failures += check(!parse_icl("true") && settings.icl_full_text && !error.empty(), "bad geometry rejected atomically");
+    failures += check(parse_icl("0") && !settings.icl_full_text, "explicit aligned ICL");
+    failures += check(parse_icl(nullptr) && !settings.icl_full_text, "aligned ICL remains default");
     return failures ? 1 : 0;
 }

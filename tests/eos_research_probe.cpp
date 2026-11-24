@@ -447,10 +447,27 @@ struct Lane {
     bool decision_overflow = false;
     bool invalid_pcm = false;
     bool capacity_exceeded = false;
+    size_t logit_width = 0;
+    std::vector<float> decision_logits;
+    std::vector<float> decision_weights;
 #ifdef QWEN_RESEARCH_PREFILL
     ResearchPrefillObservation prefill;
 #endif
 };
+
+std::vector<float> captured_decision_values(const Lane & lane, const std::vector<float> & values) {
+    if (!lane.logit_width || lane.decision_count > lane.decisions.size() ||
+        lane.decision_count > values.size() / lane.logit_width) {
+        throw std::runtime_error("invalid bounded decision capture size");
+    }
+    return {values.begin(), values.begin() + lane.decision_count * lane.logit_width};
+}
+
+void write_decision_capture(const std::filesystem::path & destination, const std::string & stem, const Lane & lane) {
+    write_raw(destination / (stem + "-decision-logits.f32"), captured_decision_values(lane, lane.decision_logits));
+    write_raw(destination / (stem + "-decision-weights.f32"), captured_decision_values(lane, lane.decision_weights));
+}
+
 struct DecisionCapture {
     std::array<Lane, 2> * observations;
     const std::array<TtsJob, 2> * jobs;
@@ -467,7 +484,21 @@ void on_decision(const TtsResearchDecision & decision, void * pointer) noexcept 
             lane.decision_overflow = true;
             return;
         }
-        lane.decisions[lane.decision_count++] = decision;
+        if (lane.logit_width) {
+            if (!decision.logits || !decision.sampler_values || decision.logits_count != lane.logit_width) {
+                lane.decision_overflow = true;
+                return;
+            }
+            std::memcpy(lane.decision_logits.data() + lane.decision_count * lane.logit_width,
+                        decision.logits, lane.logit_width * sizeof(float));
+            std::memcpy(lane.decision_weights.data() + lane.decision_count * lane.logit_width,
+                        decision.sampler_values, lane.logit_width * sizeof(float));
+        }
+        lane.decisions[lane.decision_count] = decision;
+        lane.decisions[lane.decision_count].logits = nullptr;
+        lane.decisions[lane.decision_count].sampler_values = nullptr;
+        lane.decisions[lane.decision_count].logits_count = 0;
+        ++lane.decision_count;
         return;
     }
     capture.unknown_job = true;
@@ -530,6 +561,40 @@ void observer_self_test() {
         observations[1].decision_count != TTS_RESEARCH_MAX_DECISIONS) {
         throw std::runtime_error("observer overflow/unknown-job detection failed");
     }
+    std::array<Lane, 2> logit_lanes;
+    DecisionCapture logit_capture{&logit_lanes, &jobs, 1};
+    auto & logit_lane = logit_lanes[0];
+    logit_lane.logit_width = 3;
+    logit_lane.decision_logits.resize(TTS_RESEARCH_MAX_DECISIONS * 3);
+    logit_lane.decision_weights.resize(TTS_RESEARCH_MAX_DECISIONS * 3);
+    float filtered[] = {-INFINITY, 1.0f, 2.0f};
+    float weights[] = {0.0f, 0.5f, 1.0f};
+    on_decision({start, &jobs[0], 0, 0, 0, 2, 2, false, false, filtered, weights, 3}, &logit_capture);
+    filtered[2] = 99.0f;
+    if (logit_lane.decision_count != 1 || logit_lane.decision_logits[2] != 2.0f ||
+        logit_lane.decision_logits[0] != -INFINITY || logit_lane.decisions[0].logits ||
+        logit_lane.decision_weights[1] != 0.5f || logit_lane.decisions[0].sampler_values) {
+        throw std::runtime_error("observer did not own bounded logits copy");
+    }
+    on_decision({start, &jobs[0], 0, 0, 1, 2, 2, false, false, filtered, weights, 2}, &logit_capture);
+    if (!logit_lane.decision_overflow || logit_lane.decision_count != 1) {
+        throw std::runtime_error("observer accepted mismatched logits width");
+    }
+    const auto original_logits = captured_decision_values(logit_lane, logit_lane.decision_logits);
+    const auto original_weights = captured_decision_values(logit_lane, logit_lane.decision_weights);
+    logit_lane.decision_count = 0;
+    logit_lane.decision_overflow = false;
+    weights[1] = 0.25f;
+    on_decision({start, &jobs[0], 1, 0, 0, 2, 2, false, false, filtered, weights, 3}, &logit_capture);
+    if (original_logits.size() != 3 || original_weights.size() != 3 || original_logits[2] != 2.0f ||
+        original_weights[1] != 0.5f || captured_decision_values(logit_lane, logit_lane.decision_logits)[2] != 99.0f ||
+        captured_decision_values(logit_lane, logit_lane.decision_weights)[1] != 0.25f) {
+        throw std::runtime_error("retry overwrote original decision capture or included unused capacity");
+    }
+    bool rejected_short_capture = false;
+    try { (void) captured_decision_values(logit_lane, {0.0f, 1.0f}); }
+    catch (const std::runtime_error &) { rejected_short_capture = true; }
+    if (!rejected_short_capture) throw std::runtime_error("undersized decision capture was accepted");
     std::fprintf(stderr, "research observer/sampler contracts passed (no model/backend loaded)\n");
 }
 double elapsed(Clock::time_point start) {
@@ -572,6 +637,7 @@ void write_prefill_observation(std::ostream & results, const ResearchPrefillObse
         << ",\"alignment\":" << settings.window << ",\"kv_f16\":" << (settings.kv_f16 ? "true" : "false")
         << ",\"last_only\":" << (observation.last_only ? "true" : "false")
         << ",\"retain\":" << (settings.retain ? "true" : "false")
+        << ",\"icl_text_geometry\":\"" << (settings.icl_full_text ? "full-text" : "aligned") << '"'
         << ",\"retained_hit\":" << (observation.retained_hit ? "true" : "false")
         << ",\"diagnostic\":" << (observation.diagnostic ? "true" : "false")
         << ",\"diagnostic_serial\":" << observation.diagnostic_serial
@@ -635,6 +701,11 @@ int main(int argc, char ** argv) {
         if (max_chunk != 1 && max_chunk != 2 && max_chunk != 4 && max_chunk != 8) throw std::runtime_error("invalid chunk cap");
         const bool observe_decisions = optional_boolean(root, "observe_decisions", true);
         const bool observe_prefill = optional_boolean(root, "observe_prefill", false);
+        const bool capture_codes = optional_boolean(root, "capture_codes", false);
+        const bool capture_decision_logits = optional_boolean(root, "capture_decision_logits", false);
+        if ((capture_codes && max_batch != 1) || (capture_decision_logits && !observe_decisions)) {
+            throw std::runtime_error("code capture requires one lane; logits require decision observation");
+        }
         if (observe_prefill) {
 #ifdef QWEN_RESEARCH_PREFILL
             ResearchPrefillSettings settings;
@@ -673,6 +744,13 @@ int main(int argc, char ** argv) {
              owner.pt.model_type != "base" || speaker.size() != static_cast<size_t>(owner.pt.talker.hidden_size))) {
             throw std::runtime_error("conditioning/model mismatch");
         }
+        const char * icl_text_geometry = "not-applicable";
+        if (!custom_voice && icl_reference) {
+            icl_text_geometry = "aligned";
+#ifdef QWEN_RESEARCH_PREFILL
+            if (owner.pt.research_prefill_settings.icl_full_text) icl_text_geometry = "full-text";
+#endif
+        }
         owner.engine = tts_engine_new(&owner.pt, &owner.tokenizer);
         if (!owner.engine) throw std::runtime_error("cannot create engine");
         bool failed_replay = false;
@@ -681,7 +759,7 @@ int main(int argc, char ** argv) {
             const auto & recovery = recovery_configs[group_index];
             RecoveryObservation recovery_observation;
             recovery_observation.enabled = recovery.policy != RecoveryPolicy::None;
-            if (!tts_engine_research_capture_codes(owner.engine, recovery_observation.enabled)) {
+            if (!tts_engine_research_capture_codes(owner.engine, recovery_observation.enabled || capture_codes)) {
                 throw std::runtime_error("cannot configure research code capture while active");
             }
             const bool diagnostic_dump = optional_boolean(group, "diagnostic_dump", false);
@@ -705,6 +783,16 @@ int main(int argc, char ** argv) {
             std::array<TtsJob, 2> jobs{};
             DecisionCapture capture{&observations, &jobs, lanes};
             tts_engine_set_research_observer(owner.engine, observe_decisions ? on_decision : nullptr, &capture);
+            if (capture_decision_logits && recovery_observation.enabled && recovery.policy != RecoveryPolicy::FullRetry) {
+                throw std::runtime_error("decision logits are not a checkpoint/replay artifact");
+            }
+            if (capture_decision_logits) {
+                for (size_t lane = 0; lane < lanes; ++lane) {
+                    observations[lane].logit_width = static_cast<size_t>(owner.pt.talker.vocab_size);
+                    observations[lane].decision_logits.resize(TTS_RESEARCH_MAX_DECISIONS * observations[lane].logit_width);
+                    observations[lane].decision_weights.resize(TTS_RESEARCH_MAX_DECISIONS * observations[lane].logit_width);
+                }
+            }
             const auto start = Clock::now();
             for (size_t lane = 0; lane < lanes; ++lane) {
                 yyjson_val * seed = yyjson_arr_get(seeds, lane);
@@ -773,6 +861,7 @@ int main(int argc, char ** argv) {
                 const auto original_codes = *captured_codes;
                 write_raw(destination / (stem + "-original.f32"), original_pcm);
                 write_raw(destination / (stem + "-original.i32"), original_codes);
+                if (capture_decision_logits) write_decision_capture(destination, stem + "-original", observations[0]);
                 recovery_observation.original_status = jobs[0].status;
                 recovery_observation.original_frames = jobs[0].n_frames;
                 recovery_observation.original_finish_reason = jobs[0].finish_reason;
@@ -857,6 +946,14 @@ int main(int argc, char ** argv) {
                     errors.flush();
                 }
                 const auto stem = "group-" + std::to_string(group_index) + "-lane-" + std::to_string(lane);
+                if (capture_codes && !recovery_observation.enabled) {
+                    const auto * codes_out = tts_engine_research_codes(owner.engine, &jobs[lane]);
+                    if (!codes_out) throw std::runtime_error("missing complete streaming codes");
+                    write_raw(destination / (stem + "-codes.i32"), *codes_out);
+                }
+                if (capture_decision_logits) {
+                    write_decision_capture(destination, stem, observation);
+                }
                 const auto filename = stem + ".f32";
                 std::ofstream pcm(destination / filename, std::ios::binary);
                 pcm.write(reinterpret_cast<const char *>(observation.pcm.data()),
@@ -871,12 +968,19 @@ int main(int argc, char ** argv) {
                     << ",\"prefill_ms\":" << job.prefill_ms << ",\"total_ms\":" << job.total_ms
                     << ",\"group_total_ms\":" << group_total_ms
                     << ",\"decision_observation_enabled\":" << (observe_decisions ? "true" : "false")
+                    << ",\"complete_code_capture_enabled\":" << (capture_codes || recovery_observation.enabled ? "true" : "false")
+                    << ",\"decision_logits_count\":" << (capture_decision_logits ? observation.decision_count * observation.logit_width : 0)
+                    << ",\"decision_logits_width\":" << observation.logit_width
+                    << ",\"decision_logits_stage\":\"suppressed-before-sampler\""
+                    << ",\"decision_weights_stage\":\"stochastic-unnormalized-exp-weights\""
                     << ",\"decision_capture_invalid\":" << (capture.unknown_job || observation.decision_overflow ? "true" : "false")
                     << ",\"invalid_pcm\":" << (observation.invalid_pcm ? "true" : "false")
                     << ",\"capacity_exceeded\":" << (observation.capacity_exceeded ? "true" : "false")
                     << ",\"conditioning\":\""
                     << (custom_voice ? "custom_voice" : icl_reference ? "base_icl" : "base_speaker_only") << '"'
+                    << ",\"icl_text_geometry\":\"" << icl_text_geometry << '"'
                     << ",\"execution_mode\":\"" << (recovery_observation.enabled ? "buffered-uncommitted" : "streaming") << '"'
+                    << ",\"attempt_count\":" << (recovery_observation.triggered ? 2 : 1)
                     << ",\"research_recovery\":";
                 write_recovery_observation(results, recovery, recovery_observation, start);
                 results << ",\"prefill_observation_enabled\":" << (observe_prefill ? "true" : "false")
@@ -903,6 +1007,7 @@ int main(int argc, char ** argv) {
                             << ",\"token\":" << decision.token << ",\"sampled_token\":" << decision.sampled_token
                             << ",\"forced\":" << (decision.forced ? "true" : "false")
                             << ",\"eos\":" << (decision.eos ? "true" : "false")
+                            << ",\"uniform\":" << decision.uniform << ",\"subsequence\":" << decision.subsequence
                             << ",\"serial\":" << decision.serial << ",\"slot\":" << decision.slot << '}';
                 }
                 results << "],\"chunks\":[";

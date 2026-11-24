@@ -26,6 +26,7 @@ struct ResearchPrefillSettings {
     std::string          diagnostic_dir;
     int                  diagnostic_layer = 0;  // -1 selects every layer.
     bool                 manual_attention = false;
+    bool                 icl_full_text    = false;
 };
 
 // Private snapshot made from the normal final-logits readback. It must only be
@@ -116,8 +117,13 @@ static inline bool research_prefill_parse(const char *              profile,
                                           const char *              prefix_source    = nullptr,
                                           const char *              diagnostic_dir   = nullptr,
                                           const char *              diagnostic_layer = nullptr,
-                                          const char *              attention        = nullptr) {
+                                          const char *              attention        = nullptr,
+                                          const char *              icl_full_text    = nullptr) {
     ResearchPrefillSettings candidate;
+    if (!research_prefill_parse_bool(icl_full_text, candidate.icl_full_text)) {
+        error = "QWEN_ICL_FULL_TEXT must be 0 or 1";
+        return false;
+    }
     if (!research_prefill_parse_bool(profile, candidate.profile)) {
         error = "QWEN_PREFILL_PROFILE must be 0 or 1";
         return false;
@@ -219,5 +225,6 @@ static inline bool research_prefill_from_env(ResearchPrefillSettings & out, std:
         std::getenv("QWEN_PREFILL_PROFILE"), std::getenv("QWEN_PREFILL_LAST_ONLY"), std::getenv("QWEN_PREFILL_KV"),
         std::getenv("QWEN_PREFILL_WINDOW"), std::getenv("QWEN_PREFILL_RETAIN"), out, error,
         std::getenv("QWEN_PREFILL_PREFIX_ROWS"), std::getenv("QWEN_PREFILL_PREFIX_SOURCE"),
-        std::getenv("QWEN_PREFILL_DIAG_DIR"), std::getenv("QWEN_PREFILL_DIAG_LAYER"), std::getenv("QWEN_PREFILL_ATTN"));
+        std::getenv("QWEN_PREFILL_DIAG_DIR"), std::getenv("QWEN_PREFILL_DIAG_LAYER"), std::getenv("QWEN_PREFILL_ATTN"),
+        std::getenv("QWEN_ICL_FULL_TEXT"));
 }

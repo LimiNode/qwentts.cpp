@@ -46,6 +46,7 @@
 #include "bpe.h"
 #include "ggml.h"
 #include "pipeline-tts.h"
+#include "prompt_geometry.h"
 #include "qt-error.h"
 
 #include <cmath>
@@ -561,14 +562,15 @@ static bool prompt_builder_build(PipelineTTS *         pt,
         }
     }
 
-    // ICL geometry. text_lens = N_ref_text + N_text + 1 (tts_eos).
-    // codec_lens = 1 (codec_bos) + ref_codes_T. The non_streaming_mode
-    // branch upstream pads the shorter stream so they end up the same
-    // length, except when text > codec where trailing_text_hidden carries
-    // the leftover text rows.
+    // The ordinary aligned geometry mirrors non_streaming_mode=False.
+    // Only research builds can opt into the full-text upstream geometry.
+    bool icl_full_text = false;
+#ifdef QWEN_RESEARCH_PREFILL
+    icl_full_text = pt->research_prefill_settings.icl_full_text;
+#endif
     const int text_lens_icl  = icl ? (N_ref_text + N_text + 1) : 0;
     const int codec_lens_icl = icl ? (1 + ref_codes_T) : 0;
-    const int icl_T          = icl ? (text_lens_icl > codec_lens_icl ? codec_lens_icl : codec_lens_icl) : 0;
+    const int icl_T          = icl ? icl_prompt_rows(text_lens_icl, codec_lens_icl, icl_full_text) : 0;
 
     // Allocate the full output buffer.
     // Standard layout    : N_instruct + 3 (role) + (n_pad_pre + 1) + N_text + 1 (eos) + 1 (final)
@@ -673,9 +675,9 @@ static bool prompt_builder_build(PipelineTTS *         pt,
         // [ref_text_ids; utterance_text_ids] followed by tts_eos. The
         // codec stream is codec_emb(codec_bos) followed by sum over the
         // 16 codebook embeddings of ref_codes[i, t] for each frame t.
-        // Both streams are aligned to length icl_T per the upstream
-        // non_streaming_mode=False branch of generate_icl_prompt.
-        const int T_icl = codec_lens_icl;  // text_lens > codec: truncate to codec, else pad text up to codec
+        // Both geometries retain these complete streams. Only their
+        // composition below differs; decoder reference handling is unchanged.
+        const int T_icl = codec_lens_icl;
 
         // Build the codec stream [T_icl, hidden]. Row 0 is codec_bos, rows
         // 1..ref_codes_T are the per frame sum over the num_code_groups
@@ -703,44 +705,10 @@ static bool prompt_builder_build(PipelineTTS *         pt,
         std::memcpy(text_stream.data() + (size_t) (text_lens_icl - 1) * (size_t) hidden, tts_eos_emb.data(),
                     (size_t) hidden * sizeof(float));
 
-        // Align the two streams to T_icl. text_lens > codec: truncate
-        // text and stash the leftover into trailing_text_hidden. text_lens
-        // <= codec: pad text with tts_pad up to codec, trailing reduces
-        // to tts_pad.
-        std::vector<float> aligned_text((size_t) T_icl * (size_t) hidden, 0.0f);
-        if (text_lens_icl >= T_icl) {
-            // truncate text to T_icl rows, leftover goes into trailing
-            std::memcpy(aligned_text.data(), text_stream.data(), (size_t) T_icl * (size_t) hidden * sizeof(float));
-            const int trailing_n = text_lens_icl - T_icl;
-            out->T_trailing      = trailing_n > 0 ? trailing_n : 1;
-            out->trailing_text_hidden.assign((size_t) out->T_trailing * (size_t) hidden, 0.0f);
-            if (trailing_n > 0) {
-                std::memcpy(out->trailing_text_hidden.data(), text_stream.data() + (size_t) T_icl * (size_t) hidden,
-                            (size_t) trailing_n * (size_t) hidden * sizeof(float));
-            } else {
-                std::memcpy(out->trailing_text_hidden.data(), tts_pad_emb.data(), (size_t) hidden * sizeof(float));
-            }
-        } else {
-            // pad text with tts_pad up to T_icl, trailing = single tts_pad row
-            std::memcpy(aligned_text.data(), text_stream.data(),
-                        (size_t) text_lens_icl * (size_t) hidden * sizeof(float));
-            for (int i = text_lens_icl; i < T_icl; i++) {
-                std::memcpy(aligned_text.data() + (size_t) i * (size_t) hidden, tts_pad_emb.data(),
-                            (size_t) hidden * sizeof(float));
-            }
-            out->T_trailing = 1;
-            out->trailing_text_hidden.assign((size_t) hidden, 0.0f);
-            std::memcpy(out->trailing_text_hidden.data(), tts_pad_emb.data(), (size_t) hidden * sizeof(float));
-        }
-
-        // Sum aligned_text + codec_stream into the input embed at the
-        // current row offset.
-        for (int i = 0; i < T_icl; i++) {
-            float * r = row_ptr(row + i);
-            std::memcpy(r, aligned_text.data() + (size_t) i * (size_t) hidden, (size_t) hidden * sizeof(float));
-            vec_add(r, codec_stream.data() + (size_t) i * (size_t) hidden, hidden);
-        }
-        row += T_icl;
+        compose_icl_prompt(row_ptr(row), text_stream.data(), text_lens_icl, codec_stream.data(), T_icl, hidden,
+                           tts_pad_emb.data(), codec_pad_emb.data(), icl_full_text,
+                           out->trailing_text_hidden, out->T_trailing);
+        row += icl_T;
     }
 
     if (row != T_ctx) {

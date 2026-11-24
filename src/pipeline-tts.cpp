@@ -1921,7 +1921,11 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
         s.logits[(size_t) codec_eos_id] += s.eos_guard_applied_boost;
         const bool diagnostic_frame = p->dump_dir && s.step < 128;
         std::vector<float> suppressed_logits;
-        if (diagnostic_frame) {
+        bool observe_logits = false;
+#ifdef QWEN_RESEARCH_FRAME_SEEDS
+        observe_logits = e->research_observer != nullptr;
+#endif
+        if (diagnostic_frame || observe_logits) {
             suppressed_logits = s.logits;
         }
         float u_c0 = 0.0f;
@@ -1965,7 +1969,8 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
             // work. The observer copies this bounded event; no device readback.
             const TtsResearchDecision decision{
                 std::chrono::steady_clock::now(), s.job, s.serial, i, s.step,
-                c0, sampled_c0, forced_c0, c0 == codec_eos_id};
+                c0, sampled_c0, forced_c0, c0 == codec_eos_id,
+                suppressed_logits.data(), s.logits.data(), s.logits.size(), u_c0, s.subseq_counter - 1};
             e->research_observer(decision, e->research_observer_user);
         }
 #endif

@@ -42,6 +42,7 @@
 #include "ggml.h"
 #include "graph-arena.h"
 #include "kv-cache.h"
+#include "prompt_geometry.h"
 #include "talker-decode-graph.h"
 #include "talker-weights.h"
 
@@ -693,10 +694,7 @@ static bool talker_forward_core(const TalkerWeights * tw,
 
     // Positions: n_past .. n_past + T - 1
     {
-        std::vector<int32_t> pos((size_t) T);
-        for (int i = 0; i < T; i++) {
-            pos[(size_t) i] = n_past + i;
-        }
+        const std::vector<int32_t> pos = prompt_positions(T, n_past);
         ggml_backend_tensor_set(pos_in, pos.data(), 0, (size_t) T * sizeof(int32_t));
 
         std::vector<int64_t> rows((size_t) T);
@@ -711,18 +709,9 @@ static bool talker_forward_core(const TalkerWeights * tw,
     // F16 dtype matches the ggml_flash_attn_ext convention used by the
     // attention path.
     {
-        std::vector<ggml_fp16_t> mask((size_t) T * (size_t) n_kv_pad);
         const ggml_fp16_t        zero    = ggml_fp32_to_fp16(0.0f);
         const ggml_fp16_t        neg_inf = ggml_fp32_to_fp16(-INFINITY);
-        for (size_t i = 0; i < mask.size(); i++) {
-            mask[i] = neg_inf;
-        }
-        for (int q = 0; q < T; q++) {
-            const int q_pos = n_past + q;
-            for (int k = 0; k <= q_pos; k++) {
-                mask[(size_t) q * (size_t) n_kv_pad + (size_t) k] = zero;
-            }
-        }
+        const auto mask = prompt_causal_mask(T, n_past, n_kv_pad, zero, neg_inf);
         ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
     }
 #ifdef QWEN_RESEARCH_PREFILL

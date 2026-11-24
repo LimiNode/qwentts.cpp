@@ -454,6 +454,20 @@ struct Lane {
     ResearchPrefillObservation prefill;
 #endif
 };
+
+std::vector<float> captured_decision_values(const Lane & lane, const std::vector<float> & values) {
+    if (!lane.logit_width || lane.decision_count > lane.decisions.size() ||
+        lane.decision_count > values.size() / lane.logit_width) {
+        throw std::runtime_error("invalid bounded decision capture size");
+    }
+    return {values.begin(), values.begin() + lane.decision_count * lane.logit_width};
+}
+
+void write_decision_capture(const std::filesystem::path & destination, const std::string & stem, const Lane & lane) {
+    write_raw(destination / (stem + "-decision-logits.f32"), captured_decision_values(lane, lane.decision_logits));
+    write_raw(destination / (stem + "-decision-weights.f32"), captured_decision_values(lane, lane.decision_weights));
+}
+
 struct DecisionCapture {
     std::array<Lane, 2> * observations;
     const std::array<TtsJob, 2> * jobs;
@@ -566,6 +580,21 @@ void observer_self_test() {
     if (!logit_lane.decision_overflow || logit_lane.decision_count != 1) {
         throw std::runtime_error("observer accepted mismatched logits width");
     }
+    const auto original_logits = captured_decision_values(logit_lane, logit_lane.decision_logits);
+    const auto original_weights = captured_decision_values(logit_lane, logit_lane.decision_weights);
+    logit_lane.decision_count = 0;
+    logit_lane.decision_overflow = false;
+    weights[1] = 0.25f;
+    on_decision({start, &jobs[0], 1, 0, 0, 2, 2, false, false, filtered, weights, 3}, &logit_capture);
+    if (original_logits.size() != 3 || original_weights.size() != 3 || original_logits[2] != 2.0f ||
+        original_weights[1] != 0.5f || captured_decision_values(logit_lane, logit_lane.decision_logits)[2] != 99.0f ||
+        captured_decision_values(logit_lane, logit_lane.decision_weights)[1] != 0.25f) {
+        throw std::runtime_error("retry overwrote original decision capture or included unused capacity");
+    }
+    bool rejected_short_capture = false;
+    try { (void) captured_decision_values(logit_lane, {0.0f, 1.0f}); }
+    catch (const std::runtime_error &) { rejected_short_capture = true; }
+    if (!rejected_short_capture) throw std::runtime_error("undersized decision capture was accepted");
     std::fprintf(stderr, "research observer/sampler contracts passed (no model/backend loaded)\n");
 }
 double elapsed(Clock::time_point start) {
@@ -832,6 +861,7 @@ int main(int argc, char ** argv) {
                 const auto original_codes = *captured_codes;
                 write_raw(destination / (stem + "-original.f32"), original_pcm);
                 write_raw(destination / (stem + "-original.i32"), original_codes);
+                if (capture_decision_logits) write_decision_capture(destination, stem + "-original", observations[0]);
                 recovery_observation.original_status = jobs[0].status;
                 recovery_observation.original_frames = jobs[0].n_frames;
                 recovery_observation.original_finish_reason = jobs[0].finish_reason;
@@ -922,12 +952,7 @@ int main(int argc, char ** argv) {
                     write_raw(destination / (stem + "-codes.i32"), *codes_out);
                 }
                 if (capture_decision_logits) {
-                    auto logits_out = observation.decision_logits;
-                    logits_out.resize(observation.decision_count * observation.logit_width);
-                    write_raw(destination / (stem + "-decision-logits.f32"), logits_out);
-                    auto weights_out = observation.decision_weights;
-                    weights_out.resize(observation.decision_count * observation.logit_width);
-                    write_raw(destination / (stem + "-decision-weights.f32"), weights_out);
+                    write_decision_capture(destination, stem, observation);
                 }
                 const auto filename = stem + ".f32";
                 std::ofstream pcm(destination / filename, std::ios::binary);

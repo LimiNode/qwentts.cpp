@@ -449,6 +449,7 @@ struct Lane {
     bool capacity_exceeded = false;
     size_t logit_width = 0;
     std::vector<float> decision_logits;
+    std::vector<float> decision_weights;
 #ifdef QWEN_RESEARCH_PREFILL
     ResearchPrefillObservation prefill;
 #endif
@@ -470,15 +471,18 @@ void on_decision(const TtsResearchDecision & decision, void * pointer) noexcept 
             return;
         }
         if (lane.logit_width) {
-            if (!decision.logits || decision.logits_count != lane.logit_width) {
+            if (!decision.logits || !decision.sampler_values || decision.logits_count != lane.logit_width) {
                 lane.decision_overflow = true;
                 return;
             }
             std::memcpy(lane.decision_logits.data() + lane.decision_count * lane.logit_width,
                         decision.logits, lane.logit_width * sizeof(float));
+            std::memcpy(lane.decision_weights.data() + lane.decision_count * lane.logit_width,
+                        decision.sampler_values, lane.logit_width * sizeof(float));
         }
         lane.decisions[lane.decision_count] = decision;
         lane.decisions[lane.decision_count].logits = nullptr;
+        lane.decisions[lane.decision_count].sampler_values = nullptr;
         lane.decisions[lane.decision_count].logits_count = 0;
         ++lane.decision_count;
         return;
@@ -548,14 +552,17 @@ void observer_self_test() {
     auto & logit_lane = logit_lanes[0];
     logit_lane.logit_width = 3;
     logit_lane.decision_logits.resize(TTS_RESEARCH_MAX_DECISIONS * 3);
+    logit_lane.decision_weights.resize(TTS_RESEARCH_MAX_DECISIONS * 3);
     float filtered[] = {-INFINITY, 1.0f, 2.0f};
-    on_decision({start, &jobs[0], 0, 0, 0, 2, 2, false, false, filtered, 3}, &logit_capture);
+    float weights[] = {0.0f, 0.5f, 1.0f};
+    on_decision({start, &jobs[0], 0, 0, 0, 2, 2, false, false, filtered, weights, 3}, &logit_capture);
     filtered[2] = 99.0f;
     if (logit_lane.decision_count != 1 || logit_lane.decision_logits[2] != 2.0f ||
-        logit_lane.decision_logits[0] != -INFINITY || logit_lane.decisions[0].logits) {
+        logit_lane.decision_logits[0] != -INFINITY || logit_lane.decisions[0].logits ||
+        logit_lane.decision_weights[1] != 0.5f || logit_lane.decisions[0].sampler_values) {
         throw std::runtime_error("observer did not own bounded logits copy");
     }
-    on_decision({start, &jobs[0], 0, 0, 1, 2, 2, false, false, filtered, 2}, &logit_capture);
+    on_decision({start, &jobs[0], 0, 0, 1, 2, 2, false, false, filtered, weights, 2}, &logit_capture);
     if (!logit_lane.decision_overflow || logit_lane.decision_count != 1) {
         throw std::runtime_error("observer accepted mismatched logits width");
     }
@@ -754,6 +761,7 @@ int main(int argc, char ** argv) {
                 for (size_t lane = 0; lane < lanes; ++lane) {
                     observations[lane].logit_width = static_cast<size_t>(owner.pt.talker.vocab_size);
                     observations[lane].decision_logits.resize(TTS_RESEARCH_MAX_DECISIONS * observations[lane].logit_width);
+                    observations[lane].decision_weights.resize(TTS_RESEARCH_MAX_DECISIONS * observations[lane].logit_width);
                 }
             }
             const auto start = Clock::now();
@@ -917,6 +925,9 @@ int main(int argc, char ** argv) {
                     auto logits_out = observation.decision_logits;
                     logits_out.resize(observation.decision_count * observation.logit_width);
                     write_raw(destination / (stem + "-decision-logits.f32"), logits_out);
+                    auto weights_out = observation.decision_weights;
+                    weights_out.resize(observation.decision_count * observation.logit_width);
+                    write_raw(destination / (stem + "-decision-weights.f32"), weights_out);
                 }
                 const auto filename = stem + ".f32";
                 std::ofstream pcm(destination / filename, std::ios::binary);
@@ -935,6 +946,8 @@ int main(int argc, char ** argv) {
                     << ",\"complete_code_capture_enabled\":" << (capture_codes || recovery_observation.enabled ? "true" : "false")
                     << ",\"decision_logits_count\":" << (capture_decision_logits ? observation.decision_count * observation.logit_width : 0)
                     << ",\"decision_logits_width\":" << observation.logit_width
+                    << ",\"decision_logits_stage\":\"suppressed-before-sampler\""
+                    << ",\"decision_weights_stage\":\"stochastic-unnormalized-exp-weights\""
                     << ",\"decision_capture_invalid\":" << (capture.unknown_job || observation.decision_overflow ? "true" : "false")
                     << ",\"invalid_pcm\":" << (observation.invalid_pcm ? "true" : "false")
                     << ",\"capacity_exceeded\":" << (observation.capacity_exceeded ? "true" : "false")
@@ -969,6 +982,7 @@ int main(int argc, char ** argv) {
                             << ",\"token\":" << decision.token << ",\"sampled_token\":" << decision.sampled_token
                             << ",\"forced\":" << (decision.forced ? "true" : "false")
                             << ",\"eos\":" << (decision.eos ? "true" : "false")
+                            << ",\"uniform\":" << decision.uniform << ",\"subsequence\":" << decision.subsequence
                             << ",\"serial\":" << decision.serial << ",\"slot\":" << decision.slot << '}';
                 }
                 results << "],\"chunks\":[";

@@ -294,9 +294,14 @@ struct TtsResearchDecision {
     int sampled_token;  // original stochastic/greedy result before forcing
     bool forced;
     bool eos;
-    // Borrowed only for the observer call, after the existing sampler chain.
+    // Borrowed only for the observer call. Logits are after suppression,
+    // before repetition/temperature/top-k. Stochastic weights are exp(logit-max)
+    // after that chain; greedy leaves the sampler buffer as logits.
     const float * logits = nullptr;
+    const float * sampler_values = nullptr;
     size_t logits_count = 0;
+    float uniform = -1.0f;
+    int64_t subsequence = -1;
 };
 
 constexpr int TTS_RESEARCH_EARLY_DECISIONS = 8;

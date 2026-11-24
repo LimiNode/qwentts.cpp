@@ -942,6 +942,7 @@ int main(int argc, char ** argv) {
                     << (custom_voice ? "custom_voice" : icl_reference ? "base_icl" : "base_speaker_only") << '"'
                     << ",\"icl_text_geometry\":\"" << icl_text_geometry << '"'
                     << ",\"execution_mode\":\"" << (recovery_observation.enabled ? "buffered-uncommitted" : "streaming") << '"'
+                    << ",\"attempt_count\":" << (recovery_observation.triggered ? 2 : 1)
                     << ",\"research_recovery\":";
                 write_recovery_observation(results, recovery, recovery_observation, start);
                 results << ",\"prefill_observation_enabled\":" << (observe_prefill ? "true" : "false")

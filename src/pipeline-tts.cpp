@@ -19,6 +19,9 @@
 #include "prompt-builder.h"
 #include "qt-error.h"
 #include "sampling.h"
+#ifdef QWEN_RESEARCH_EOS_CONTROL
+#include "research_eos_control.h"
+#endif
 #include "speaker-encoder-extract.h"
 #include "talker-forward.h"
 #include "timer.h"
@@ -794,6 +797,9 @@ struct TtsSlot {
     // AR state, one to one with the single sequence loop.
     int                  step;            // frames emitted so far
     int64_t              subseq_counter;  // Philox subsequence cursor
+#ifdef QWEN_RESEARCH_EOS_CONTROL
+    ResearchEosControl   eos_control;
+#endif
 #ifdef QWEN_RESEARCH_FRAME_SEEDS
     ResearchFrameSeedSchedule frame_seed_schedule;
     int64_t                   frame_seed_current;
@@ -1257,6 +1263,14 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
 #endif
 
     const std::string instruct = params->instruct ? params->instruct : "";
+#ifdef QWEN_RESEARCH_EOS_CONTROL
+    ResearchEosControl eos_control;
+    const char * eos_policy = std::getenv("QWEN_RESEARCH_EOS_CONTROL");
+    if (!research_eos_parse(eos_policy, &eos_control)) {
+        qt_set_error("tts_engine_admit: invalid QWEN_RESEARCH_EOS_CONTROL");
+        return tts_admit_fail(job, QT_STATUS_INVALID_PARAMS);
+    }
+#endif
     const std::string speaker  = params->speaker ? params->speaker : "";
     const std::string ref_text = params->ref_text ? params->ref_text : "";
 
@@ -1345,6 +1359,12 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
     s.ref_codes_T      = 0;
     s.step             = 0;
     s.subseq_counter   = 0;
+#ifdef QWEN_RESEARCH_EOS_CONTROL
+    s.eos_control = eos_control;
+    qt_log(QT_LOG_INFO, "[ResearchEOS] version=1 serial=%lld policy=%s seed=%lld",
+           (long long) s.serial, eos_policy && *eos_policy ? eos_policy : "baseline",
+           (long long) job->resolved_seed);
+#endif
 #ifdef QWEN_RESEARCH_FRAME_SEEDS
     s.frame_seed_schedule = frame_seed_schedule;
     s.frame_seed_current = job->resolved_seed;
@@ -1553,6 +1573,27 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
 
     s.talker_T = params->do_sample ? params->temperature : 0.0f;
     s.subtk_T  = params->subtalker_do_sample ? params->subtalker_temperature : 0.0f;
+#ifdef QWEN_RESEARCH_EOS_CONTROL
+    if (s.eos_control.mode != ResearchEosMode::Baseline) {
+        bool conflicting = pt->max_batch != 1 || !params->do_sample ||
+            !params->subtalker_do_sample || params->top_k != 50 || params->top_p != 1.0f ||
+            params->temperature != 0.9f || params->repetition_penalty != 1.05f ||
+            params->subtalker_temperature != 0.9f || !s.forced_talker_history.empty() ||
+            !s.forced_talker_frames.empty() || !s.forced_predictor_frames.empty() ||
+            (params->abi_version >= 6 && params->eos_guard_enabled);
+#ifdef QWEN_RESEARCH_FRAME_SEEDS
+        conflicting = conflicting || s.frame_seed_schedule.mode != ResearchFrameSeedMode::Baseline;
+#endif
+#ifdef QWEN_RESEARCH_PREFILL
+        conflicting = conflicting || pt->research_prefill_settings.prefix_rows != 0;
+#endif
+        if (conflicting) {
+            qt_set_error("research EOS requires N=1, default stochastic sampling, no guard/forced history/reseed/prefix reuse");
+            e->slots.pop_back();
+            return tts_admit_fail(job, QT_STATUS_INVALID_PARAMS);
+        }
+    }
+#endif
     if (params->abi_version >= 6 && params->eos_guard_enabled) {
         EosGuardConfig guard;
         guard.enabled          = true;
@@ -1925,9 +1966,11 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
 #ifdef QWEN_RESEARCH_FRAME_SEEDS
         observe_logits = e->research_observer != nullptr;
 #endif
+#ifndef QWEN_RESEARCH_EOS_CONTROL
         if (diagnostic_frame || observe_logits) {
             suppressed_logits = s.logits;
         }
+#endif
         float u_c0 = 0.0f;
         int64_t frame_seed = s.job->resolved_seed;
 #ifdef QWEN_RESEARCH_FRAME_SEEDS
@@ -1939,10 +1982,26 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                    (long long) s.subseq_counter);
         }
 #endif
+#ifdef QWEN_RESEARCH_EOS_CONTROL
+        const auto eos_selection = research_eos_sample(s.eos_control, s.logits.data(), vocab,
+            codec_eos_id, s.step, s.talker_T, p->top_k, p->top_p, p->repetition_penalty,
+            s.talker_history.data(), (int) s.talker_history.size(), frame_seed,
+            s.subseq_counter, &u_c0, (diagnostic_frame || observe_logits) ? &suppressed_logits : nullptr);
+        const int sampled_c0 = eos_selection.effective;
+        if (s.eos_control.mode != ResearchEosMode::Baseline &&
+            (s.step < 8 || eos_selection.initial == codec_eos_id || eos_selection.intervened)) {
+            qt_log(QT_LOG_DEBUG,
+                "[ResearchEOS] serial=%lld frame=%d initial=%d effective=%d intervention=%d used=%d penalty=%.1f u=%.10f subseq=%lld",
+                (long long) s.serial, s.step, eos_selection.initial, eos_selection.effective,
+                (int) eos_selection.intervened, (int) s.eos_control.alternative_used,
+                (double) s.eos_control.penalty, (double) u_c0, (long long) s.subseq_counter);
+        }
+#else
         const int sampled_c0 = sample_top_k_p(s.logits.data(), vocab, s.talker_T, p->top_k, p->top_p,
                                               p->repetition_penalty, s.talker_history.data(),
                                               (int) s.talker_history.size(), frame_seed,
                                               s.subseq_counter, &u_c0);
+#endif
         int c0 = sampled_c0;
         s.perf.host_ms += t_host.ms();
         s.subseq_counter++;
